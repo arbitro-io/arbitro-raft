@@ -1,0 +1,14 @@
+[package]
+name = "arbitro-raft"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytes = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+async-trait = "0.1"
+tracing = "0.1"
+zerocopy = { version = "0.8", features = ["derive"] }
+
+[dev-dependencies]
+futures = "0.3"
