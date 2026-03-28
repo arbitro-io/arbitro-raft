@@ -1,12 +1,16 @@
 use bytes::{Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
 use zerocopy::IntoBytes;
 
 use crate::{EntryPayload, LogEntry, LogIndex, PeerId, RaftError, SnapshotMeta, Term};
 
 use super::codec::{validate_append_entries_body, AppendEntriesBody, EntryHeader, EntryHeaderView};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Protocol message types are internal wire intermediaries.
+// Their serialization format is defined in codec.rs (zerocopy).
+// No serde derives here — users who need to log or persist
+// these types have access to the raw Bytes from encode_message.
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestVote {
     pub term: Term,
     pub candidate_id: PeerId,
@@ -14,18 +18,22 @@ pub struct RequestVote {
     pub last_log_term: Term,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestVoteResp {
     pub term: Term,
     pub vote_granted: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppendEntries {
     bytes: Bytes,
 }
 
 impl AppendEntries {
+    /// Build an `AppendEntries` message from components.
+    ///
+    /// Validates the resulting byte layout. Use the public API when constructing
+    /// messages outside the node (e.g. in tests).
     pub fn new(
         term: Term,
         leader_id: PeerId,
@@ -34,6 +42,35 @@ impl AppendEntries {
         leader_commit: LogIndex,
         entries: &[LogEntry],
     ) -> Result<Self, RaftError> {
+        let bytes = Self::build_bytes(term, leader_id, prev_log_index, prev_log_term, leader_commit, entries)?;
+        validate_append_entries_body(bytes.as_ref())?;
+        Ok(Self { bytes })
+    }
+
+    /// Build without post-construction validation.
+    ///
+    /// Entries come from trusted storage on the leader path — re-validating
+    /// bytes we just wrote is redundant work. Only use this inside the node.
+    pub(crate) fn new_unchecked(
+        term: Term,
+        leader_id: PeerId,
+        prev_log_index: LogIndex,
+        prev_log_term: Term,
+        leader_commit: LogIndex,
+        entries: &[LogEntry],
+    ) -> Result<Self, RaftError> {
+        let bytes = Self::build_bytes(term, leader_id, prev_log_index, prev_log_term, leader_commit, entries)?;
+        Ok(Self { bytes })
+    }
+
+    fn build_bytes(
+        term: Term,
+        leader_id: PeerId,
+        prev_log_index: LogIndex,
+        prev_log_term: Term,
+        leader_commit: LogIndex,
+        entries: &[LogEntry],
+    ) -> Result<Bytes, RaftError> {
         let mut body_len = std::mem::size_of::<AppendEntriesBody>();
         for entry in entries {
             body_len = body_len
@@ -62,12 +99,11 @@ impl AppendEntries {
                 _pad: 0.into(),
             };
             bytes.extend_from_slice(header.as_bytes());
+            // Bytes::extend_from_slice writes the payload once — no extra copy here.
             bytes.extend_from_slice(entry.payload.0.as_ref());
         }
 
-        let bytes = bytes.freeze();
-        validate_append_entries_body(bytes.as_ref())?;
-        Ok(Self { bytes })
+        Ok(bytes.freeze())
     }
 
     pub(crate) fn from_validated_bytes(bytes: Bytes) -> Self {
@@ -189,6 +225,9 @@ impl<'a> AppendEntriesEntryView<'a> {
         self.body.slice(header.payload_start()..header.payload_end())
     }
 
+    /// Convert to an owned `LogEntry`.
+    ///
+    /// `payload()` is a `Bytes::slice` — an Arc reference bump, not a data copy.
     #[inline]
     pub fn to_owned(&self) -> LogEntry {
         LogEntry {
@@ -199,21 +238,21 @@ impl<'a> AppendEntriesEntryView<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppendEntriesResp {
     pub term: Term,
     pub success: bool,
     pub match_index: LogIndex,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotChunk {
     pub offset: u64,
     pub bytes: Bytes,
     pub done: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallSnapshot {
     pub term: Term,
     pub leader_id: PeerId,
@@ -221,24 +260,24 @@ pub struct InstallSnapshot {
     pub chunk: SnapshotChunk,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallSnapshotResp {
     pub term: Term,
     pub accepted: bool,
     pub next_offset: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RaftCustomMessage {
     pub bytes: Bytes,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RaftCustomResponse {
     pub bytes: Bytes,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RaftMessage {
     RequestVote(RequestVote),
     RequestVoteResp(RequestVoteResp),

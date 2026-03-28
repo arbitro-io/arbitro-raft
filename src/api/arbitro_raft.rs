@@ -152,15 +152,14 @@ where
     }
 
     async fn run_leader_once(&mut self) -> Result<(), RaftError> {
-        // Adaptive Batching: Drenar todas las propuestas pendientes usando el buffer pre-alocado
         self.pending_batch.clear();
         while let Ok(payload) = self.proposal_rx.try_recv() {
             self.pending_batch.push(payload);
+            // Bound the batch to avoid starving the heartbeat loop
             if self.pending_batch.len() >= 4096 { break; }
         }
 
         if !self.pending_batch.is_empty() {
-            // Pasamos la referencia al buffer pre-alocado (Zero-Allocation)
             self.node.replicate_batch_async(&self.pending_batch).await?;
             self.pending_batch.clear();
         }
@@ -173,8 +172,9 @@ where
         }
 
         let timeout = self.next_heartbeat_at.saturating_duration_since(now);
-        match self.node.transport().recv_timeout(timeout).await? {
-            Some(inbound) => {
+        match self.node.transport().recv_frame_timeout(timeout).await? {
+            Some(raw) => {
+                let inbound = crate::decode_message_view(raw)?;
                 self.node.handle_inbound(inbound).await?;
             }
             None => {
@@ -189,8 +189,9 @@ where
     async fn run_follower_once(&mut self) -> Result<(), RaftError> {
         let now = Instant::now();
         let timeout = self.next_election_at.saturating_duration_since(now);
-        match self.node.transport().recv_timeout(timeout).await? {
-            Some(inbound) => {
+        match self.node.transport().recv_frame_timeout(timeout).await? {
+            Some(raw) => {
+                let inbound = crate::decode_message_view(raw)?;
                 self.node.handle_inbound(inbound).await?;
                 self.reset_election_deadline();
                 if self.node.is_leader() {

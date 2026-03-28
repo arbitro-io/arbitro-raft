@@ -1,5 +1,4 @@
 use std::sync::OnceLock;
-use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
 use zerocopy::byteorder::little_endian::{U16, U32, U64};
@@ -27,7 +26,8 @@ fn trace_enabled() -> bool {
 
 fn trace_log(from: PeerId, msg: impl AsRef<str>) {
     if trace_enabled() {
-        eprintln!("[raft-codec from={}] {}", from.0, msg.as_ref());
+        // tracing::trace! is a no-op when no TRACE subscriber is active — no alloc, no syscall
+        tracing::trace!(node_id = from.0, msg = msg.as_ref(), "raft-codec");
     }
 }
 
@@ -395,7 +395,6 @@ pub fn encode_message(from: PeerId, msg: &RaftMessage) -> Result<Bytes, RaftErro
 }
 
 pub fn encode_message_into(from: PeerId, msg: &RaftMessage, buf: &mut BytesMut) -> Result<(), RaftError> {
-    let started = Instant::now();
     let body_len = body_len(msg)?;
     buf.reserve(RAFT_FRAME_HEADER_SIZE + body_len);
     let header = RaftFrameHeader {
@@ -470,29 +469,17 @@ pub fn encode_message_into(from: PeerId, msg: &RaftMessage, buf: &mut BytesMut) 
         }
     }
 
-    trace_log(
-        from,
-        format!(
-            "encode kind={} body_len={} encode_us={}",
-            kind_of(msg),
-            body_len,
-            started.elapsed().as_micros()
-        ),
-    );
+    if trace_enabled() {
+        trace_log(from, format!("encode kind={} body_len={}", kind_of(msg), body_len));
+    }
     Ok(())
 }
 
 pub fn decode_message_view(frame: Bytes) -> Result<super::view::InboundRaftMessageView, RaftError> {
-    let started = Instant::now();
     let inbound = super::view::RaftMessageView::parse(frame)?;
-    trace_log(
-        inbound.from,
-        format!(
-            "decode kind={} decode_us={}",
-            view_kind(&inbound.message),
-            started.elapsed().as_micros()
-        ),
-    );
+    if trace_enabled() {
+        trace_log(inbound.from, format!("decode kind={}", view_kind(&inbound.message)));
+    }
     Ok(inbound)
 }
 

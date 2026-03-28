@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
-use tracing::{info, debug};
+use tracing::{debug, info};
 
 use crate::{
-    PeerId, RaftError, RaftMessage, RequestVote, RequestVoteResp,
+    RaftError, RaftMessage, RequestVote, RequestVoteResp,
     RequestVoteRespView, RequestVoteView, Role, Term, InboundRaftMessageView,
 };
 use super::RaftNode;
@@ -20,6 +20,7 @@ where
         self.soft_state.leader_id = None;
         self.hard_state.current_term = Term(self.hard_state.current_term.0 + 1);
         self.hard_state.voted_for = Some(self.config.node_id);
+        // Persist before any send — guide §Orden de persistencia
         self.storage.save_hard_state(&self.hard_state)?;
 
         let term = self.hard_state.current_term;
@@ -41,7 +42,7 @@ where
         };
 
         for peer in self.config.peers.iter().copied().filter(|peer| *peer != self.config.node_id) {
-            if self.send_best_effort(peer, RaftMessage::RequestVote(req.clone()), "request_vote").await {
+            if self.encode_and_send_best_effort(peer, &RaftMessage::RequestVote(req.clone())).await {
                 possible_votes += 1;
             }
         }
@@ -51,12 +52,17 @@ where
         }
 
         let timeout = self.election_timeout();
-        while votes < votes_needed && responders.len() < possible_votes.saturating_sub(1) {
-            let Some(inbound) = self.transport.recv_timeout(timeout).await? else {
-                return Err(RaftError::NoQuorum);
+        // Collect votes until we have quorum or all possible respondents have answered.
+        // Must wait for ALL possible_votes — not possible_votes-1 — to avoid discarding
+        // the decisive vote in tight clusters.
+        while votes < votes_needed && responders.len() < possible_votes {
+            let raw = match self.transport.recv_frame_timeout(timeout).await? {
+                Some(r) => r,
+                None => return Err(RaftError::NoQuorum),
             };
-
+            let inbound = crate::decode_message_view(raw)?;
             let from = inbound.from;
+
             match inbound.message {
                 crate::RaftMessageView::RequestVoteResp(resp) => {
                     if !responders.insert(from) { continue; }
@@ -83,7 +89,7 @@ where
         self.soft_state.is_leader = true;
         self.soft_state.leader_id = Some(self.config.node_id);
         self.initialize_leader_progress()?;
-        
+
         info!(node_id = self.config.node_id.0, term = term.0, "leader elected");
         super::trace_log(self.config.node_id, format!("campaign_once elected term={} total_us={}", term.0, started.elapsed().as_micros()));
         Ok(true)
@@ -107,10 +113,11 @@ where
             self.storage.save_hard_state(&self.hard_state)?;
         }
 
-        self.transport.send(msg.from(), RaftMessage::RequestVoteResp(RequestVoteResp {
+        let frame = self.encode_msg(&RaftMessage::RequestVoteResp(RequestVoteResp {
             term: self.hard_state.current_term,
             vote_granted: can_vote,
-        })).await?;
+        }))?;
+        self.transport.send_frame(msg.from(), frame).await?;
         Ok(())
     }
 

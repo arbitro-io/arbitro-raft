@@ -92,7 +92,7 @@ impl ResponseCollector {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl DispatchResponder for ResponseCollector {
     async fn send_response(&self, response: DispatchResponse) -> Result<(), RaftError> {
         self.responses.lock().unwrap().push(response);

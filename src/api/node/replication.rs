@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use super::progress::{AppendAdvance, AppendAttemptState};
 use super::RaftNode;
@@ -39,8 +39,9 @@ where
         for i in 0..self.scratch_peers.len() {
             let peer = self.scratch_peers[i];
             let msg = self.build_append_for_peer(peer)?;
+            // encode once per peer (payloads differ per peer due to varying prev_log_index)
             if self
-                .send_best_effort(peer, RaftMessage::AppendEntries(msg), "heartbeat")
+                .encode_and_send_best_effort(peer, &RaftMessage::AppendEntries(msg))
                 .await
             {
                 sent += 1;
@@ -90,6 +91,7 @@ where
             self.scratch_entries.push(LogEntry {
                 term: self.hard_state.current_term,
                 index: next_index,
+                // EntryPayload clones the Bytes arc — no data copy
                 payload: EntryPayload(payload),
             });
             self.scratch_indexes.push(next_index);
@@ -128,10 +130,13 @@ where
 
         let timeout = Duration::from_millis(self.config.timing.heartbeat_ms as u64 * 2);
         while accepted < needed && !self.scratch_pending.is_empty() {
-            let Some(inbound) = self.transport.recv_timeout(timeout).await? else {
-                break;
+            let raw = match self.transport.recv_frame_timeout(timeout).await? {
+                Some(r) => r,
+                None => break,
             };
+            let inbound = crate::decode_message_view(raw)?;
             let from = inbound.from;
+
             match inbound.message {
                 crate::RaftMessageView::AppendEntriesResp(resp) => {
                     let Some(state) = self.scratch_pending.get(&from).copied() else {
@@ -164,8 +169,10 @@ where
         if accepted < needed {
             return Err(RaftError::NoQuorum);
         }
-        self.hard_state.commit_index = last_index;
-        self.storage.save_hard_state(&self.hard_state)?;
+
+        // commit_index is volatile — no save_hard_state needed for commit advance alone
+        self.soft_state.commit_index = last_index;
+
         super::trace_log(
             self.config.node_id,
             format!(
@@ -197,12 +204,14 @@ where
         )?;
         self.scratch_entries
             .truncate(self.config.limits.append_batch_entries.max(1));
-        AppendEntries::new(
+
+        // Entries come from our own trusted log — skip post-construction validation
+        AppendEntries::new_unchecked(
             self.hard_state.current_term,
             self.config.node_id,
             prev_log_index,
             prev_log_term,
-            self.hard_state.commit_index,
+            self.soft_state.commit_index,
             &self.scratch_entries,
         )
     }
@@ -213,14 +222,15 @@ where
         _attempt: u64,
     ) -> Result<Option<LogIndex>, RaftError> {
         let msg = self.build_append_for_peer(peer)?;
-        let mut last_idx = msg.prev_log_index();
-        if let Some(last) = msg.entries()?.last() {
-            last_idx = last.index();
-        }
-        if self
-            .send_best_effort(peer, RaftMessage::AppendEntries(msg), "append")
-            .await
-        {
+        // scratch_entries is filled by build_append_for_peer; use it to find last index
+        // without re-iterating (and re-validating) the AppendEntries bytes.
+        let last_idx = self
+            .scratch_entries
+            .last()
+            .map(|e| e.index)
+            .unwrap_or(msg.prev_log_index());
+        let frame = self.encode_msg(&RaftMessage::AppendEntries(msg))?;
+        if self.send_best_effort(peer, frame).await {
             Ok(Some(last_idx))
         } else {
             Ok(None)
@@ -232,16 +242,12 @@ where
         msg: AppendEntriesView,
     ) -> Result<(), RaftError> {
         if msg.term().0 < self.hard_state.current_term.0 {
-            self.transport
-                .send(
-                    msg.from(),
-                    RaftMessage::AppendEntriesResp(AppendEntriesResp {
-                        term: self.hard_state.current_term,
-                        success: false,
-                        match_index: self.storage.last_log_position()?.0,
-                    }),
-                )
-                .await?;
+            let frame = self.encode_msg(&RaftMessage::AppendEntriesResp(AppendEntriesResp {
+                term: self.hard_state.current_term,
+                success: false,
+                match_index: self.storage.last_log_position()?.0,
+            }))?;
+            self.transport.send_frame(msg.from(), frame).await?;
             return Ok(());
         }
 
@@ -262,16 +268,12 @@ where
         };
 
         if !prev_ok {
-            self.transport
-                .send(
-                    msg.from(),
-                    RaftMessage::AppendEntriesResp(AppendEntriesResp {
-                        term: self.hard_state.current_term,
-                        success: false,
-                        match_index: self.storage.last_log_position()?.0,
-                    }),
-                )
-                .await?;
+            let frame = self.encode_msg(&RaftMessage::AppendEntriesResp(AppendEntriesResp {
+                term: self.hard_state.current_term,
+                success: false,
+                match_index: self.storage.last_log_position()?.0,
+            }))?;
+            self.transport.send_frame(msg.from(), frame).await?;
             return Ok(());
         }
 
@@ -294,27 +296,24 @@ where
         if append_from < entry_count {
             self.scratch_entries.clear();
             for entry in msg.entries()?.skip(append_from) {
+                // entry.to_owned() does an Arc bump on the payload Bytes — no data copy
                 self.scratch_entries.push(entry.to_owned());
             }
             self.storage.append_entries(&self.scratch_entries)?;
         }
 
         let last_log_index = self.storage.last_log_position()?.0;
-        if msg.leader_commit() > self.hard_state.commit_index {
-            self.hard_state.commit_index = LogIndex(msg.leader_commit().0.min(last_log_index.0));
-            self.storage.save_hard_state(&self.hard_state)?;
+        if msg.leader_commit() > self.soft_state.commit_index {
+            // commit_index is volatile — no save_hard_state needed here
+            self.soft_state.commit_index = LogIndex(msg.leader_commit().0.min(last_log_index.0));
         }
 
-        self.transport
-            .send(
-                msg.from(),
-                RaftMessage::AppendEntriesResp(AppendEntriesResp {
-                    term: self.hard_state.current_term,
-                    success: true,
-                    match_index: last_log_index,
-                }),
-            )
-            .await?;
+        let frame = self.encode_msg(&RaftMessage::AppendEntriesResp(AppendEntriesResp {
+            term: self.hard_state.current_term,
+            success: true,
+            match_index: last_log_index,
+        }))?;
+        self.transport.send_frame(msg.from(), frame).await?;
         Ok(())
     }
 
@@ -431,15 +430,6 @@ where
         Ok(())
     }
 
-    pub(crate) async fn send_best_effort(
-        &self,
-        peer: PeerId,
-        msg: RaftMessage,
-        _phase: &str,
-    ) -> bool {
-        self.transport.send(peer, msg).await.is_ok()
-    }
-
     pub(crate) fn term_at(&self, index: LogIndex) -> Result<Term, RaftError> {
         if index.0 == 0 {
             return Ok(Term(0));
@@ -451,13 +441,14 @@ where
     }
 
     pub(crate) async fn drain_inbound_ready(&mut self) -> Result<(), RaftError> {
-        while let Some(inbound) = self.transport.recv_timeout(Duration::ZERO).await? {
-            let from = inbound.from;
-            self.handle_inbound(InboundRaftMessageView {
-                from,
-                message: inbound.message,
-            })
-            .await?;
+        loop {
+            match self.transport.recv_frame_timeout(Duration::ZERO).await? {
+                Some(raw) => {
+                    let inbound = crate::decode_message_view(raw)?;
+                    self.handle_inbound(inbound).await?;
+                }
+                None => break,
+            }
         }
         Ok(())
     }
@@ -507,7 +498,11 @@ where
 
         for i in 0..self.scratch_peers.len() {
             let peer = self.scratch_peers[i];
-            let _ = self.send_append_attempt(peer, 1).await;
+            // Fire-and-forget: errors are logged, not propagated — the heartbeat cycle
+            // recovers missed peers. Silent drop is forbidden; warn on failure.
+            if let Err(e) = self.send_append_attempt(peer, 1).await {
+                warn!(peer = peer.0, error = %e, "replicate_batch_async: send attempt failed");
+            }
         }
         Ok(self.scratch_indexes.clone())
     }

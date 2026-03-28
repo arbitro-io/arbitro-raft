@@ -34,20 +34,25 @@ where
         loop {
             let end = (offset + chunk_size).min(total_len);
             let done = end == total_len;
-            let chunk_bytes = if total_len == 0 { Bytes::new() } else { Bytes::copy_from_slice(&snapshot[offset..end]) };
+            // Bytes::slice is an Arc reference bump — no data copy
+            let chunk_bytes = if total_len == 0 { Bytes::new() } else { snapshot.slice(offset..end) };
 
-            self.transport.send(peer, RaftMessage::InstallSnapshot(InstallSnapshot {
+            let frame = self.encode_msg(&RaftMessage::InstallSnapshot(InstallSnapshot {
                 term: self.hard_state.current_term,
                 leader_id: self.config.node_id,
                 meta: meta.clone(),
                 chunk: crate::SnapshotChunk { offset: offset as u64, bytes: chunk_bytes, done },
-            })).await?;
+            }))?;
+            self.transport.send_frame(peer, frame).await?;
 
             loop {
-                let Some(inbound) = self.transport.recv_timeout(timeout).await? else {
-                    return Err(RaftError::NoQuorum);
+                let raw = match self.transport.recv_frame_timeout(timeout).await? {
+                    Some(r) => r,
+                    None => return Err(RaftError::NoQuorum),
                 };
+                let inbound = crate::decode_message_view(raw)?;
                 let from = inbound.from;
+
                 match inbound.message {
                     crate::RaftMessageView::InstallSnapshotResp(resp) if from == peer => {
                         if resp.term().0 > self.hard_state.current_term.0 {
@@ -69,9 +74,10 @@ where
 
     pub(crate) async fn handle_install_snapshot(&mut self, msg: InstallSnapshotView) -> Result<(), RaftError> {
         if msg.term().0 < self.hard_state.current_term.0 {
-            self.transport.send(msg.from(), RaftMessage::InstallSnapshotResp(InstallSnapshotResp {
+            let frame = self.encode_msg(&RaftMessage::InstallSnapshotResp(InstallSnapshotResp {
                 term: self.hard_state.current_term, accepted: false, next_offset: 0,
-            })).await?;
+            }))?;
+            self.transport.send_frame(msg.from(), frame).await?;
             return Ok(());
         }
 
@@ -92,9 +98,10 @@ where
 
         if pending.bytes.len() as u64 != msg.offset() {
             let next_offset = pending.bytes.len() as u64;
-            self.transport.send(msg.from(), RaftMessage::InstallSnapshotResp(InstallSnapshotResp {
+            let frame = self.encode_msg(&RaftMessage::InstallSnapshotResp(InstallSnapshotResp {
                 term: self.hard_state.current_term, accepted: false, next_offset,
-            })).await?;
+            }))?;
+            self.transport.send_frame(msg.from(), frame).await?;
             return Ok(());
         }
 
@@ -104,15 +111,16 @@ where
         if msg.done() {
             let completed = self.pending_snapshots.remove(&msg.from()).ok_or_else(|| RaftError::Snapshot("missing pending snapshot".into()))?;
             self.storage.save_snapshot(&completed.meta, &completed.bytes)?;
-            if self.hard_state.commit_index.0 < completed.meta.last_included_index.0 {
-                self.hard_state.commit_index = completed.meta.last_included_index;
-                self.storage.save_hard_state(&self.hard_state)?;
+            if self.soft_state.commit_index.0 < completed.meta.last_included_index.0 {
+                // commit_index is volatile — no save_hard_state needed here
+                self.soft_state.commit_index = completed.meta.last_included_index;
             }
         }
 
-        self.transport.send(msg.from(), RaftMessage::InstallSnapshotResp(InstallSnapshotResp {
+        let frame = self.encode_msg(&RaftMessage::InstallSnapshotResp(InstallSnapshotResp {
             term: self.hard_state.current_term, accepted: true, next_offset,
-        })).await?;
+        }))?;
+        self.transport.send_frame(msg.from(), frame).await?;
         Ok(())
     }
 
