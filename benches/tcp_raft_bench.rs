@@ -13,7 +13,8 @@ use tokio::runtime::Runtime;
 use arbitro_raft::{
     HardState, LogIndex, NodeConfig, PeerId, RaftMessage, RaftStorage, RaftTransport,
     Term, InboundRaftMessageView, LimitsConfig, TimingConfig, ClusterId,
-    ArbitroRaft, LogEntry, decode_message_view, encode_message_into, RaftError
+    ArbitroRaft, LogEntry, decode_message_view, encode_message_into, RaftError,
+    BootstrapPeer
 };
 
 // --- Almacenamiento en Memoria (Sencillo para el bench) ---
@@ -197,7 +198,11 @@ fn bench_tcp_raft(c: &mut Criterion) {
                     let config1 = NodeConfig {
                         node_id: PeerId(1),
                         cluster_id: ClusterId(1),
-                        bootstrap_peers: vec![],
+                        bootstrap_peers: vec![
+                            BootstrapPeer { id: PeerId(1), addr: addr1 },
+                            BootstrapPeer { id: PeerId(2), addr: addr2 },
+                            BootstrapPeer { id: PeerId(3), addr: addr3 },
+                        ],
                         peers: vec![PeerId(1), PeerId(2), PeerId(3)],
                         timing: TimingConfig::default(),
                         limits: LimitsConfig::default(),
