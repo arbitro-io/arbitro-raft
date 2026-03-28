@@ -9,15 +9,19 @@ serde = { version = "1", features = ["derive"] }
 async-trait = "0.1"
 tracing = "0.1"
 zerocopy = { version = "0.8", features = ["derive"] }
-tokio = { version = "1", features = ["full"] }
+futures = "0.3"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["full"] }
 criterion = { version = "0.8.2", features = ["async_tokio"] }
-futures = "0.3"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tokio-uring = "0.5"
 
 [[bench]]
 name = "memory_e2e_bench"
+harness = false
+
+[[bench]]
+name = "tcp_raft_bench"
 harness = false

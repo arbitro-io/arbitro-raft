@@ -15,8 +15,8 @@ pub struct ArbitroRaft<S, T> {
     next_election_at: Instant,
     next_heartbeat_at: Instant,
     election_state: u64,
-    proposal_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
-    proposal_rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+    proposal_tx: futures::channel::mpsc::UnboundedSender<Bytes>,
+    proposal_rx: futures::channel::mpsc::UnboundedReceiver<Bytes>,
     pending_batch: Vec<Bytes>,
 }
 
@@ -26,7 +26,7 @@ where
     T: RaftTransport,
 {
     pub fn new(node: RaftNode<S, T>) -> Self {
-        let (proposal_tx, proposal_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (proposal_tx, proposal_rx) = futures::channel::mpsc::unbounded();
         let mut raft = Self {
             election_state: seed(node.node_id()),
             node,
@@ -63,7 +63,7 @@ where
     }
 
     #[inline]
-    pub fn handle(&self) -> tokio::sync::mpsc::UnboundedSender<Bytes> {
+    pub fn handle(&self) -> futures::channel::mpsc::UnboundedSender<Bytes> {
         self.proposal_tx.clone()
     }
 
@@ -77,7 +77,11 @@ where
     where
         P: Send + 'static,
         R: 'static,
-        F: for<'a> Fn(P, DispatchContextView<'a>) -> Pin<Box<dyn Future<Output = Result<(), RaftError>> + Send + 'a>>
+        F: for<'a> Fn(
+                P,
+                DispatchContextView<'a>,
+            )
+                -> Pin<Box<dyn Future<Output = Result<(), RaftError>> + Send + 'a>>
             + Send
             + Sync
             + 'static,
@@ -193,22 +197,20 @@ where
                     self.reset_heartbeat_deadline();
                 }
             }
-            None => {
-                match self.node.campaign_once().await {
-                    Ok(elected) => {
-                        self.reset_election_deadline();
-                        if elected {
-                            self.reset_heartbeat_deadline();
-                            self.node.send_heartbeat_once().await?;
-                            self.reset_heartbeat_deadline();
-                        }
+            None => match self.node.campaign_once().await {
+                Ok(elected) => {
+                    self.reset_election_deadline();
+                    if elected {
+                        self.reset_heartbeat_deadline();
+                        self.node.send_heartbeat_once().await?;
+                        self.reset_heartbeat_deadline();
                     }
-                    Err(RaftError::NoQuorum) => {
-                        self.reset_election_deadline();
-                    }
-                    Err(err) => return Err(err),
                 }
-            }
+                Err(RaftError::NoQuorum) => {
+                    self.reset_election_deadline();
+                }
+                Err(err) => return Err(err),
+            },
         }
 
         Ok(())

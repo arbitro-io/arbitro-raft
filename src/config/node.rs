@@ -20,3 +20,15 @@ pub struct NodeConfig {
     pub timing: TimingConfig,
     pub limits: LimitsConfig,
 }
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            cluster_id: ClusterId::default(),
+            node_id: PeerId::default(),
+            peers: Vec::new(),
+            bootstrap_peers: Vec::new(),
+            timing: TimingConfig::default(),
+            limits: LimitsConfig::default(),
+        }
+    }
+}
