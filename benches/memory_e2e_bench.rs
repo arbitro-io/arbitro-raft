@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use arbitro_raft::{decode_message_view, encode_message_into};
 use arbitro_raft::{
     AppendEntriesResp, ArbitroRaft, BootstrapPeer, ClusterId, HardState, InboundRaftMessageView,
-    LogEntry, LogIndex, NodeConfig, PeerId, RaftError, RaftMessage, RaftStorage,
-    RaftTransport, SnapshotMeta, Term,
+    LogEntry, LogIndex, NodeConfig, PeerId, RaftError, RaftMessage, RaftStorage, RaftTransport,
+    SnapshotMeta, Term,
 };
 use bytes::{Bytes, BytesMut};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -71,8 +71,12 @@ impl RaftStorage for MemStorage {
         entries.retain(|e| e.index < from);
         Ok(())
     }
-    fn save_snapshot(&self, _meta: &SnapshotMeta, _snapshot: &[u8]) -> Result<(), RaftError> { Ok(()) }
-    fn load_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, RaftError> { Ok(None) }
+    fn save_snapshot(&self, _meta: &SnapshotMeta, _snapshot: &[u8]) -> Result<(), RaftError> {
+        Ok(())
+    }
+    fn load_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, RaftError> {
+        Ok(None)
+    }
 }
 
 struct MemTransport {
@@ -131,7 +135,10 @@ impl RaftTransport for MemTransport {
         }
     }
 
-    async fn recv_timeout(&self, timeout: Duration) -> Result<Option<InboundRaftMessageView>, RaftError> {
+    async fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<InboundRaftMessageView>, RaftError> {
         let mut rx = self.rx.lock().await;
         match tokio::time::timeout(timeout, rx.next()).await {
             Ok(Some(msg)) => Ok(Some(msg)),
@@ -149,18 +156,32 @@ fn bench_memory_hot_path(c: &mut Criterion) {
 
     group.throughput(Throughput::Elements(1));
     group.bench_function("single_entry", |b| {
-        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(16).enable_all().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(16)
+            .enable_all()
+            .build()
+            .unwrap();
         let payload_ref = payload_bytes.clone();
         b.to_async(&runtime).iter_custom(move |iters| {
             let payload_bytes = payload_ref.clone();
             async move {
                 let config = NodeConfig {
-                    node_id: PeerId(1), cluster_id: ClusterId(1),
+                    node_id: PeerId(1),
+                    cluster_id: ClusterId(1),
                     peers: vec![PeerId(1), PeerId(2), PeerId(3)],
                     bootstrap_peers: vec![
-                        BootstrapPeer { id: PeerId(1), addr: "127.0.0.1:8001".parse().unwrap() },
-                        BootstrapPeer { id: PeerId(2), addr: "127.0.0.1:8002".parse().unwrap() },
-                        BootstrapPeer { id: PeerId(3), addr: "127.0.0.1:8003".parse().unwrap() },
+                        BootstrapPeer {
+                            id: PeerId(1),
+                            addr: "127.0.0.1:8001".parse().unwrap(),
+                        },
+                        BootstrapPeer {
+                            id: PeerId(2),
+                            addr: "127.0.0.1:8002".parse().unwrap(),
+                        },
+                        BootstrapPeer {
+                            id: PeerId(3),
+                            addr: "127.0.0.1:8003".parse().unwrap(),
+                        },
                     ],
                     ..Default::default()
                 };
@@ -169,10 +190,12 @@ fn bench_memory_hot_path(c: &mut Criterion) {
                 let node = arbitro_raft::RaftNode::new(config, storage, transport).unwrap();
                 let mut node = node;
                 node.become_leader_for_benchmark(Term(1));
-                
+
                 let mut raft = ArbitroRaft::new(node);
                 let handle = raft.handle();
-                let raft_task = tokio::spawn(async move { let _ = raft.run().await; });
+                let raft_task = tokio::spawn(async move {
+                    let _ = raft.run().await;
+                });
 
                 let start = Instant::now();
                 for _ in 0..iters {
@@ -187,18 +210,32 @@ fn bench_memory_hot_path(c: &mut Criterion) {
 
     group.throughput(Throughput::Bytes((payload_size * batch_size) as u64));
     group.bench_function("batch_50", |b| {
-        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(16).enable_all().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(16)
+            .enable_all()
+            .build()
+            .unwrap();
         let payload_ref = payload_bytes.clone();
         b.to_async(&runtime).iter_custom(move |iters| {
             let payload_bytes = payload_ref.clone();
             async move {
                 let config = NodeConfig {
-                    node_id: PeerId(1), cluster_id: ClusterId(1),
+                    node_id: PeerId(1),
+                    cluster_id: ClusterId(1),
                     peers: vec![PeerId(1), PeerId(2), PeerId(3)],
                     bootstrap_peers: vec![
-                        BootstrapPeer { id: PeerId(1), addr: "127.0.0.1:8001".parse().unwrap() },
-                        BootstrapPeer { id: PeerId(2), addr: "127.0.0.1:8002".parse().unwrap() },
-                        BootstrapPeer { id: PeerId(3), addr: "127.0.0.1:8003".parse().unwrap() },
+                        BootstrapPeer {
+                            id: PeerId(1),
+                            addr: "127.0.0.1:8001".parse().unwrap(),
+                        },
+                        BootstrapPeer {
+                            id: PeerId(2),
+                            addr: "127.0.0.1:8002".parse().unwrap(),
+                        },
+                        BootstrapPeer {
+                            id: PeerId(3),
+                            addr: "127.0.0.1:8003".parse().unwrap(),
+                        },
                     ],
                     ..Default::default()
                 };
@@ -207,15 +244,19 @@ fn bench_memory_hot_path(c: &mut Criterion) {
                 let node = arbitro_raft::RaftNode::new(config, storage, transport).unwrap();
                 let mut node = node;
                 node.become_leader_for_benchmark(Term(1));
-                
+
                 let mut raft = ArbitroRaft::new(node);
                 let handle = raft.handle();
-                let raft_task = tokio::spawn(async move { let _ = raft.run().await; });
+                let raft_task = tokio::spawn(async move {
+                    let _ = raft.run().await;
+                });
 
                 let payloads = vec![payload_bytes.clone(); batch_size as usize];
                 let start = Instant::now();
                 for _ in 0..iters {
-                    for p in &payloads { let _ = handle.unbounded_send(p.clone()); }
+                    for p in &payloads {
+                        let _ = handle.unbounded_send(p.clone());
+                    }
                 }
                 drop(handle);
                 raft_task.abort();
@@ -233,50 +274,74 @@ fn bench_concurrent_clients(c: &mut Criterion) {
 
     for clients in [1, 64, 256, 1024, 4096] {
         group.throughput(Throughput::Elements(1));
-        group.bench_with_input(BenchmarkId::new("single_writes", clients), &clients, |b, &clients| {
-            let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(16).enable_all().build().unwrap();
-            let payload_ref = payload_bytes.clone();
-            b.to_async(&runtime).iter_custom(move |iters| {
-                let payload_bytes = payload_ref.clone();
-                async move {
-                    let iters = std::cmp::max(iters, clients);
-                    let writes_per_client = iters / clients;
-                    let config = NodeConfig {
-                        node_id: PeerId(1), cluster_id: ClusterId(1),
-                        peers: vec![PeerId(1), PeerId(2), PeerId(3)],
-                        bootstrap_peers: vec![
-                            BootstrapPeer { id: PeerId(1), addr: "127.0.0.1:8001".parse().unwrap() },
-                            BootstrapPeer { id: PeerId(2), addr: "127.0.0.1:8002".parse().unwrap() },
-                            BootstrapPeer { id: PeerId(3), addr: "127.0.0.1:8003".parse().unwrap() },
-                        ],
-                        ..Default::default()
-                    };
-                    let storage = MemStorage::new();
-                    let transport = MemTransport::new(PeerId(1));
-                    let node = arbitro_raft::RaftNode::new(config, storage, transport).unwrap();
-                    let mut node = node;
-                    node.become_leader_for_benchmark(Term(1));
-                    
-                    let mut raft = ArbitroRaft::new(node);
-                    let handle = raft.handle();
-                    let raft_task = tokio::spawn(async move { let _ = raft.run().await; });
+        group.bench_with_input(
+            BenchmarkId::new("single_writes", clients),
+            &clients,
+            |b, &clients| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(16)
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let payload_ref = payload_bytes.clone();
+                b.to_async(&runtime).iter_custom(move |iters| {
+                    let payload_bytes = payload_ref.clone();
+                    async move {
+                        let iters = std::cmp::max(iters, clients);
+                        let writes_per_client = iters / clients;
+                        let config = NodeConfig {
+                            node_id: PeerId(1),
+                            cluster_id: ClusterId(1),
+                            peers: vec![PeerId(1), PeerId(2), PeerId(3)],
+                            bootstrap_peers: vec![
+                                BootstrapPeer {
+                                    id: PeerId(1),
+                                    addr: "127.0.0.1:8001".parse().unwrap(),
+                                },
+                                BootstrapPeer {
+                                    id: PeerId(2),
+                                    addr: "127.0.0.1:8002".parse().unwrap(),
+                                },
+                                BootstrapPeer {
+                                    id: PeerId(3),
+                                    addr: "127.0.0.1:8003".parse().unwrap(),
+                                },
+                            ],
+                            ..Default::default()
+                        };
+                        let storage = MemStorage::new();
+                        let transport = MemTransport::new(PeerId(1));
+                        let node = arbitro_raft::RaftNode::new(config, storage, transport).unwrap();
+                        let mut node = node;
+                        node.become_leader_for_benchmark(Term(1));
 
-                    let start = Instant::now();
-                    let mut handles = Vec::with_capacity(clients as usize);
-                    for _ in 0..clients {
-                        let handle = handle.clone();
-                        let payload = payload_bytes.clone();
-                        handles.push(tokio::spawn(async move {
-                            for _ in 0..writes_per_client { let _ = handle.unbounded_send(payload.clone()); }
-                        }));
+                        let mut raft = ArbitroRaft::new(node);
+                        let handle = raft.handle();
+                        let raft_task = tokio::spawn(async move {
+                            let _ = raft.run().await;
+                        });
+
+                        let start = Instant::now();
+                        let mut handles = Vec::with_capacity(clients as usize);
+                        for _ in 0..clients {
+                            let handle = handle.clone();
+                            let payload = payload_bytes.clone();
+                            handles.push(tokio::spawn(async move {
+                                for _ in 0..writes_per_client {
+                                    let _ = handle.unbounded_send(payload.clone());
+                                }
+                            }));
+                        }
+                        drop(handle);
+                        for h in handles {
+                            let _ = h.await;
+                        }
+                        raft_task.abort();
+                        start.elapsed()
                     }
-                    drop(handle);
-                    for h in handles { let _ = h.await; }
-                    raft_task.abort();
-                    start.elapsed()
-                }
-            });
-        });
+                });
+            },
+        );
     }
     group.finish();
 }

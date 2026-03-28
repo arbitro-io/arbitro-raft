@@ -1,0 +1,148 @@
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use crate::{
+    HardState, InboundRaftMessageView, LogEntry, LogIndex, NodeConfig, PeerId,
+    RaftCustomRegistry, RaftError, Role, SoftState, Term, TimingConfig,
+};
+
+mod election;
+mod replication;
+mod snapshot;
+mod dispatch;
+mod progress;
+
+pub(crate) use progress::{PeerProgress, AppendAttemptState, AppendAdvance, PendingSnapshot};
+pub(crate) use dispatch::PendingCustomDispatch;
+
+pub struct RaftNode<S, T> {
+    pub(crate) config: NodeConfig,
+    pub(crate) storage: S,
+    pub(crate) transport: T,
+    pub(crate) hard_state: HardState,
+    pub(crate) soft_state: SoftState,
+    pub(crate) custom_registry: RaftCustomRegistry,
+    pub(crate) pending_custom: HashMap<u64, Box<dyn PendingCustomDispatch + Send + Sync>>,
+    pub(crate) peer_progress: HashMap<PeerId, PeerProgress>,
+    pub(crate) pending_snapshots: HashMap<PeerId, PendingSnapshot>,
+
+    // Scratchpads for Hardware Sympathy (Zero-Allocation on Hot Path)
+    pub(crate) scratch_entries: Vec<LogEntry>,
+    pub(crate) scratch_indexes: Vec<LogIndex>,
+    pub(crate) scratch_peers: Vec<PeerId>,
+    pub(crate) scratch_pending: HashMap<PeerId, AppendAttemptState>,
+    pub(crate) scratch_started: HashMap<PeerId, std::time::Instant>,
+}
+
+impl<S, T> RaftNode<S, T>
+where
+    S: crate::RaftStorage,
+    T: crate::RaftTransport,
+{
+    pub fn new(config: NodeConfig, storage: S, transport: T) -> Result<Self, RaftError> {
+        crate::validate_node_config(&config)?;
+        let hard_state = storage.load_hard_state()?;
+        let soft_state = SoftState {
+            leader_id: None,
+            is_leader: false,
+            role: Role::Follower,
+        };
+        Ok(Self {
+            config,
+            storage,
+            transport,
+            hard_state,
+            soft_state,
+            custom_registry: RaftCustomRegistry::new(),
+            pending_custom: HashMap::new(),
+            peer_progress: HashMap::new(),
+            pending_snapshots: HashMap::new(),
+            scratch_entries: Vec::new(),
+            scratch_indexes: Vec::new(),
+            scratch_peers: Vec::new(),
+            scratch_pending: HashMap::new(),
+            scratch_started: HashMap::new(),
+        })
+    }
+
+    #[inline]
+    pub fn custom_registry(&self) -> &RaftCustomRegistry { &self.custom_registry }
+
+    #[inline]
+    pub fn role(&self) -> Role { self.soft_state.role }
+
+    #[inline]
+    pub fn node_id(&self) -> PeerId { self.config.node_id }
+
+    #[inline]
+    pub fn timing(&self) -> TimingConfig { self.config.timing }
+
+    #[inline]
+    pub fn transport(&self) -> &T { &self.transport }
+
+    #[inline]
+    pub fn is_leader(&self) -> bool { self.soft_state.role == Role::Leader }
+
+    #[inline]
+    pub fn hard_state(&self) -> &HardState { &self.hard_state }
+
+    #[inline]
+    pub fn peer_progress(&self, peer: PeerId) -> Option<(LogIndex, LogIndex)> {
+        self.peer_progress.get(&peer).map(|p| (p.next_index, p.match_index))
+    }
+
+    #[doc(hidden)]
+    pub fn become_leader_for_benchmark(&mut self, term: Term) {
+        self.soft_state.is_leader = true;
+        self.soft_state.role = Role::Leader;
+        self.hard_state.current_term = term;
+        self.soft_state.leader_id = Some(self.config.node_id);
+    }
+
+    pub async fn handle_once(&mut self) -> Result<(), RaftError> {
+        let inbound = self.transport.recv().await?;
+        self.handle_inbound(inbound).await
+    }
+
+    /// O(1) Frame Dispatch
+    pub async fn handle_inbound(
+        &mut self,
+        inbound: InboundRaftMessageView,
+    ) -> Result<(), RaftError> {
+        match inbound.message {
+            crate::RaftMessageView::RequestVote(msg) => self.handle_request_vote(msg).await,
+            crate::RaftMessageView::RequestVoteResp(msg) => self.handle_request_vote_response(msg).await,
+            crate::RaftMessageView::AppendEntries(msg) => self.handle_append_entries(msg).await,
+            crate::RaftMessageView::AppendEntriesResp(msg) => self.handle_append_entries_response(msg).await,
+            crate::RaftMessageView::InstallSnapshot(msg) => self.handle_install_snapshot(msg).await,
+            crate::RaftMessageView::InstallSnapshotResp(msg) => self.handle_install_snapshot_response(msg).await,
+            crate::RaftMessageView::Custom(msg) => self.handle_custom_message(msg).await,
+            crate::RaftMessageView::CustomResponse(msg) => self.handle_custom_response(msg).await,
+        }
+    }
+
+    pub(crate) fn step_down(&mut self, new_term: Term) -> Result<(), RaftError> {
+        self.hard_state.current_term = new_term;
+        self.hard_state.voted_for = None;
+        self.storage.save_hard_state(&self.hard_state)?;
+        self.soft_state.role = Role::Follower;
+        self.soft_state.is_leader = false;
+        self.soft_state.leader_id = None;
+        self.peer_progress.clear();
+        self.pending_snapshots.clear();
+        Ok(())
+    }
+}
+
+pub(crate) fn quorum(nodes: usize) -> usize { (nodes / 2) + 1 }
+
+pub(crate) fn trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("ARBITRO_RAFT_TRACE").is_some())
+}
+
+pub(crate) fn trace_log(node_id: PeerId, msg: impl AsRef<str>) {
+    if trace_enabled() {
+        eprintln!("[raft-trace node={}] {}", node_id.0, msg.as_ref());
+    }
+}
