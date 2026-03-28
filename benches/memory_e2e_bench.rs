@@ -1,3 +1,10 @@
+// ARBITRO RAFT - CONSENSUS LAYER BENCHMARK
+// Pure Consensus Measurement (Raft only, No Network/Disk IO)
+// --------------------------------------------------------
+// Principles: Zero-Allocation on Hot Path, Zero-Copy (shallow clone)
+// Hardware Sympathy: O(1) Frame Dispatch, Pipelined Reactor
+// --------------------------------------------------------
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -6,7 +13,7 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput, Benchmar
 use arbitro_raft::{
     HardState, LogEntry, LogIndex, NodeConfig, PeerId, RaftError,
     RaftMessage, RaftStorage, RaftTransport, SnapshotMeta, Term, InboundRaftMessageView,
-    LimitsConfig, TimingConfig, ClusterId, AppendEntriesResp
+    LimitsConfig, TimingConfig, ClusterId, AppendEntriesResp, LeaderHint, ArbitroRaft
 };
 use tokio::sync::mpsc;
 use arbitro_raft::{encode_message_into, decode_message_view};
@@ -442,16 +449,16 @@ fn bench_concurrent_clients(c: &mut Criterion) {
 }
 
 fn bench_openraft_exact_match(c: &mut Criterion) {
-    let mut group = c.benchmark_group("openraft_exact_match_0_bytes");
+    let mut group = c.benchmark_group("openraft_exact_match");
     
-    // Payload VACÍO como el de OpenRaft
-    let payload_bytes = Bytes::new();
-
-    for clients in [1, 1024, 4096] {
-        let payload_bytes = payload_bytes.clone();
-        group.throughput(Throughput::Elements(1));
-        
-        group.bench_with_input(BenchmarkId::new("single_writes", clients), &clients, move |b, &clients| {
+    for payload_size in [0, 1024, 4096, 16384] {
+        let payload_bytes = Bytes::from(vec![0xAA; payload_size]);
+        for clients in [1, 1024, 4096] {
+            let payload_bytes = payload_bytes.clone();
+            group.throughput(Throughput::Elements(1));
+            
+            let id = format!("size_{}_clients_{}", payload_size, clients);
+            group.bench_with_input(BenchmarkId::new("single_writes", id), &clients, move |b, &clients| {
             let payload_bytes = payload_bytes.clone();
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(16)
@@ -481,47 +488,40 @@ fn bench_openraft_exact_match(c: &mut Criterion) {
 
                     let storage = MemStorage::new();
                     let transport = MemTransport::new(PeerId(1));
-                    let mut node = arbitro_raft::RaftNode::new(config, storage, transport).unwrap();
+                    let node = arbitro_raft::RaftNode::new(config, storage, transport).unwrap();
+                    let mut node = node;
                     node.become_leader_for_benchmark(Term(1));
+                    
+                    let mut raft = arbitro_raft::ArbitroRaft::new(node);
+                    let handle = raft.handle();
 
-                    let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
-
-                    // El "Dispatcher" multi-hilo
-                    let node_task = tokio::spawn(async move {
-                        let mut batch = Vec::with_capacity(128);
-                        while let Some(msg) = rx.recv().await {
-                            batch.push(msg);
-                            while batch.len() < 128 {
-                                if let Ok(msg) = rx.try_recv() {
-                                    batch.push(msg);
-                                } else {
-                                    break;
-                                }
-                            }
-                            let _ = node.propose_batch_once(batch.clone()).await;
-                            batch.clear();
-                        }
+                    // El Reactor de Raft en modo Turbo
+                    let raft_task = tokio::spawn(async move {
+                        let _ = raft.run().await;
                     });
 
                     let mut handles = Vec::with_capacity(clients as usize);
                     for _ in 0..clients {
-                        let tx = tx.clone();
+                        let handle = handle.clone();
                         let payload = payload_bytes.clone();
                         handles.push(tokio::spawn(async move {
                             for _ in 0..writes_per_client {
-                                let _ = tx.send(payload.clone());
+                                let _ = handle.send(payload.clone());
                             }
                         }));
                     }
-                    drop(tx);
+                    drop(handle);
                     for h in handles { let _ = h.await; }
-                    let _ = node_task.await;
+                    
+                    // Detenemos el reactor
+                    raft_task.abort();
 
                     start.elapsed()
                 }
             });
         });
     }
+}
 
     group.finish();
 }

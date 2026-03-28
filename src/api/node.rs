@@ -12,8 +12,8 @@ use crate::{
     AppendEntriesView, DispatchContextView, DispatchHandle, DispatchNodeRole, DispatchRequester,
     DispatchResponder, DispatchResponse, DispatchResponseKind, DispatchRoute, DispatchSpec,
     DispatchTx, EntryPayload, HardState, InboundRaftMessageView, InstallSnapshotRespView,
-    InstallSnapshotView, LogEntry, LogIndex, NodeConfig, PeerId, RaftCustomMessage,
-    RaftCustomMessageView, RaftCustomResponse, RaftCustomResponseView, RaftCustomRegistry,
+    InstallSnapshotView, LeaderHint, LogEntry, LogIndex, NodeConfig, PeerId, RaftCustomMessage,
+    RaftCustomMessageView, RaftCustomRegistry, RaftCustomResponse, RaftCustomResponseView,
     RaftError, RaftMessage, RaftStorage, RaftTransport, RequestVote, RequestVoteResp,
     RequestVoteRespView, RequestVoteView, Role, SoftState, Term, TimingConfig,
 };
@@ -28,7 +28,7 @@ pub struct RaftNode<S, T> {
     pending_custom: HashMap<u64, Box<dyn PendingCustomDispatch + Send + Sync>>,
     peer_progress: HashMap<PeerId, PeerProgress>,
     pending_snapshots: HashMap<PeerId, PendingSnapshot>,
-    
+
     // Scratchpads for Hardware Sympathy (Zero-Allocation on Hot Path)
     scratch_entries: Vec<LogEntry>,
     scratch_indexes: Vec<LogIndex>,
@@ -159,7 +159,11 @@ where
     where
         P: Send + 'static,
         R: 'static,
-        F: for<'a> Fn(P, DispatchContextView<'a>) -> Pin<Box<dyn Future<Output = Result<(), RaftError>> + Send + 'a>>
+        F: for<'a> Fn(
+                P,
+                DispatchContextView<'a>,
+            )
+                -> Pin<Box<dyn Future<Output = Result<(), RaftError>> + Send + 'a>>
             + Send
             + Sync
             + 'static,
@@ -328,9 +332,7 @@ where
                 self.handle_install_snapshot_response(msg).await
             }
             crate::RaftMessageView::Custom(msg) => self.handle_custom_message(msg).await,
-            crate::RaftMessageView::CustomResponse(msg) => {
-                self.handle_custom_response(msg).await
-            }
+            crate::RaftMessageView::CustomResponse(msg) => self.handle_custom_response(msg).await,
         }
     }
 
@@ -530,14 +532,14 @@ where
             });
         }
         self.ensure_leader_progress_initialized()?;
-        
+
         self.scratch_peers.clear();
         for peer in self.config.peers.iter().copied() {
             if peer != self.config.node_id {
                 self.scratch_peers.push(peer);
             }
         }
-        
+
         let mut sent = 0usize;
         let mut i = 0;
         while i < self.scratch_peers.len() {
@@ -635,21 +637,27 @@ where
         let mut accepted = 1usize;
         self.scratch_pending.clear();
         self.scratch_started.clear();
-        
+
         let mut i = 0;
         while i < self.scratch_peers.len() {
             let peer = self.scratch_peers[i];
             i += 1;
             self.scratch_started.insert(peer, Instant::now());
             if let Some(sent_last_index) = self.send_append_attempt(peer, 1).await? {
-                self.scratch_pending.insert(peer, AppendAttemptState {
-                    attempts: 1,
-                    sent_last_index,
-                });
+                self.scratch_pending.insert(
+                    peer,
+                    AppendAttemptState {
+                        attempts: 1,
+                        sent_last_index,
+                    },
+                );
             } else {
                 trace_log(
                     self.config.node_id,
-                    format!("propose_once peer={} replicated=false replicate_us=0", peer.0),
+                    format!(
+                        "propose_once peer={} replicated=false replicate_us=0",
+                        peer.0
+                    ),
                 );
             }
         }
@@ -906,16 +914,18 @@ where
     }
 
     fn build_append_for_peer(&mut self, peer: PeerId) -> Result<AppendEntries, RaftError> {
-        let progress = self
-            .peer_progress
-            .get(&peer)
-            .copied()
-            .ok_or_else(|| RaftError::Protocol(format!("missing progress for peer {}", peer.0)))?;
+        let progress =
+            self.peer_progress.get(&peer).copied().ok_or_else(|| {
+                RaftError::Protocol(format!("missing progress for peer {}", peer.0))
+            })?;
         let prev_log_index = LogIndex(progress.next_index.0.saturating_sub(1));
         let prev_log_term = self.term_at(prev_log_index)?;
         self.scratch_entries.clear();
-        self.storage
-            .read_entries(progress.next_index, LogIndex(u64::MAX), &mut self.scratch_entries)?;
+        self.storage.read_entries(
+            progress.next_index,
+            LogIndex(u64::MAX),
+            &mut self.scratch_entries,
+        )?;
         let max_entries = self.config.limits.append_batch_entries.max(1);
         let max_bytes = self.config.limits.append_batch_bytes.max(1);
         let mut taken = 0usize;
@@ -1218,7 +1228,8 @@ where
         let prev_ok = if msg.prev_log_index().0 == 0 {
             true
         } else {
-            self.storage.entry_at(msg.prev_log_index())?
+            self.storage
+                .entry_at(msg.prev_log_index())?
                 .map(|entry| entry.term == msg.prev_log_term())
                 .unwrap_or(false)
         };
@@ -1264,10 +1275,12 @@ where
             }
         }
         if append_from < entry_count {
-            let incoming_entries: Vec<LogEntry> =
-                msg.entries()?.skip(append_from).map(|entry| entry.to_owned()).collect();
-            appended = incoming_entries.len();
-            self.storage.append_entries(&incoming_entries)?;
+            self.scratch_entries.clear();
+            for entry in msg.entries()?.skip(append_from) {
+                self.scratch_entries.push(entry.to_owned());
+            }
+            appended = self.scratch_entries.len();
+            self.storage.append_entries(&self.scratch_entries)?;
         } else if must_truncate {
             appended = 0;
         }
@@ -1458,6 +1471,54 @@ where
             self.step_down(resp.term())?;
         }
         Ok(())
+    }
+    pub async fn replicate_batch_async(
+        &mut self,
+        payloads: &[Bytes],
+    ) -> Result<Vec<LogIndex>, RaftError> {
+        if !self.is_leader() {
+            return Err(RaftError::NotLeader {
+                leader_hint: self
+                    .soft_state
+                    .leader_id
+                    .map(|leader_id| LeaderHint { leader_id }),
+            });
+        }
+        if payloads.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let last_log_index = self.storage.last_log_position()?.0;
+        self.scratch_entries.clear();
+        self.scratch_indexes.clear();
+        let mut next_raw = last_log_index.0 + 1;
+        for payload in payloads {
+            let next_index = LogIndex(next_raw);
+            self.scratch_entries.push(LogEntry {
+                term: self.hard_state.current_term,
+                index: next_index,
+                payload: EntryPayload(payload.clone()),
+            });
+            self.scratch_indexes.push(next_index);
+            next_raw += 1;
+        }
+
+        self.storage.append_entries(&self.scratch_entries)?;
+
+        // Broadcast a todos sin esperar quórum
+        self.scratch_peers.clear();
+        for peer in self.config.peers.iter().copied() {
+            if peer != self.config.node_id {
+                self.scratch_peers.push(peer);
+            }
+        }
+
+        for i in 0..self.scratch_peers.len() {
+            let peer = self.scratch_peers[i];
+            let _ = self.send_append_attempt(peer, 1).await;
+        }
+
+        Ok(self.scratch_indexes.clone())
     }
 }
 

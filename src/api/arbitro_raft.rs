@@ -15,6 +15,9 @@ pub struct ArbitroRaft<S, T> {
     next_election_at: Instant,
     next_heartbeat_at: Instant,
     election_state: u64,
+    proposal_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
+    proposal_rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+    pending_batch: Vec<Bytes>,
 }
 
 impl<S, T> ArbitroRaft<S, T>
@@ -23,12 +26,16 @@ where
     T: RaftTransport,
 {
     pub fn new(node: RaftNode<S, T>) -> Self {
+        let (proposal_tx, proposal_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut raft = Self {
             election_state: seed(node.node_id()),
             node,
             stopped: false,
             next_election_at: Instant::now(),
             next_heartbeat_at: Instant::now(),
+            proposal_tx,
+            proposal_rx,
+            pending_batch: Vec::with_capacity(4096),
         };
         raft.reset_election_deadline();
         raft.reset_heartbeat_deadline();
@@ -53,6 +60,11 @@ where
     #[inline]
     pub fn node_id(&self) -> PeerId {
         self.node.node_id()
+    }
+
+    #[inline]
+    pub fn handle(&self) -> tokio::sync::mpsc::UnboundedSender<Bytes> {
+        self.proposal_tx.clone()
     }
 
     #[inline]
@@ -136,6 +148,19 @@ where
     }
 
     async fn run_leader_once(&mut self) -> Result<(), RaftError> {
+        // Adaptive Batching: Drenar todas las propuestas pendientes usando el buffer pre-alocado
+        self.pending_batch.clear();
+        while let Ok(payload) = self.proposal_rx.try_recv() {
+            self.pending_batch.push(payload);
+            if self.pending_batch.len() >= 4096 { break; }
+        }
+
+        if !self.pending_batch.is_empty() {
+            // Pasamos la referencia al buffer pre-alocado (Zero-Allocation)
+            self.node.replicate_batch_async(&self.pending_batch).await?;
+            self.pending_batch.clear();
+        }
+
         let now = Instant::now();
         if now >= self.next_heartbeat_at {
             self.node.send_heartbeat_once().await?;
