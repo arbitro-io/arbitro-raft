@@ -20,13 +20,13 @@ pub struct DispatchResponse {
     pub payload: Bytes,
 }
 
-#[async_trait(?Send)]
-pub trait DispatchResponder {
+#[async_trait]
+pub trait DispatchResponder: Send + Sync {
     async fn send_response(&self, response: DispatchResponse) -> Result<(), RaftError>;
 }
 
-#[async_trait(?Send)]
-pub trait DispatchRequester {
+#[async_trait]
+pub trait DispatchRequester: Send + Sync {
     async fn request(&self, command: u8, payload: Bytes) -> Result<Bytes, RaftError>;
 }
 

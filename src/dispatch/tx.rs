@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::task::Waker;
 use std::thread;
 
-use async_trait::async_trait;
+
 use bytes::Bytes;
 
 use crate::dispatch::{
@@ -396,8 +396,8 @@ impl<R> DispatchTxResponder<R> {
     }
 }
 
-#[async_trait(?Send)]
-impl<R: Clone> DispatchResponder for DispatchTxResponder<R> {
+#[async_trait::async_trait]
+impl<R: Clone + Send + Sync> DispatchResponder for DispatchTxResponder<R> {
     async fn send_response(&self, response: DispatchResponse) -> Result<(), RaftError> {
         match response.kind {
             DispatchResponseKind::Accepted => self.tx.accept_raw(self.peer, response.payload),

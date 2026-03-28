@@ -25,7 +25,7 @@ pub use dispatch::{
 pub use entry::{EntryPayload, LogEntry};
 pub use error::RaftError;
 pub use protocol::{
-    decode_message, decode_message_view, encode_message, AppendEntries, AppendEntriesResp,
+    decode_message, decode_message_view, encode_message, encode_message_into, AppendEntries, AppendEntriesResp,
     AppendEntriesRespView, AppendEntriesView, EntryView, InboundRaftMessage,
     InboundRaftMessageView, InstallSnapshot, InstallSnapshotResp, InstallSnapshotRespView,
     InstallSnapshotView, KIND_CUSTOM, RaftCustomMessage, RaftCustomMessageView,

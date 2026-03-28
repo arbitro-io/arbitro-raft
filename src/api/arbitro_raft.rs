@@ -65,7 +65,7 @@ where
     where
         P: Send + 'static,
         R: 'static,
-        F: for<'a> Fn(P, DispatchContextView<'a>) -> Pin<Box<dyn Future<Output = Result<(), RaftError>> + 'a>>
+        F: for<'a> Fn(P, DispatchContextView<'a>) -> Pin<Box<dyn Future<Output = Result<(), RaftError>> + Send + 'a>>
             + Send
             + Sync
             + 'static,

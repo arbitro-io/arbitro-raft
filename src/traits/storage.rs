@@ -4,13 +4,15 @@ pub trait RaftStorage: Send + Sync + 'static {
     fn load_hard_state(&self) -> Result<HardState, RaftError>;
     fn save_hard_state(&self, state: &HardState) -> Result<(), RaftError>;
     fn append_entries(&self, entries: &[LogEntry]) -> Result<(), RaftError>;
-    fn read_entries(&self, from: LogIndex, to: LogIndex) -> Result<Vec<LogEntry>, RaftError>;
+    fn read_entries(&self, from: LogIndex, to: LogIndex, out: &mut Vec<LogEntry>) -> Result<(), RaftError>;
     fn entry_at(&self, index: LogIndex) -> Result<Option<LogEntry>, RaftError> {
-        let mut entries = self.read_entries(index, LogIndex(index.0.saturating_add(1)))?;
+        let mut entries = Vec::new();
+        self.read_entries(index, LogIndex(index.0.saturating_add(1)), &mut entries)?;
         Ok(entries.pop())
     }
     fn last_log_position(&self) -> Result<(LogIndex, Term), RaftError> {
-        let entries = self.read_entries(LogIndex(1), LogIndex(u64::MAX))?;
+        let mut entries = Vec::new(); // Un único Vec para leer todo. En uso real la base de datos almacena índices sueltos de última posición o se usa otro query, pero para el fallback sirve.
+        self.read_entries(LogIndex(1), LogIndex(u64::MAX), &mut entries)?;
         if let Some(last) = entries.last() {
             Ok((last.index, last.term))
         } else {

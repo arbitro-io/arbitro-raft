@@ -3,7 +3,7 @@ mod message;
 mod view;
 
 pub use codec::{
-    decode_message, decode_message_view, encode_message, KIND_CUSTOM, RAFT_FRAME_HEADER_SIZE,
+    decode_message, decode_message_view, encode_message, encode_message_into, KIND_CUSTOM, RAFT_FRAME_HEADER_SIZE,
     RAFT_MAGIC, RAFT_VERSION,
 };
 pub use message::{

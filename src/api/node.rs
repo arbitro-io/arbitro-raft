@@ -25,9 +25,16 @@ pub struct RaftNode<S, T> {
     hard_state: HardState,
     soft_state: SoftState,
     custom_registry: RaftCustomRegistry,
-    pending_custom: HashMap<u64, Box<dyn PendingCustomDispatch>>,
+    pending_custom: HashMap<u64, Box<dyn PendingCustomDispatch + Send + Sync>>,
     peer_progress: HashMap<PeerId, PeerProgress>,
     pending_snapshots: HashMap<PeerId, PendingSnapshot>,
+    
+    // Scratchpads for Hardware Sympathy (Zero-Allocation on Hot Path)
+    scratch_entries: Vec<LogEntry>,
+    scratch_indexes: Vec<LogIndex>,
+    scratch_peers: Vec<PeerId>,
+    scratch_pending: HashMap<PeerId, AppendAttemptState>,
+    scratch_started: HashMap<PeerId, Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +63,7 @@ struct PendingSnapshot {
     bytes: Vec<u8>,
 }
 
-trait PendingCustomDispatch {
+trait PendingCustomDispatch: Send + Sync {
     fn on_response(&self, peer: PeerId, response: DispatchResponse) -> Result<(), RaftError>;
     fn is_ready(&self) -> bool;
 }
@@ -128,6 +135,11 @@ where
             pending_custom: HashMap::new(),
             peer_progress: HashMap::new(),
             pending_snapshots: HashMap::new(),
+            scratch_entries: Vec::new(),
+            scratch_indexes: Vec::new(),
+            scratch_peers: Vec::new(),
+            scratch_pending: HashMap::new(),
+            scratch_started: HashMap::new(),
         })
     }
 
@@ -135,11 +147,19 @@ where
         &self.custom_registry
     }
 
+    #[doc(hidden)]
+    pub fn become_leader_for_benchmark(&mut self, term: Term) {
+        self.soft_state.is_leader = true;
+        self.soft_state.role = Role::Leader;
+        self.hard_state.current_term = term;
+        self.soft_state.leader_id = Some(self.config.node_id);
+    }
+
     pub fn on_with<P, R, F>(&self, spec: DispatchSpec<P, R>, handler: F) -> Result<(), RaftError>
     where
         P: Send + 'static,
         R: 'static,
-        F: for<'a> Fn(P, DispatchContextView<'a>) -> Pin<Box<dyn Future<Output = Result<(), RaftError>> + 'a>>
+        F: for<'a> Fn(P, DispatchContextView<'a>) -> Pin<Box<dyn Future<Output = Result<(), RaftError>> + Send + 'a>>
             + Send
             + Sync
             + 'static,
@@ -510,14 +530,19 @@ where
             });
         }
         self.ensure_leader_progress_initialized()?;
+        
+        self.scratch_peers.clear();
+        for peer in self.config.peers.iter().copied() {
+            if peer != self.config.node_id {
+                self.scratch_peers.push(peer);
+            }
+        }
+        
         let mut sent = 0usize;
-        for peer in self
-            .config
-            .peers
-            .iter()
-            .copied()
-            .filter(|peer| *peer != self.config.node_id)
-        {
+        let mut i = 0;
+        while i < self.scratch_peers.len() {
+            let peer = self.scratch_peers[i];
+            i += 1;
             let msg = self.build_append_for_peer(peer)?;
             if self
                 .send_best_effort(peer, RaftMessage::AppendEntries(msg), "heartbeat")
@@ -558,63 +583,66 @@ where
         }
 
         let last_log_index = self.storage.last_log_position()?.0;
-        let mut entries = Vec::with_capacity(payloads.len());
-        let mut indexes = Vec::with_capacity(payloads.len());
+        self.scratch_entries.clear();
+        self.scratch_indexes.clear();
         let mut next_raw = last_log_index.0 + 1;
         let mut total_payload_bytes = 0usize;
         for payload in payloads {
             let next_index = LogIndex(next_raw);
             total_payload_bytes += payload.len();
-            entries.push(LogEntry {
+            self.scratch_entries.push(LogEntry {
                 term: self.hard_state.current_term,
                 index: next_index,
                 payload: EntryPayload(payload),
             });
-            indexes.push(next_index);
+            self.scratch_indexes.push(next_index);
             next_raw += 1;
         }
-        let first_index = *indexes.first().unwrap();
-        let last_index = *indexes.last().unwrap();
+        let first_index = *self.scratch_indexes.first().unwrap();
+        let last_index = *self.scratch_indexes.last().unwrap();
         trace_log(
             self.config.node_id,
             format!(
                 "propose_batch_once start first_index={} last_index={} entries={} payload_bytes={}",
                 first_index.0,
                 last_index.0,
-                entries.len(),
+                self.scratch_entries.len(),
                 total_payload_bytes
             ),
         );
         let append_started = Instant::now();
-        self.storage.append_entries(&entries)?;
+        self.storage.append_entries(&self.scratch_entries)?;
         trace_log(
             self.config.node_id,
             format!(
                 "propose_batch_once local_append first_index={} last_index={} entries={} append_us={}",
                 first_index.0,
                 last_index.0,
-                entries.len(),
+                self.scratch_entries.len(),
                 append_started.elapsed().as_micros()
             ),
         );
         self.ensure_leader_progress_initialized()?;
 
         let needed = quorum(self.config.peers.len());
-        let peers: Vec<_> = self
-            .config
-            .peers
-            .iter()
-            .copied()
-            .filter(|peer| *peer != self.config.node_id)
-            .collect();
+        self.scratch_peers.clear();
+        for peer in self.config.peers.iter().copied() {
+            if peer != self.config.node_id {
+                self.scratch_peers.push(peer);
+            }
+        }
 
         let mut accepted = 1usize;
-        let mut pending = HashMap::with_capacity(peers.len());
-        let mut peer_started = HashMap::with_capacity(peers.len());
-        for peer in peers {
-            peer_started.insert(peer, Instant::now());
+        self.scratch_pending.clear();
+        self.scratch_started.clear();
+        
+        let mut i = 0;
+        while i < self.scratch_peers.len() {
+            let peer = self.scratch_peers[i];
+            i += 1;
+            self.scratch_started.insert(peer, Instant::now());
             if let Some(sent_last_index) = self.send_append_attempt(peer, 1).await? {
-                pending.insert(peer, AppendAttemptState {
+                self.scratch_pending.insert(peer, AppendAttemptState {
                     attempts: 1,
                     sent_last_index,
                 });
@@ -626,14 +654,14 @@ where
             }
         }
 
-        while accepted < needed && !pending.is_empty() {
+        while accepted < needed && !self.scratch_pending.is_empty() {
             let wait_started = Instant::now();
             let Some(inbound) = self.transport.recv_timeout(self.rpc_timeout()).await? else {
                 trace_log(
                     self.config.node_id,
                     format!(
                         "propose_batch_once quorum_wait_timeout pending={} wait_us={}",
-                        pending.len(),
+                        self.scratch_pending.len(),
                         wait_started.elapsed().as_micros()
                     ),
                 );
@@ -651,7 +679,7 @@ where
 
             match inbound.message {
                 crate::RaftMessageView::AppendEntriesResp(resp) => {
-                    let Some(state) = pending.get(&inbound.from).copied() else {
+                    let Some(state) = self.scratch_pending.get(&inbound.from).copied() else {
                         self.handle_append_entries_response(resp).await?;
                         continue;
                     };
@@ -661,9 +689,9 @@ where
                         .await?
                     {
                         AppendAdvance::Completed => {
-                            pending.remove(&inbound.from);
+                            self.scratch_pending.remove(&inbound.from);
                             accepted += 1;
-                            if let Some(started) = peer_started.remove(&inbound.from) {
+                            if let Some(started) = self.scratch_started.remove(&inbound.from) {
                                 trace_log(
                                     self.config.node_id,
                                     format!(
@@ -675,11 +703,11 @@ where
                             }
                         }
                         AppendAdvance::Retry(next_state) => {
-                            pending.insert(inbound.from, next_state);
+                            self.scratch_pending.insert(inbound.from, next_state);
                         }
                         AppendAdvance::Dropped => {
-                            pending.remove(&inbound.from);
-                            if let Some(started) = peer_started.remove(&inbound.from) {
+                            self.scratch_pending.remove(&inbound.from);
+                            if let Some(started) = self.scratch_started.remove(&inbound.from) {
                                 trace_log(
                                     self.config.node_id,
                                     format!(
@@ -723,7 +751,7 @@ where
             node_id = self.config.node_id.0,
             first_index = first_index.0,
             last_index = last_index.0,
-            entries = entries.len(),
+            entries = self.scratch_entries.len(),
             term = self.hard_state.current_term.0,
             "entries committed"
         );
@@ -738,7 +766,7 @@ where
             ),
         );
         self.drain_inbound_ready().await?;
-        Ok(indexes)
+        Ok(self.scratch_indexes.clone())
     }
 
     pub async fn install_snapshot_once(
@@ -877,21 +905,22 @@ where
         Ok(())
     }
 
-    fn build_append_for_peer(&self, peer: PeerId) -> Result<AppendEntries, RaftError> {
+    fn build_append_for_peer(&mut self, peer: PeerId) -> Result<AppendEntries, RaftError> {
         let progress = self
             .peer_progress
             .get(&peer)
+            .copied()
             .ok_or_else(|| RaftError::Protocol(format!("missing progress for peer {}", peer.0)))?;
         let prev_log_index = LogIndex(progress.next_index.0.saturating_sub(1));
         let prev_log_term = self.term_at(prev_log_index)?;
-        let mut entries = self
-            .storage
-            .read_entries(progress.next_index, LogIndex(u64::MAX))?;
+        self.scratch_entries.clear();
+        self.storage
+            .read_entries(progress.next_index, LogIndex(u64::MAX), &mut self.scratch_entries)?;
         let max_entries = self.config.limits.append_batch_entries.max(1);
         let max_bytes = self.config.limits.append_batch_bytes.max(1);
         let mut taken = 0usize;
         let mut payload_bytes = 0usize;
-        for entry in &entries {
+        for entry in &self.scratch_entries {
             let next_bytes = payload_bytes.saturating_add(entry.payload.0.len());
             if taken >= max_entries || (taken > 0 && next_bytes > max_bytes) {
                 break;
@@ -899,14 +928,14 @@ where
             payload_bytes = next_bytes;
             taken += 1;
         }
-        entries.truncate(taken);
+        self.scratch_entries.truncate(taken);
         AppendEntries::new(
             self.hard_state.current_term,
             self.config.node_id,
             prev_log_index,
             prev_log_term,
             self.hard_state.commit_index,
-            &entries,
+            &self.scratch_entries,
         )
     }
 
@@ -1437,7 +1466,7 @@ struct NodeDispatchResponder<'a, T> {
     target: PeerId,
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 impl<T> DispatchResponder for NodeDispatchResponder<'_, T>
 where
     T: RaftTransport,
@@ -1457,7 +1486,7 @@ where
 struct LocalDispatchResponder<'a> {
     local_peer: PeerId,
     command: u8,
-    pending: &'a mut HashMap<u64, Box<dyn PendingCustomDispatch>>,
+    pending: &'a HashMap<u64, Box<dyn PendingCustomDispatch + Send + Sync>>,
     tx_id: u64,
 }
 
@@ -1465,7 +1494,7 @@ impl<'a> LocalDispatchResponder<'a> {
     fn new(
         local_peer: PeerId,
         command: u8,
-        pending: &'a mut HashMap<u64, Box<dyn PendingCustomDispatch>>,
+        pending: &'a HashMap<u64, Box<dyn PendingCustomDispatch + Send + Sync>>,
         tx_id: u64,
     ) -> Self {
         Self {
@@ -1477,7 +1506,7 @@ impl<'a> LocalDispatchResponder<'a> {
     }
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 impl DispatchResponder for LocalDispatchResponder<'_> {
     async fn send_response(&self, response: DispatchResponse) -> Result<(), RaftError> {
         if let Some(pending) = self.pending.get(&self.tx_id) {
@@ -1501,7 +1530,7 @@ struct NodeDispatchRequester<'a, T> {
     timeout: Duration,
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 impl<T> DispatchRequester for NodeDispatchRequester<'_, T>
 where
     T: RaftTransport,

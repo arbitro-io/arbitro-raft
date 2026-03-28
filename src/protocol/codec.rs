@@ -388,9 +388,16 @@ where
 }
 
 pub fn encode_message(from: PeerId, msg: &RaftMessage) -> Result<Bytes, RaftError> {
-    let started = Instant::now();
     let body_len = body_len(msg)?;
     let mut frame = BytesMut::with_capacity(RAFT_FRAME_HEADER_SIZE + body_len);
+    encode_message_into(from, msg, &mut frame)?;
+    Ok(frame.freeze())
+}
+
+pub fn encode_message_into(from: PeerId, msg: &RaftMessage, buf: &mut BytesMut) -> Result<(), RaftError> {
+    let started = Instant::now();
+    let body_len = body_len(msg)?;
+    buf.reserve(RAFT_FRAME_HEADER_SIZE + body_len);
     let header = RaftFrameHeader {
         magic: U32::new(RAFT_MAGIC),
         version: RAFT_VERSION,
@@ -400,7 +407,7 @@ pub fn encode_message(from: PeerId, msg: &RaftMessage) -> Result<Bytes, RaftErro
         body_len: U32::new(body_len as u32),
         reserved: U32::new(0),
     };
-    frame.extend_from_slice(header.as_bytes());
+    buf.extend_from_slice(header.as_bytes());
 
     match msg {
         RaftMessage::RequestVote(msg) => {
@@ -410,7 +417,7 @@ pub fn encode_message(from: PeerId, msg: &RaftMessage) -> Result<Bytes, RaftErro
                 last_log_index: U64::new(msg.last_log_index.0),
                 last_log_term: U64::new(msg.last_log_term.0),
             };
-            frame.extend_from_slice(body.as_bytes());
+            buf.extend_from_slice(body.as_bytes());
         }
         RaftMessage::RequestVoteResp(msg) => {
             let body = RequestVoteRespBody {
@@ -418,10 +425,10 @@ pub fn encode_message(from: PeerId, msg: &RaftMessage) -> Result<Bytes, RaftErro
                 vote_granted: u8::from(msg.vote_granted),
                 _pad: [0; 7],
             };
-            frame.extend_from_slice(body.as_bytes());
+            buf.extend_from_slice(body.as_bytes());
         }
         RaftMessage::AppendEntries(msg) => {
-            frame.extend_from_slice(msg.bytes().as_ref());
+            buf.extend_from_slice(msg.bytes().as_ref());
         }
         RaftMessage::AppendEntriesResp(msg) => {
             let body = AppendEntriesRespBody {
@@ -430,7 +437,7 @@ pub fn encode_message(from: PeerId, msg: &RaftMessage) -> Result<Bytes, RaftErro
                 success: u8::from(msg.success),
                 _pad: [0; 7],
             };
-            frame.extend_from_slice(body.as_bytes());
+            buf.extend_from_slice(body.as_bytes());
         }
         RaftMessage::InstallSnapshot(msg) => {
             let body = InstallSnapshotBody {
@@ -443,8 +450,8 @@ pub fn encode_message(from: PeerId, msg: &RaftMessage) -> Result<Bytes, RaftErro
                 done: u8::from(msg.chunk.done),
                 _pad: [0; 3],
             };
-            frame.extend_from_slice(body.as_bytes());
-            frame.extend_from_slice(msg.chunk.bytes.as_ref());
+            buf.extend_from_slice(body.as_bytes());
+            buf.extend_from_slice(msg.chunk.bytes.as_ref());
         }
         RaftMessage::InstallSnapshotResp(msg) => {
             let body = InstallSnapshotRespBody {
@@ -453,28 +460,26 @@ pub fn encode_message(from: PeerId, msg: &RaftMessage) -> Result<Bytes, RaftErro
                 accepted: u8::from(msg.accepted),
                 _pad: [0; 7],
             };
-            frame.extend_from_slice(body.as_bytes());
+            buf.extend_from_slice(body.as_bytes());
         }
         RaftMessage::Custom(msg) => {
-            frame.extend_from_slice(msg.bytes.as_ref());
+            buf.extend_from_slice(msg.bytes.as_ref());
         }
         RaftMessage::CustomResponse(msg) => {
-            frame.extend_from_slice(msg.bytes.as_ref());
+            buf.extend_from_slice(msg.bytes.as_ref());
         }
     }
 
-    let frame = frame.freeze();
     trace_log(
         from,
         format!(
-            "encode kind={} body_len={} total_len={} encode_us={}",
+            "encode kind={} body_len={} encode_us={}",
             kind_of(msg),
             body_len,
-            frame.len(),
             started.elapsed().as_micros()
         ),
     );
-    Ok(frame)
+    Ok(())
 }
 
 pub fn decode_message_view(frame: Bytes) -> Result<super::view::InboundRaftMessageView, RaftError> {

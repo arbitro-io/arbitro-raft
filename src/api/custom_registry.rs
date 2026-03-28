@@ -10,7 +10,7 @@ use crate::dispatch::{
 };
 use crate::RaftError;
 
-type DispatchFuture<'a> = Pin<Box<dyn Future<Output = Result<(), RaftError>> + 'a>>;
+type DispatchFuture<'a> = Pin<Box<dyn Future<Output = Result<(), RaftError>> + Send + 'a>>;
 type ErasedHandler =
     Arc<dyn for<'a> Fn(DispatchView, DispatchContextView<'a>) -> DispatchFuture<'a> + Send + Sync>;
 
