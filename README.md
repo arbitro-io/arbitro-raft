@@ -1,6 +1,6 @@
 # arbitro-raft
 
-**Predictable Consensus at Scale.**
+**Predictable Consensus at Scale (v0.2.0 — The Zero-Copy Era).**
 
 `arbitro-raft` is a transport-agnostic and storage-agnostic Raft core designed for high-concurrency message brokers. It is the heart of the Arbitro ecosystem, built with a single constraint: **Hardware Sympathy**.
 
@@ -26,7 +26,7 @@ We don't promise "infinite" scale. We show you the actual physical bounds of our
 ## Core Philosophy
 
 ### Zero-Allocation Hot Path
-In `arbitro-raft`, the hot path (replicate, deliver, ACK) never touches the heap. We use **Memory Scratchpads**—pre-allocated vectors and buffers—to handle ráfagas of messages without triggering the allocator.
+In `arbitro-raft`, the hot path (replicate, deliver, ACK) never touches the heap. We use **Memory Scratchpads**—pre-allocated vectors and buffers—to handle ráfagas of messages without triggering the allocator. We removed `serde` completely; all protocol frames are mapped directly to memory via `zerocopy` slices and atomic `Bytes` references.
 
 ### Zero-Cost Abstraction
 The core has been refactored into a modular architecture (`src/api/node/`) for maintainability. However, thanks to Rust's monomorphization and aggressive inlining, this modularity has **zero overhead**. The compiler treats the fragmented modules as a single, optimized block of machine code.
@@ -46,8 +46,9 @@ Forget long `if-else` chains. Our frame dispatcher uses a direct jump table (via
   - `replication.rs`: Leader/Follower flow and Adaptive Batching.
   - `snapshot.rs`: State recovery protocol.
   - `dispatch.rs`: Custom RPC extension layer.
+- **[NEW] Byte-Pure Transport**: The `RaftTransport` trait expects and returns raw `Bytes`. The core codec builds responses via zero-copy overlays, preventing serialization overhead.
 - **[NEW] Zero-Allocation Scratchpads**: Pre-allocated structures for peer tracking and entry building.
-- **Lazy Protocol Views**: Inspect wire data over `Bytes` without materializing owned structs.
+- **Lazy Protocol Views**: Inspect wire data over `Bytes` directly from the socket without materializing owned structs.
 
 ---
 

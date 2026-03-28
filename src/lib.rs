@@ -28,7 +28,7 @@ pub use protocol::{
     decode_message, decode_message_view, encode_message, encode_message_into, AppendEntries, AppendEntriesResp,
     AppendEntriesRespView, AppendEntriesView, EntryView, InboundRaftMessage,
     InboundRaftMessageView, InstallSnapshot, InstallSnapshotResp, InstallSnapshotRespView,
-    InstallSnapshotView, KIND_CUSTOM, RaftCustomMessage, RaftCustomMessageView,
+    InstallSnapshotView, KIND_CUSTOM, KIND_CUSTOM_RESPONSE, RaftCustomMessage, RaftCustomMessageView,
     RaftCustomResponse, RaftCustomResponseView, RaftMessage, RaftMessageView, RequestVote,
     RequestVoteResp, RequestVoteRespView, RequestVoteView, SnapshotChunk,
     RAFT_FRAME_HEADER_SIZE, RAFT_MAGIC, RAFT_VERSION,

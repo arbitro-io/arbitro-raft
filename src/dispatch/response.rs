@@ -49,6 +49,9 @@ impl DispatchResponseView {
                 "dispatch response body length mismatch".into(),
             ));
         }
+        if header.kind > 3 {
+            return Err(RaftError::Dispatch("unknown dispatch response kind".into()));
+        }
         Ok(Self { frame })
     }
 
