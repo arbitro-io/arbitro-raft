@@ -69,7 +69,6 @@ where
         &mut self,
         payloads: Vec<Bytes>,
     ) -> Result<Vec<LogIndex>, RaftError> {
-        let started = Instant::now();
         if !self.is_leader() {
             return Err(RaftError::NotLeader {
                 leader_hint: self
@@ -130,6 +129,39 @@ where
 
         let timeout = Duration::from_millis(self.config.timing.heartbeat_ms as u64 * 2);
         while accepted < needed && !self.scratch_pending.is_empty() {
+            // Burst-drain: process all ready frames without yielding to the timer
+            while let Some(raw) = self.transport.recv_frame_timeout(Duration::ZERO).await? {
+                let inbound = crate::decode_message_view(raw)?;
+                let from = inbound.from;
+                if let crate::RaftMessageView::AppendEntriesResp(resp) = inbound.message {
+                    if let Some(state) = self.scratch_pending.get(&from).copied() {
+                        if let AppendAdvance::Completed = self
+                            .advance_append_replication(from, last_index, state, resp)
+                            .await?
+                        {
+                            self.scratch_pending.remove(&from);
+                            accepted += 1;
+                        }
+                    } else {
+                        self.handle_append_entries_response(resp).await?;
+                    }
+                } else {
+                    self.handle_inbound(InboundRaftMessageView {
+                        from,
+                        message: inbound.message,
+                    })
+                    .await?;
+                }
+                if accepted >= needed || self.scratch_pending.is_empty() {
+                    break;
+                }
+            }
+
+            if accepted >= needed || self.scratch_pending.is_empty() {
+                break;
+            }
+
+            // Blocking wait: yield only when the queue is actually empty
             let raw = match self.transport.recv_frame_timeout(timeout).await? {
                 Some(r) => r,
                 None => break,
@@ -139,24 +171,16 @@ where
 
             match inbound.message {
                 crate::RaftMessageView::AppendEntriesResp(resp) => {
-                    let Some(state) = self.scratch_pending.get(&from).copied() else {
-                        self.handle_append_entries_response(resp).await?;
-                        continue;
-                    };
-                    match self
-                        .advance_append_replication(from, last_index, state, resp)
-                        .await?
-                    {
-                        AppendAdvance::Completed => {
+                    if let Some(state) = self.scratch_pending.get(&from).copied() {
+                        if let AppendAdvance::Completed = self
+                            .advance_append_replication(from, last_index, state, resp)
+                            .await?
+                        {
                             self.scratch_pending.remove(&from);
                             accepted += 1;
                         }
-                        AppendAdvance::Retry(next_state) => {
-                            self.scratch_pending.insert(from, next_state);
-                        }
-                        _ => {
-                            self.scratch_pending.remove(&from);
-                        }
+                    } else {
+                        self.handle_append_entries_response(resp).await?;
                     }
                 }
                 message => {
@@ -170,17 +194,7 @@ where
             return Err(RaftError::NoQuorum);
         }
 
-        // commit_index is volatile — no save_hard_state needed for commit advance alone
         self.soft_state.commit_index = last_index;
-
-        super::trace_log(
-            self.config.node_id,
-            format!(
-                "propose_batch_once committed last_index={} total_us={}",
-                last_index.0,
-                started.elapsed().as_micros()
-            ),
-        );
         self.drain_inbound_ready().await?;
         Ok(self.scratch_indexes.clone())
     }
@@ -498,8 +512,6 @@ where
 
         for i in 0..self.scratch_peers.len() {
             let peer = self.scratch_peers[i];
-            // Fire-and-forget: errors are logged, not propagated — the heartbeat cycle
-            // recovers missed peers. Silent drop is forbidden; warn on failure.
             if let Err(e) = self.send_append_attempt(peer, 1).await {
                 warn!(peer = peer.0, error = %e, "replicate_batch_async: send attempt failed");
             }

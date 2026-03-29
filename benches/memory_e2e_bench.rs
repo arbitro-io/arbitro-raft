@@ -8,9 +8,8 @@ use std::time::{Duration, Instant};
 
 use arbitro_raft::{decode_message_view, encode_message};
 use arbitro_raft::{
-    AppendEntriesResp, ArbitroRaft, BootstrapPeer, ClusterId, HardState,
-    LogEntry, LogIndex, NodeConfig, PeerId, RaftError, RaftMessage, RaftStorage, RaftTransport,
-    SnapshotMeta, Term,
+    AppendEntriesResp, ArbitroRaft, BootstrapPeer, ClusterId, HardState, LogEntry, LogIndex,
+    NodeConfig, PeerId, RaftError, RaftMessage, RaftStorage, RaftTransport, SnapshotMeta, Term,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -84,7 +83,10 @@ impl RaftStorage for MemStorage {
     // O(1) overrides — default impls are O(N) scan which would invalidate bench results
     fn last_log_position(&self) -> Result<(LogIndex, Term), RaftError> {
         let entries = self.entries.lock().unwrap();
-        Ok(entries.last().map(|e| (e.index, e.term)).unwrap_or((LogIndex(0), Term(0))))
+        Ok(entries
+            .last()
+            .map(|e| (e.index, e.term))
+            .unwrap_or((LogIndex(0), Term(0))))
     }
     fn entry_at(&self, index: LogIndex) -> Result<Option<LogEntry>, RaftError> {
         let entries = self.entries.lock().unwrap();
@@ -108,7 +110,11 @@ struct MemTransport {
 impl MemTransport {
     fn new(local_id: PeerId) -> Self {
         let (tx, rx) = futures::channel::mpsc::unbounded();
-        Self { local_id, tx, rx: tokio::sync::Mutex::new(rx) }
+        Self {
+            local_id,
+            tx,
+            rx: tokio::sync::Mutex::new(rx),
+        }
     }
 }
 
@@ -119,9 +125,10 @@ impl RaftTransport for MemTransport {
         // On AppendEntries: simulate a successful response from the peer.
         let inbound = decode_message_view(frame)?;
         if let arbitro_raft::RaftMessageView::AppendEntries(ae) = &inbound.message {
-            let last_idx = ae.entries()
+            let last_idx = ae
+                .entries()
                 .ok()
-                .and_then(|mut it| it.last())
+                .and_then(|it| it.last())
                 .map(|e| e.index())
                 .unwrap_or(ae.prev_log_index());
 
@@ -145,11 +152,14 @@ impl RaftTransport for MemTransport {
         }
     }
 
-    async fn recv_frame_timeout(
-        &self,
-        timeout: Duration,
-    ) -> Result<Option<Bytes>, RaftError> {
+    async fn recv_frame_timeout(&self, timeout: Duration) -> Result<Option<Bytes>, RaftError> {
         let mut rx = self.rx.lock().await;
+        if timeout.is_zero() {
+            return match rx.try_next() {
+                Ok(Some(msg)) => Ok(Some(msg)),
+                _ => Ok(None),
+            };
+        }
         match tokio::time::timeout(timeout, rx.next()).await {
             Ok(Some(frame)) => Ok(Some(frame)),
             Ok(None) | Err(_) => Ok(None),
@@ -167,9 +177,18 @@ fn make_config(node_id: PeerId) -> NodeConfig {
         cluster_id: ClusterId(1),
         peers: vec![PeerId(1), PeerId(2), PeerId(3)],
         bootstrap_peers: vec![
-            BootstrapPeer { id: PeerId(1), addr: "127.0.0.1:8001".parse().unwrap() },
-            BootstrapPeer { id: PeerId(2), addr: "127.0.0.1:8002".parse().unwrap() },
-            BootstrapPeer { id: PeerId(3), addr: "127.0.0.1:8003".parse().unwrap() },
+            BootstrapPeer {
+                id: PeerId(1),
+                addr: "127.0.0.1:8001".parse().unwrap(),
+            },
+            BootstrapPeer {
+                id: PeerId(2),
+                addr: "127.0.0.1:8002".parse().unwrap(),
+            },
+            BootstrapPeer {
+                id: PeerId(3),
+                addr: "127.0.0.1:8003".parse().unwrap(),
+            },
         ],
         ..Default::default()
     }
@@ -189,6 +208,9 @@ fn make_leader() -> ArbitroRaft<MemStorage, MemTransport> {
 
 fn bench_memory_hot_path(c: &mut Criterion) {
     let mut group = c.benchmark_group("raft_hot_path_zero_copy");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(1));
+    group.warm_up_time(Duration::from_millis(1));
     let payload_size = 1024;
     let payload_bytes = Bytes::from(vec![0xAA; payload_size]);
     let batch_size = 50;
@@ -201,19 +223,11 @@ fn bench_memory_hot_path(c: &mut Criterion) {
             .build()
             .unwrap();
         let payload_ref = payload_bytes.clone();
-        b.to_async(&runtime).iter_custom(move |iters| {
-            let payload_bytes = payload_ref.clone();
+        b.to_async(&runtime).iter(|| {
+            let mut raft = make_leader();
+            let payload = payload_ref.clone();
             async move {
-                let mut raft = make_leader();
-                let handle = raft.handle();
-                let raft_task = tokio::spawn(async move { let _ = raft.run().await; });
-                let start = Instant::now();
-                for _ in 0..iters {
-                    let _ = handle.unbounded_send(payload_bytes.clone());
-                }
-                drop(handle);
-                raft_task.abort();
-                start.elapsed()
+                let _ = raft.propose_once(payload).await.unwrap();
             }
         });
     });
@@ -231,7 +245,9 @@ fn bench_memory_hot_path(c: &mut Criterion) {
             async move {
                 let mut raft = make_leader();
                 let handle = raft.handle();
-                let raft_task = tokio::spawn(async move { let _ = raft.run().await; });
+                let raft_task = tokio::spawn(async move {
+                    let _ = raft.run().await;
+                });
                 let payloads = vec![payload_bytes.clone(); batch_size];
                 let start = Instant::now();
                 for _ in 0..iters {
@@ -245,57 +261,75 @@ fn bench_memory_hot_path(c: &mut Criterion) {
             }
         });
     });
+
     group.finish();
 }
 
-fn bench_concurrent_clients(c: &mut Criterion) {
-    let mut group = c.benchmark_group("concurrent_clients");
+fn bench_throughput_scenarios(c: &mut Criterion) {
+    let mut group = c.benchmark_group("raft_throughput");
+    group.sample_size(10);
     let payload_size = 1024;
     let payload_bytes = Bytes::from(vec![0xAA; payload_size]);
 
-    for clients in [1u64, 64, 256, 1024, 4096] {
-        group.throughput(Throughput::Elements(1));
-        group.bench_with_input(
-            BenchmarkId::new("single_writes", clients),
-            &clients,
-            |b, &clients| {
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(16)
-                    .enable_all()
-                    .build()
-                    .unwrap();
-                let payload_ref = payload_bytes.clone();
-                b.to_async(&runtime).iter_custom(move |iters| {
-                    let payload_bytes = payload_ref.clone();
-                    async move {
-                        let iters = iters.max(clients);
-                        let writes_per_client = iters / clients;
-                        let mut raft = make_leader();
-                        let handle = raft.handle();
-                        let raft_task = tokio::spawn(async move { let _ = raft.run().await; });
+    let scenarios = [
+        (1, 1, "put_s_1"),
+        (64, 1, "put_s_64"),
+        (256, 1, "put_s_256"),
+        (1024, 1, "put_s_1024"),
+        (4096, 1, "put_s_4096"),
+        (4096, 4, "put_s_batch_4_4096"),
+    ];
 
-                        let start = Instant::now();
-                        let mut handles = Vec::with_capacity(clients as usize);
-                        for _ in 0..clients {
-                            let handle = handle.clone();
-                            let payload = payload_bytes.clone();
-                            handles.push(tokio::spawn(async move {
-                                for _ in 0..writes_per_client {
-                                    let _ = handle.unbounded_send(payload.clone());
+    for (num_clients, batch_size, name) in scenarios {
+        let payload_ref = payload_bytes.clone();
+        group.throughput(Throughput::Elements((num_clients * batch_size) as u64));
+        group.bench_function(name, |b| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(16)
+                .enable_all()
+                .build()
+                .unwrap();
+            let p_ref = payload_ref.clone();
+            b.to_async(&runtime).iter_custom(move |iters| {
+                let p = p_ref.clone();
+                async move {
+                    let mut raft = make_leader();
+                    let handle = raft.handle();
+                    let raft_task = tokio::spawn(async move {
+                        let _ = raft.run().await;
+                    });
+
+                    let start = Instant::now();
+                    let mut futures = Vec::new();
+                    
+                    // We split 'iters' across clients for total throughput measure
+                    // but since num_clients can be large, we ensure each client does a fair share.
+                    let iters_per_client = iters.max(1);
+                    
+                    for _ in 0..num_clients {
+                        let h = handle.clone();
+                        let p = p.clone();
+                        futures.push(tokio::spawn(async move {
+                            for _ in 0..iters_per_client {
+                                for _ in 0..batch_size {
+                                    let _ = h.unbounded_send(p.clone());
                                 }
-                            }));
-                        }
-                        drop(handle);
-                        for h in handles { let _ = h.await; }
-                        raft_task.abort();
-                        start.elapsed()
+                            }
+                        }));
                     }
-                });
-            },
-        );
+                    for f in futures {
+                        let _ = f.await;
+                    }
+
+                    drop(handle);
+                    raft_task.abort();
+                    start.elapsed()
+                }
+            });
+        });
     }
     group.finish();
 }
 
-criterion_group!(benches, bench_memory_hot_path, bench_concurrent_clients);
+criterion_group!(benches, bench_memory_hot_path, bench_throughput_scenarios);
 criterion_main!(benches);

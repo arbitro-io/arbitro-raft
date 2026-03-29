@@ -155,13 +155,24 @@ where
         self.pending_batch.clear();
         while let Ok(payload) = self.proposal_rx.try_recv() {
             self.pending_batch.push(payload);
-            // Bound the batch to avoid starving the heartbeat loop
-            if self.pending_batch.len() >= 4096 { break; }
+            if self.pending_batch.len() >= self.node.config.limits.append_batch_entries { break; }
         }
 
         if !self.pending_batch.is_empty() {
             self.node.replicate_batch_async(&self.pending_batch).await?;
             self.pending_batch.clear();
+        }
+
+        let mut processed = 0;
+        while let Some(raw) = self.node.transport().recv_frame_timeout(Duration::ZERO).await? {
+            let inbound = crate::decode_message_view(raw)?;
+            self.node.handle_inbound(inbound).await?;
+            processed += 1;
+            if processed >= 128 { break; }
+        }
+
+        if processed > 0 {
+            return Ok(());
         }
 
         let now = Instant::now();
@@ -172,21 +183,28 @@ where
         }
 
         let timeout = self.next_heartbeat_at.saturating_duration_since(now);
-        match self.node.transport().recv_frame_timeout(timeout).await? {
-            Some(raw) => {
-                let inbound = crate::decode_message_view(raw)?;
-                self.node.handle_inbound(inbound).await?;
-            }
-            None => {
-                self.node.send_heartbeat_once().await?;
-                self.reset_heartbeat_deadline();
-            }
+        if let Some(raw) = self.node.transport().recv_frame_timeout(timeout).await? {
+            let inbound = crate::decode_message_view(raw)?;
+            self.node.handle_inbound(inbound).await?;
         }
 
         Ok(())
     }
 
     async fn run_follower_once(&mut self) -> Result<(), RaftError> {
+        let mut processed = 0;
+        while let Some(raw) = self.node.transport().recv_frame_timeout(Duration::ZERO).await? {
+            let inbound = crate::decode_message_view(raw)?;
+            self.node.handle_inbound(inbound).await?;
+            processed += 1;
+            if processed >= 128 { break; }
+        }
+
+        if processed > 0 {
+            self.reset_election_deadline();
+            return Ok(());
+        }
+
         let now = Instant::now();
         let timeout = self.next_election_at.saturating_duration_since(now);
         match self.node.transport().recv_frame_timeout(timeout).await? {

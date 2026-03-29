@@ -1,389 +1,351 @@
-# ARBITRO-RAFT — GUÍA DE CONTRIBUCIÓN
-
-Este crate implementa el núcleo del protocolo Raft para el ecosistema Arbitro.
-Hereda **todas** las reglas de `AGENTS.md` del repositorio raíz. Las reglas
-de este documento son de alcance crate y refinan o especifican lo que `AGENTS.md`
-establece a nivel ecosistema.
-
+---
+trigger: always_on
 ---
 
-## CAPAS DEL CRATE
+# ARBITRO-RAFT — Contribution Rules for Agents
 
-El crate tiene tres capas ordenadas. Una capa superior **nunca** importa de una
-capa igual o superior a ella en otra rama.
+You are working inside `arbitro-raft`, the Raft core for Arbitro. This crate inherits all root `AGENTS.md` rules. The rules below are crate-specific and mandatory.
 
-```
-protocol/          ← Serialización wire. Sin lógica de Raft.
-state/ types/ error/ entry/ config/ validation/ traits/  ← Tipos puros.
-api/               ← Lógica Raft + orquestación de las capas inferiores.
-```
+## 1) Layering
 
-| Módulo | Responsabilidad |
-|---|---|
-| `protocol/codec.rs` | Serialización / deserialización zerocopy de frames |
-| `protocol/view.rs` | Vistas zero-copy sobre frames recibidos |
-| `protocol/message.rs` | Tipos owned para frames creados en sender |
-| `dispatch/` | Protocolo de dispatch personalizado sobre Raft custom |
-| `api/node/` | Máquina de estados Raft (election, replication, snapshot, dispatch) |
-| `api/arbitro_raft.rs` | Loop de ejecución, batching, scheduling de timers |
-| `api/custom_registry.rs` | Registro de handlers de dispatch por command byte |
+The crate has 3 ordered layers:
 
----
-
-## ESTADO RAFT — QUÉ ES HARD Y QUÉ ES SOFT
-
-Esta distinción es un invariante de correctness, no de estilo.
-
-### HardState — persiste en cada transición
-
-```
-current_term   ← obligatorio en disco antes de cualquier send
-voted_for      ← obligatorio en disco antes de votar
+```txt
+protocol/   -> wire serialization only, no Raft logic
+state/ types/ error/ entry/ config/ validation/ traits/ -> pure types
+api/        -> Raft logic and orchestration
 ```
 
-> **`commit_index` NO pertenece al HardState.**
-> Es estado volátil. Debe vivir en `SoftState` o en memoria directa del nodo.
-> Restaurar `commit_index` desde disco puede hacer creer al nodo que entradas
-> están comprometidas cuando el log fue truncado — violación de linearizabilidad.
+A higher layer must never import from an equal or higher layer in another branch.
 
-### SoftState — reconstruido en memoria al reiniciar
+### Module responsibilities
 
-```
-role          (Follower al iniciar siempre)
-leader_id     (None al iniciar siempre)
-is_leader     (false al iniciar siempre)
-commit_index  (0 al iniciar; el líder lo propaga via AppendEntries)
-```
+- `protocol/codec.rs` -> zero-copy wire encode/decode
+- `protocol/view.rs` -> zero-copy views over received frames
+- `protocol/message.rs` -> owned outbound message types
+- `dispatch/` -> custom dispatch protocol over Raft
+- `api/node/` -> Raft state machine: election, replication, snapshot, dispatch
+- `api/arbitro_raft.rs` -> execution loop, batching, timers
+- `api/custom_registry.rs` -> dispatch handler registry by command byte
 
----
+## 2) HardState vs SoftState
 
-## PROTOCOLO WIRE — REGLAS DE CODIFICACIÓN
+This is a correctness invariant, not style.
 
-### Constantes
+### HardState
 
-Todas las constantes de protocolo están definidas en `protocol/codec.rs`.
-**Nunca** uses literales hex directamente — usa las constantes nombradas.
+Must be durably persisted on every relevant transition:
 
-| Constante | Valor | Uso |
-|---|---|---|
-| `RAFT_MAGIC` | `0x5241_4654` | Identifica frame Raft |
-| `RAFT_VERSION` | `0x01` | Versión de protocolo |
-| `RAFT_FRAME_HEADER_SIZE` | `size_of::<RaftFrameHeader>()` | Offset al body |
-| `RAFT_DISPATCH_MAGIC` | `0x4453_5054` | Frame de dispatch custom |
-| `RAFT_DISPATCH_RESPONSE_MAGIC` | `0x4452_5350` | Frame de respuesta dispatch |
+- `current_term` -> persist before any send
+- `voted_for` -> persist before voting
+
+### SoftState
+
+Rebuilt in memory on restart:
+
+- `role` -> starts as `Follower`
+- `leader_id` -> starts as `None`
+- `is_leader` -> starts as `false`
+- `commit_index` -> starts at `0`; leader propagates it via AppendEntries
+
+### Critical rule
+
+`commit_index` is **not** HardState. Never persist or restore it from disk. Restoring it can violate linearizability if the log was truncated.
+
+## 3) Wire Protocol Rules
+
+### Constants
+
+All protocol constants must live in `protocol/codec.rs`. Never use raw hex literals directly. Use named constants only.
+
+- `RAFT_MAGIC = 0x5241_4654`
+- `RAFT_VERSION = 0x01`
+- `RAFT_FRAME_HEADER_SIZE = size_of::<RaftFrameHeader>()`
+- `RAFT_DISPATCH_MAGIC = 0x4453_5054`
+- `RAFT_DISPATCH_RESPONSE_MAGIC = 0x4452_5350`
 
 ### Endianness
 
-Todo el wire es **little-endian**. Usar `zerocopy::byteorder::little_endian::{U16, U32, U64}`
-para todos los campos multi-byte en structs `#[repr(C)]`.
+All wire fields are **little-endian**. Use `zerocopy::byteorder::little_endian::{U16, U32, U64}` for all multi-byte fields in `#[repr(C)]` structs.
 
 ### Padding
 
-Cada struct de wire debe estar alineado a **8 bytes**. Los campos `_pad` explícitos
-son parte del contrato de formato — no eliminar, no cambiar de tamaño sin bump de versión.
+Every wire struct must remain **8-byte aligned**. Explicit `_pad` fields are part of the wire contract. Do not remove or resize them without a protocol version bump.
 
-### Validación al recibir
+### Receive validation
 
-1. Verificar magic → error si no coincide.
-2. Verificar version → error si no soportada.
-3. Verificar que `body_len` coincide con bytes restantes → error si no.
-4. Para AppendEntries: iterar todos los `EntryHeader` y verificar que `payload_end <= body.len()`.
+Before reading any field:
 
-**Nunca** accedas a un campo de un frame sin haberlo validado primero. Las funciones
-`parse_*_view` son la única entrada válida a frames recibidos.
+1. validate `magic`
+2. validate `version`
+3. validate `body_len` against remaining bytes
+4. for `AppendEntries`, validate every `EntryHeader` so `payload_end <= body.len()`
 
----
+Never access a received frame before validation. `parse_*_view` functions are the only valid entry points for inbound frames.
 
-## HOT PATH — ESPECIFICACIONES PARA ESTE CRATE
+## 4) Hot Path Rules
 
-Complementa las reglas globales de `AGENTS.md` con lo siguiente:
+These refine the root performance rules.
 
-### Zero-allocation en el hot path
+### No allocations in hot paths
 
-Los `Vec` de scratchpad pre-alocados en `RaftNode` son la única forma válida
-de acumular datos temporales en funciones hot:
+Preallocated scratchpads in `RaftNode` are the only valid temporary buffers:
 
 ```rust
-// ✅ Correcto — reusar scratchpad pre-alocado
 self.scratch_entries.clear();
 self.storage.read_entries(from, to, &mut self.scratch_entries)?;
-
-// ❌ Prohibido — new allocation por llamada
-let entries: Vec<LogEntry> = self.storage.read_entries_owned(from, to)?;
 ```
 
-Los campos de scratchpad en `RaftNode` son:
-- `scratch_entries: Vec<LogEntry>` — entries temporales para replicación
-- `scratch_indexes: Vec<LogIndex>` — índices de un batch propuesto
-- `scratch_peers: Vec<PeerId>` — peers destino temporales
-- `scratch_pending: HashMap<PeerId, AppendAttemptState>` — estado de intento en curso
-- `scratch_started: HashMap<PeerId, Instant>` — timing de operaciones en curso
+Do **not** allocate new `Vec` or `HashMap` in per-frame paths.
 
-**Siempre** llamar `.clear()` antes de usar un scratchpad, nunca asumir que está vacío.
+Scratchpads:
 
-### Views vs Owned en el hot path
+- `scratch_entries: Vec<LogEntry>`
+- `scratch_indexes: Vec<LogIndex>`
+- `scratch_peers: Vec<PeerId>`
+- `scratch_pending: HashMap<PeerId, AppendAttemptState>`
+- `scratch_started: HashMap<PeerId, Instant>`
 
-| Situación | Usar |
-|---|---|
-| Frame recibido — procesado sin salir de la función | `*View` (zero-copy) |
-| Frame que debe ser almacenado o enviado por canal | `Owned` (via `.to_owned()`) |
-| Bytes que se re-envían sin modificar | `Bytes::clone()` (Arc bump, no copia) |
+Always call `.clear()` before reuse.
 
-`Bytes::clone()` es O(1) y no copia el buffer — es la forma correcta de pasar
-el mismo frame a múltiples destinatarios.
+### Views vs owned
 
-### Dispatch en el hot path — switch, no if-chain
+- received frame, used only locally -> `*View`
+- frame stored or sent across channels -> owned via `.to_owned()`
+- same bytes forwarded unchanged -> `Bytes::clone()` only
+
+`Bytes::clone()` is O(1) and must be preferred over copying.
+
+### Dispatch must use `match`, not if-chains
 
 ```rust
-// ✅ handle_inbound — O(1) dispatch
 match inbound.message {
     RaftMessageView::RequestVote(msg)         => self.handle_request_vote(msg).await,
     RaftMessageView::RequestVoteResp(msg)     => self.handle_request_vote_response(msg).await,
     RaftMessageView::AppendEntries(msg)       => self.handle_append_entries(msg).await,
-    RaftMessageView::AppendEntriesResp(msg)  => self.handle_append_entries_response(msg).await,
+    RaftMessageView::AppendEntriesResp(msg)   => self.handle_append_entries_response(msg).await,
     RaftMessageView::InstallSnapshot(msg)     => self.handle_install_snapshot(msg).await,
-    RaftMessageView::InstallSnapshotResp(msg)=> self.handle_install_snapshot_response(msg).await,
-    RaftMessageView::Custom(msg)             => self.handle_custom_message(msg).await,
-    RaftMessageView::CustomResponse(msg)     => self.handle_custom_response(msg).await,
-    // No `_ =>` implícito — añadir variant aquí si se añade al enum
+    RaftMessageView::InstallSnapshotResp(msg) => self.handle_install_snapshot_response(msg).await,
+    RaftMessageView::Custom(msg)              => self.handle_custom_message(msg).await,
+    RaftMessageView::CustomResponse(msg)      => self.handle_custom_response(msg).await,
 }
 ```
 
----
+Do not use a silent wildcard arm. Every new enum variant must be handled explicitly.
 
-## CORRECTNESS RAFT — INVARIANTES NO NEGOCIABLES
+## 5) Raft Correctness Invariants
 
-### Orden de persistencia antes de enviar
+### Persistence order before send
 
-Antes de enviar cualquier mensaje a la red, las operaciones de disco deben
-haberse completado en este orden:
+Before any network send:
 
-```
-1. Si term cambió → save_hard_state (con nuevo term y voted_for = None)
-2. Si voted_for cambió → save_hard_state
-3. Si se appendaron entries → append_entries (fsync si el storage lo soporta)
-4. ENTONCES → transport.send(...)
-```
+1. if term changed -> `save_hard_state` with new term and `voted_for = None`
+2. if `voted_for` changed -> `save_hard_state`
+3. if entries were appended -> `append_entries` and `fsync` if supported
+4. only then -> `transport.send(...)`
 
-Invertir este orden puede causar que un nodo vote dos veces en el mismo term
-tras un crash, violando la unicidad del líder.
+Never invert this order.
 
-### Quórum
+### Quorum
+
+Use this as the single source of truth:
 
 ```rust
 pub(crate) fn quorum(nodes: usize) -> usize { (nodes / 2) + 1 }
 ```
 
-Esta función es la única fuente de verdad para quórum. No calcular `(n/2)+1`
-inline en ningún otro lugar.
+Never inline quorum math elsewhere.
 
-### Election loop — condición de terminación
+### Election termination
 
-El loop de recolección de votos debe iterar hasta que:
-- Se alcance `votes >= votes_needed`, **o**
-- Todos los posibles respondedores hayan contestado (`responders.len() >= possible_votes`), **o**
-- Expire el timeout.
+Vote collection must continue until:
+
+- `votes >= votes_needed`, or
+- all possible responders replied, or
+- timeout expires
+
+Correct:
 
 ```rust
-// ✅ Correcto
 while votes < votes_needed && responders.len() < possible_votes {
     ...
 }
-
-// ❌ Incorrecto — termina un respondedor antes, puede perder el voto decisivo
-while votes < votes_needed && responders.len() < possible_votes.saturating_sub(1) {
-    ...
-}
 ```
 
-### Replicación — nunca silenciar errores de red
+Never subtract 1 from `possible_votes`.
 
-Cuando el líder envía AppendEntries a peers, un fallo de transporte no es
-un error fatal, pero **debe** ser registrado en el estado de progreso del peer.
-Nunca usar `let _ = transport.send(...)` en funciones que contribuyen al quórum
-de replicación.
+### Replication errors
+
+Network failures during `AppendEntries` are not fatal, but must be recorded in peer progress state. Never silence them with `let _ = ...` in quorum-related paths.
+
+Correct pattern:
 
 ```rust
-// ✅ Correcto — best-effort, el fallo se propaga al caller como bool
 async fn send_best_effort(&self, peer: PeerId, msg: RaftMessage, _phase: &str) -> bool {
     self.transport.send(peer, msg).await.is_ok()
 }
-
-// ❌ Prohibido en funciones que esperan quórum
-let _ = self.send_append_attempt(peer, 1).await;
 ```
 
-### Snapshot — integridad de offset
+### Snapshot offsets
 
-Un follower que recibe un chunk de snapshot verifica:
-`pending.bytes.len() as u64 == msg.offset()`
+Followers receiving snapshot chunks must verify:
 
-Si no coincide, responde con `accepted: false` y `next_offset = pending.bytes.len()`.
-El líder debe respetar este `next_offset` y reenviar desde ahí.
-**Nunca** asumir que los chunks llegan en orden o sin gaps.
+```txt
+pending.bytes.len() as u64 == msg.offset()
+```
 
----
+If mismatched, reply with:
 
-## SISTEMA DE DISPATCH — REGLAS DE USO
+- `accepted: false`
+- `next_offset = pending.bytes.len()`
 
-### Registro de handlers
+Leaders must retry from `next_offset`. Never assume ordered or gap-free chunk delivery.
 
-- Cada `command: u8` puede tener **exactamente un** handler registrado.
-- Intentar registrar un segundo handler para el mismo command es `Err`.
-- Los handlers son registrados en `RaftCustomRegistry` antes de iniciar el loop.
-- **No** registrar handlers desde dentro del loop de ejecución.
+## 6) Dispatch System Rules
 
-### DispatchSpec — fuente de verdad de encode/decode
+### Handler registration
 
-Cada comando de dispatch tiene un `DispatchSpec<P, R>` que contiene los
-codecs de parámetros y respuesta. Este spec es la única fuente de verdad.
+- one `command: u8` -> exactly one handler
+- duplicate registration -> `Err`
+- register handlers before the main loop starts
+- never register handlers from inside the execution loop
+
+### `DispatchSpec` is the only encode/decode source of truth
+
+Always encode/decode through the spec:
 
 ```rust
-// ✅ Usar spec para encode y decode
 let body = spec.encode_params(&params)?;
 let response = spec.decode_response(bytes)?;
-
-// ❌ Nunca encode/decode inline sin pasar por spec
-let body = serde_json::to_vec(&params)?; // JSON prohibido en hot path además
 ```
 
-### Scope de dispatch
+Never encode/decode ad hoc. JSON is forbidden in hot paths.
 
-```
-DispatchScope::All       → todos los nodos (incluyendo self)
-DispatchScope::Others    → todos excepto self
-DispatchScope::Followers → solo followers
-DispatchScope::Leader    → solo el líder conocido
-DispatchScope::LocalOnly → solo self (sin red)
-```
+### Dispatch scopes
 
-El scope es parte del frame wire — no puede cambiarse después del `build()`.
+- `All` -> all nodes, including self
+- `Others` -> all except self
+- `Followers` -> followers only
+- `Leader` -> known leader only
+- `LocalOnly` -> self only, no network
 
-### Policy de ACK y fallo
+Scope is part of the wire frame and cannot change after `build()`.
 
-- `DispatchAckPolicy::Quorum` es el default — requiere `(active/2)+1` aceptaciones.
-- `DispatchFailPolicy::AllowFailures` es el default — permite cualquier número de fallos.
-- Un `DispatchHandle` está listo cuando `completion.is_some()`.
-- Nunca esperar un handle con `.wait()` dentro del loop principal del nodo —
-  usar `.try_result()` para polling no bloqueante.
+### ACK / failure policy
 
----
+- default ACK policy -> `DispatchAckPolicy::Quorum`
+- default failure policy -> `DispatchFailPolicy::AllowFailures`
+- a `DispatchHandle` is ready when `completion.is_some()`
+- never call `.wait()` inside the main node loop
+- use `.try_result()` for non-blocking polling
 
-## TRAITS — CONTRATO DE IMPLEMENTACIÓN
+## 7) Trait Contracts
 
 ### `RaftStorage`
 
-| Método | Semántica |
-|---|---|
-| `load_hard_state` | Llamado una vez al init. Debe ser idempotente. |
-| `save_hard_state` | Debe ser síncrono y durable antes de retornar. |
-| `append_entries` | Los entries deben ser durables antes de retornar. |
-| `read_entries(from, to, out)` | Rango `[from, to)`. `out` se **extiende**, no se limpia. |
-| `truncate_suffix(from)` | Elimina `[from, ∞)`. Durable antes de retornar. |
-| `last_log_position` | **DEBE** sobrescribirse — el default hace O(N) full scan. |
-| `entry_at` | **DEBE** sobrescribirse — el default aloca un Vec por llamada. |
-| `save_snapshot` | Atómica — o el snapshot completo o nada. |
+- `load_hard_state` -> called once at init, must be idempotent
+- `save_hard_state` -> synchronous and durable before return
+- `append_entries` -> entries durable before return
+- `read_entries(from, to, out)` -> range is `[from, to)`, `out` is extended, not cleared
+- `truncate_suffix(from)` -> removes `[from, ∞)`, durable before return
+- `last_log_position` -> must be overridden; default is O(N)
+- `entry_at` -> must be overridden; default allocates per call
+- `save_snapshot` -> atomic: full snapshot or nothing
 
 ### `RaftTransport`
 
-| Método | Semántica |
-|---|---|
-| `send` | Best-effort. El error no debe ser fatal para el nodo. |
-| `recv` | Bloqueante hasta recibir un frame válido. |
-| `recv_timeout(d)` | `None` si expiró el timeout, `Some` si llegó frame. |
+- `send` -> best-effort, not fatal to node correctness
+- `recv` -> blocks until a valid frame arrives
+- `recv_timeout(d)` -> `None` on timeout, `Some` on frame
 
-`recv` y `recv_timeout` deben retornar frames **ya parseados** como
-`InboundRaftMessageView`. La codificación/decodificación ocurre en el transport,
-no en el nodo.
+`recv` and `recv_timeout` must return already parsed `InboundRaftMessageView`. Parsing belongs in the transport, not in the node.
 
 ### `StateMachine`
 
-El trait existe para extensiones futuras. No tiene métodos en v0.1.
-La aplicación del log al estado de la máquina es responsabilidad del usuario
-del crate, no de `arbitro-raft` en v0.1.
+Reserved for future extensions. In v0.1 it has no methods. Log application is the responsibility of the crate user, not `arbitro-raft`.
 
----
+## 8) Observability
 
-## OBSERVABILIDAD — TRACING Y MÉTRICAS
-
-### Qué usar
+### Allowed
 
 ```rust
-// ✅ Para eventos de management path (election ganada, snapshot completado)
-tracing::info!(node_id = ..., term = ..., "leader elected");
+tracing::info!(...);
+tracing::debug!(...);
 
-// ✅ Para diagnóstico de replicación (solo en funciones non-hot)
-tracing::debug!(voter = ..., votes, needed = ..., "vote granted");
-
-// ✅ Para tracing condicional muy verbose (controlado por env var)
 if super::trace_enabled() {
     tracing::trace!(...);
 }
-
-// ❌ PROHIBIDO en cualquier contexto de producción
-eprintln!(...);
-println!(...);
 ```
 
-### La variable `ARBITRO_RAFT_TRACE`
+### Forbidden
 
-`trace_enabled()` (en `node/mod.rs`) y la función homónima en `protocol/codec.rs`
-leen `ARBITRO_RAFT_TRACE` una sola vez via `OnceLock`. El output de trace
-**nunca** puede usar `eprintln!` — debe usar `tracing::trace!` o bien
-`tracing::event!(Level::TRACE, ...)`.
+```rust
+println!(...);
+eprintln!(...);
+```
 
-Toda instrumentación de timing (`Instant::now()`) solo puede existir dentro
-de un bloque `if trace_enabled()`. No medir en el hot path incondicional.
+### `ARBITRO_RAFT_TRACE`
 
----
+`trace_enabled()` must read `ARBITRO_RAFT_TRACE` only once via `OnceLock`. Tracing output must go through `tracing`, never `eprintln!`.
 
-## ESTRUCTURA DE ARCHIVOS — LÍMITES
+Any timing instrumentation using `Instant::now()` must exist only inside `if trace_enabled()` blocks. Never measure unconditionally in hot paths.
 
-| Ámbito | Límite |
-|---|---|
-| Archivo `.rs` | 400 líneas |
-| Función / método | 60 líneas |
-| `impl` block | 200 líneas |
+## 9) Size Limits
 
-Cuando un archivo (`replication.rs`, `codec.rs`) supere las 400 líneas,
-extraer en submódulos con responsabilidad única:
-- `replication/heartbeat.rs`, `replication/propose.rs`, `replication/handler.rs`
-- `codec/encode.rs`, `codec/decode.rs`, `codec/validate.rs`
+- `.rs` file -> max 400 lines
+- function / method -> max 60 lines
+- `impl` block -> max 200 lines
 
----
+If a file exceeds the limit, split it into focused submodules, for example:
 
-## NOMBRADO DE SUFIJOS Y PREFIJOS EN ESTE CRATE
+- `replication/heartbeat.rs`
+- `replication/propose.rs`
+- `replication/handler.rs`
+- `codec/encode.rs`
+- `codec/decode.rs`
+- `codec/validate.rs`
 
-Complementa las convenciones globales de `AGENTS.md`:
+## 10) Naming Conventions
 
-| Patrón | Ejemplo | Significado |
-|---|---|---|
-| `*View` | `AppendEntriesView` | Tipo que lee desde `Bytes` sin copiar |
-| `*Resp` | `AppendEntriesResp` | Mensaje de respuesta (owned) |
-| `*RespView` | `AppendEntriesRespView` | Vista de mensaje de respuesta |
-| `handle_*` | `handle_append_entries` | Handler de frame inbound |
-| `build_*` | `build_append_for_peer` | Construye un mensaje outbound |
-| `send_*_once` | `send_heartbeat_once` | Envío único, sin loop interno |
-| `*_once` | `propose_once`, `campaign_once` | Una iteración, sin retry loop externo |
-| `scratch_*` | `scratch_entries` | Buffer pre-alocado de scratchpad en `RaftNode` |
-| `pending_*` | `pending_custom`, `pending_snapshots` | Estado en vuelo esperando respuesta |
+- `*View` -> zero-copy type over `Bytes`
+- `*Resp` -> owned response message
+- `*RespView` -> zero-copy response view
+- `handle_*` -> inbound frame handler
+- `build_*` -> outbound message builder
+- `send_*_once` -> single send, no internal loop
+- `*_once` -> one iteration, no external retry loop implied
+- `scratch_*` -> preallocated scratch buffer in `RaftNode`
+- `pending_*` -> in-flight state awaiting completion
 
----
+## 11) PR Must-Not Checklist
 
-## LO QUE UN PR NO PUEDE HACER (CHECKLIST)
+Before proposing changes, verify all of the following:
 
-Antes de proponer cualquier cambio, verificar:
+- no `println!` / `eprintln!` in production code
+- no `format!` in hot paths; only allowed in errors or tracing
+- no `Instant::now()` outside `if trace_enabled()`
+- no `Vec::new()` / `HashMap::new()` in per-frame logic
+- `commit_index` is not in `HardState`
+- election loop uses `responders.len() < possible_votes`
+- replication paths do not hide send failures with `let _ = ...`
+- `save_hard_state` happens before `transport.send` on any term/vote transition
+- new protocol constants live in `protocol/codec.rs` or `dispatch/view.rs`
+- no raw protocol hex literals outside constant definition files
+- `RaftStorage` implementations used in tests/benchmarks override `last_log_position` and `entry_at`
+- no silent `_ => {}` in frame dispatch; unknown cases must fail explicitly
+- no file exceeds 400 lines
 
-- [ ] No `eprintln!` / `println!` en ningún archivo de producción
-- [ ] No `format!` fuera de bloques de error o tracing — nunca inline en el hot path
-- [ ] No `Instant::now()` fuera de bloques `if trace_enabled()`
-- [ ] No `Vec::new()` / `HashMap::new()` en funciones llamadas por frame (usar scratchpad)
-- [ ] `commit_index` no está en `HardState`
-- [ ] El election loop termina en `responders.len() < possible_votes` (sin `- 1`)
-- [ ] `replicate_batch_async` y similares no silencian errores de replicación con `let _`
-- [ ] `save_hard_state` se llama **antes** de `transport.send` en cualquier transición de term
-- [ ] Toda nueva constante de protocolo está en `protocol/codec.rs` o `dispatch/view.rs`
-- [ ] No hay literales hex de protocolo fuera de los archivos de constantes
-- [ ] `RaftStorage` implementada por tests/benchmarks sobreescribe `last_log_position` y `entry_at`
-- [ ] No hay `match` con `_ => {}` silencioso en dispatch de frames — el default debe ser error
-- [ ] Archivos no superan 400 líneas
+## Final Rule
+
+If you change or add code in this crate, preserve:
+
+- Raft safety
+- durability ordering
+- zero-copy receive paths
+- zero-allocation hot paths
+- explicit validation
+- explicit dispatch
+- strict trait semantics
+- trace-only observability overhead
+
+Do not trade correctness for convenience.
