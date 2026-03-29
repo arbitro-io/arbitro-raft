@@ -44,6 +44,8 @@ pub struct EntryIter<'a> {
 }
 
 impl<'a> EntryIter<'a> {
+    // No validation — the frame was already validated in `parse_append_entries_view`
+    // during decode. Re-validating here is redundant O(N) work on the hot path.
     fn new(view: &'a AppendEntriesView) -> Result<Self, RaftError> {
         Ok(Self { view, remaining: view.entry_count(), offset: 48 })
     }
@@ -56,42 +58,47 @@ impl<'a> Iterator for EntryIter<'a> {
         if self.remaining == 0 {
             return None;
         }
-        let entry = EntryHeaderView::parse(self.view.frame.body(), self.offset).ok()?;
-        self.offset    = entry.payload_end();
-        self.remaining -= 1;
-        Some(EntryView {
+        let eh = EntryHeaderView::parse(self.view.frame.body(), self.offset).ok()?;
+        // Cache all header fields inline — avoids re-parsing on every term()/index()/payload().
+        let entry = EntryView {
             frame:         self.view.frame.frame().clone(),
             body_offset:   self.view.frame.body_offset(),
-            header_offset: entry.header_offset(),
-        })
+            term:          eh.term(),
+            index:         eh.index(),
+            payload_start: eh.payload_start(),
+            payload_end:   eh.payload_end(),
+        };
+        self.offset    = eh.payload_end();
+        self.remaining -= 1;
+        Some(entry)
     }
 }
 
 // ── EntryView ─────────────────────────────────────────────────────────────────
 
+/// Zero-copy view into one log entry inside a received `AppendEntries` frame.
+///
+/// Fields are parsed once by `EntryIter` and cached inline — subsequent calls to
+/// `term()`, `index()`, and `payload()` are plain field reads with no re-parsing.
 #[derive(Debug, Clone)]
 pub struct EntryView {
     pub(crate) frame:         Bytes,
     pub(crate) body_offset:   usize,
-    pub(crate) header_offset: usize,
+    // Cached from EntryHeader — no re-parse on every field access.
+    pub(crate) term:          u64,
+    pub(crate) index:         u64,
+    pub(crate) payload_start: usize,
+    pub(crate) payload_end:   usize,
 }
 
 impl EntryView {
-    fn header_view(&self) -> EntryHeaderView<'_> {
-        EntryHeaderView::parse(&self.frame[self.body_offset..], self.header_offset).unwrap()
-    }
-
-    #[inline]
-    pub fn term(&self) -> Term { Term(self.header_view().term()) }
-
-    #[inline]
-    pub fn index(&self) -> LogIndex { LogIndex(self.header_view().index()) }
+    #[inline] pub fn term(&self)  -> Term      { Term(self.term) }
+    #[inline] pub fn index(&self) -> LogIndex  { LogIndex(self.index) }
 
     #[inline]
     pub fn payload(&self) -> Bytes {
-        let view = self.header_view();
         self.frame.slice(
-            (self.body_offset + view.payload_start())..(self.body_offset + view.payload_end()),
+            (self.body_offset + self.payload_start)..(self.body_offset + self.payload_end),
         )
     }
 

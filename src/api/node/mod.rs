@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+
 use bytes::Bytes;
 
 use crate::{
@@ -15,7 +16,7 @@ mod replication;
 mod snapshot;
 
 pub(crate) use dispatch::PendingCustomDispatch;
-pub(crate) use progress::{AppendAttemptState, PeerProgress, PendingSnapshot};
+pub(crate) use progress::{AppendAttemptState, PeerMap, PeerProgress, PendingSnapshot};
 
 pub struct RaftNode<S, T> {
     pub(crate) config: NodeConfig,
@@ -25,7 +26,7 @@ pub struct RaftNode<S, T> {
     pub(crate) soft_state: SoftState,
     pub(crate) custom_registry: RaftCustomRegistry,
     pub(crate) pending_custom: HashMap<u64, Box<dyn PendingCustomDispatch + Send + Sync>>,
-    pub(crate) peer_progress: HashMap<PeerId, PeerProgress>,
+    pub(crate) peer_progress: PeerMap<PeerProgress>,
     pub(crate) pending_snapshots: HashMap<PeerId, PendingSnapshot>,
 
     // Scratchpads — pre-allocated buffers reused across calls on the hot path.
@@ -33,9 +34,13 @@ pub struct RaftNode<S, T> {
     pub(crate) scratch_entries: Vec<LogEntry>,
     pub(crate) scratch_indexes: Vec<LogIndex>,
     pub(crate) scratch_peers: Vec<PeerId>,
-    pub(crate) scratch_pending: HashMap<PeerId, AppendAttemptState>,
+    pub(crate) scratch_pending: PeerMap<AppendAttemptState>,
     #[allow(dead_code)] // reserved for per-peer attempt timing instrumentation
     pub(crate) scratch_started: HashMap<PeerId, std::time::Instant>,
+
+    /// Cached last-log position — kept in sync with every append/truncate so
+    /// `try_advance_commit_index` and leader-progress init avoid a storage read.
+    pub(crate) cached_last_log: (LogIndex, Term),
 }
 
 impl<S, T> RaftNode<S, T>
@@ -46,6 +51,7 @@ where
     pub fn new(config: NodeConfig, storage: S, transport: T) -> Result<Self, RaftError> {
         crate::validate_node_config(&config)?;
         let hard_state = storage.load_hard_state()?;
+        let cached_last_log = storage.last_log_position()?;
         let soft_state = SoftState {
             leader_id: None,
             is_leader: false,
@@ -61,13 +67,14 @@ where
             soft_state,
             custom_registry: RaftCustomRegistry::new(),
             pending_custom: HashMap::new(),
-            peer_progress: HashMap::new(),
+            peer_progress: PeerMap::new(),
             pending_snapshots: HashMap::new(),
             scratch_entries: Vec::new(),
             scratch_indexes: Vec::new(),
             scratch_peers: Vec::new(),
-            scratch_pending: HashMap::new(),
+            scratch_pending: PeerMap::new(),
             scratch_started: HashMap::new(),
+            cached_last_log,
         })
     }
 
@@ -179,6 +186,15 @@ where
         // commit_index is monotone — do not reset on step_down
         self.peer_progress.clear();
         self.pending_snapshots.clear();
+        Ok(())
+    }
+
+    /// Truncate the log and refresh the last-log cache.
+    /// Always use this instead of calling `storage.truncate_suffix()` directly.
+    #[inline]
+    pub(crate) fn storage_truncate(&mut self, from: LogIndex) -> Result<(), RaftError> {
+        self.storage.truncate_suffix(from)?;
+        self.cached_last_log = self.storage.last_log_position()?;
         Ok(())
     }
 

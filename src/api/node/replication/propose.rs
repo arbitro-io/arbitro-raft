@@ -16,7 +16,7 @@ where
     /// Append `payloads` to local log, populating `scratch_entries` and `scratch_indexes`.
     /// Returns the last appended `LogIndex`.
     fn append_propose_entries(&mut self, payloads: Vec<Bytes>) -> Result<LogIndex, RaftError> {
-        let last_log_index = self.storage.last_log_position()?.0;
+        let last_log_index = self.cached_last_log.0;
         self.scratch_entries.clear();
         self.scratch_indexes.clear();
         let mut next_raw = last_log_index.0 + 1;
@@ -32,6 +32,7 @@ where
         }
         let last_index = *self.scratch_indexes.last().unwrap();
         self.storage.append_entries(&self.scratch_entries)?;
+        self.cached_last_log = (last_index, self.hard_state.current_term);
         Ok(last_index)
     }
 
@@ -190,10 +191,14 @@ where
         }
         // Progress must be initialized BEFORE append — same reason as propose_batch_once.
         self.ensure_leader_progress_initialized()?;
-        let last_log_index = self.storage.last_log_position()?.0;
+
+        // Read prev_log position from cache BEFORE appending — used to build AppendEntries
+        // without re-reading the new entries from storage after the write.
+        let (prev_log_index, prev_log_term) = self.cached_last_log;
+
         self.scratch_entries.clear();
         self.scratch_indexes.clear();
-        let mut next_raw = last_log_index.0 + 1;
+        let mut next_raw = prev_log_index.0 + 1;
         for payload in payloads {
             let next_index = LogIndex(next_raw);
             self.scratch_entries.push(LogEntry {
@@ -205,7 +210,12 @@ where
             next_raw += 1;
         }
         self.storage.append_entries(&self.scratch_entries)?;
+        if let Some(last) = self.scratch_entries.last() {
+            self.cached_last_log = (last.index, last.term);
+        }
 
+        // Build peer list, then send frames directly from scratch_entries —
+        // no storage re-read, one allocation per peer.
         self.scratch_peers.clear();
         for peer in self
             .config
@@ -218,7 +228,16 @@ where
         }
         for i in 0..self.scratch_peers.len() {
             let peer = self.scratch_peers[i];
-            self.send_append_attempt(peer, 1).await?;
+            let frame = crate::protocol::encode_append_entries_frame(
+                self.config.node_id,
+                self.hard_state.current_term,
+                self.config.node_id,
+                prev_log_index,
+                prev_log_term,
+                self.soft_state.commit_index,
+                &self.scratch_entries,
+            )?;
+            self.send_best_effort(peer, frame).await;
         }
         Ok(self.scratch_indexes.clone())
     }

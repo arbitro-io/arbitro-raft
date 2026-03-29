@@ -11,6 +11,72 @@ use super::wire::{
     KIND_INSTALL_SNAPSHOT, KIND_INSTALL_SNAPSHOT_RESP, KIND_REQUEST_VOTE, KIND_REQUEST_VOTE_RESP,
 };
 
+/// Build a complete wire frame (Raft header + AppendEntries body) in **one allocation**.
+///
+/// Avoids the two-step path: `AppendEntries::build_bytes()` (alloc 1) →
+/// `encode_message()` copies body into new BytesMut (alloc 2).
+/// Callers on the leader replication hot-path should use this directly.
+pub(crate) fn encode_append_entries_frame(
+    from:           PeerId,
+    term:           crate::Term,
+    leader_id:      PeerId,
+    prev_log_index: crate::LogIndex,
+    prev_log_term:  crate::Term,
+    leader_commit:  crate::LogIndex,
+    entries:        &[crate::LogEntry],
+) -> Result<Bytes, RaftError> {
+    use zerocopy::byteorder::little_endian::{U16, U32, U64};
+    use zerocopy::IntoBytes;
+    use super::wire::{AppendEntriesBody, EntryHeader, RaftFrameHeader,
+                      KIND_APPEND_ENTRIES, RAFT_FRAME_HEADER_SIZE, RAFT_MAGIC, RAFT_VERSION};
+
+    // Compute body length up-front so we allocate exactly once.
+    let mut body_len = std::mem::size_of::<AppendEntriesBody>();
+    for e in entries {
+        body_len = body_len
+            .checked_add(std::mem::size_of::<EntryHeader>())
+            .and_then(|v| v.checked_add(e.payload.0.len()))
+            .ok_or_else(|| RaftError::Protocol("append entries body overflow".into()))?;
+    }
+
+    let mut buf = BytesMut::with_capacity(RAFT_FRAME_HEADER_SIZE + body_len);
+
+    // Raft frame header.
+    buf.extend_from_slice(RaftFrameHeader {
+        magic:    U32::new(RAFT_MAGIC),
+        version:  RAFT_VERSION,
+        kind:     KIND_APPEND_ENTRIES,
+        flags:    U16::new(0),
+        from:     U64::new(from.0),
+        body_len: U32::new(body_len as u32),
+        reserved: U32::new(0),
+    }.as_bytes());
+
+    // AppendEntries fixed header.
+    buf.extend_from_slice(AppendEntriesBody {
+        term:           U64::new(term.0),
+        leader_id:      U64::new(leader_id.0),
+        prev_log_index: U64::new(prev_log_index.0),
+        prev_log_term:  U64::new(prev_log_term.0),
+        leader_commit:  U64::new(leader_commit.0),
+        entry_count:    U32::new(entries.len() as u32),
+        _pad:           U32::new(0),
+    }.as_bytes());
+
+    // Entries.
+    for e in entries {
+        buf.extend_from_slice(EntryHeader {
+            term:        U64::new(e.term.0),
+            index:       U64::new(e.index.0),
+            payload_len: U32::new(e.payload.0.len() as u32),
+            _pad:        U32::new(0),
+        }.as_bytes());
+        buf.extend_from_slice(e.payload.0.as_ref());
+    }
+
+    Ok(buf.freeze())
+}
+
 pub fn encode_message(from: PeerId, msg: &RaftMessage) -> Result<Bytes, RaftError> {
     let body_len = body_len(msg)?;
     let mut frame = BytesMut::with_capacity(RAFT_FRAME_HEADER_SIZE + body_len);

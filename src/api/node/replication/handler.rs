@@ -15,7 +15,7 @@ where
             match self.storage.entry_at(incoming.index())? {
                 Some(local) if local.term == incoming.term() => {}
                 Some(_) => {
-                    self.storage.truncate_suffix(incoming.index())?;
+                    self.storage_truncate(incoming.index())?;
                     append_from = idx;
                     break;
                 }
@@ -31,6 +31,9 @@ where
                 self.scratch_entries.push(entry.to_owned());
             }
             self.storage.append_entries(&self.scratch_entries)?;
+            if let Some(last) = self.scratch_entries.last() {
+                self.cached_last_log = (last.index, last.term);
+            }
         }
         Ok(())
     }
@@ -43,7 +46,7 @@ where
             let frame = self.encode_msg(&RaftMessage::AppendEntriesResp(AppendEntriesResp {
                 term:        self.hard_state.current_term,
                 success:     false,
-                match_index: self.storage.last_log_position()?.0,
+                match_index: self.cached_last_log.0,
             }))?;
             self.transport.send_frame(msg.from(), frame).await?;
             return Ok(());
@@ -68,7 +71,7 @@ where
             let frame = self.encode_msg(&RaftMessage::AppendEntriesResp(AppendEntriesResp {
                 term:        self.hard_state.current_term,
                 success:     false,
-                match_index: self.storage.last_log_position()?.0,
+                match_index: self.cached_last_log.0,
             }))?;
             self.transport.send_frame(msg.from(), frame).await?;
             return Ok(());
@@ -76,7 +79,7 @@ where
 
         self.apply_append_entries(&msg)?;
 
-        let last_log_index = self.storage.last_log_position()?.0;
+        let last_log_index = self.cached_last_log.0;
         if msg.leader_commit() > self.soft_state.commit_index {
             // commit_index is volatile — no save_hard_state needed here
             self.soft_state.commit_index =

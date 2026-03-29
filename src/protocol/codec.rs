@@ -10,6 +10,7 @@ pub use decode::{
     parse_request_vote_view,
 };
 pub use encode::{encode_message, encode_message_into};
+pub(crate) use encode::encode_append_entries_frame;
 pub(crate) use wire::{AppendEntriesBody, EntryHeader};
 pub use wire::{
     EntryHeaderView, KIND_APPEND_ENTRIES, KIND_APPEND_ENTRIES_RESP, KIND_CUSTOM,

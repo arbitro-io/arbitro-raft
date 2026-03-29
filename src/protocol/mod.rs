@@ -2,6 +2,8 @@ mod codec;
 mod message;
 mod view;
 
+pub(crate) use codec::encode_append_entries_frame;
+
 pub use codec::{
     decode_message, decode_message_view, encode_message, encode_message_into, KIND_CUSTOM, KIND_CUSTOM_RESPONSE, RAFT_FRAME_HEADER_SIZE,
     RAFT_MAGIC, RAFT_VERSION,

@@ -1,5 +1,5 @@
 use super::super::RaftNode;
-use crate::{RaftError, RaftMessage};
+use crate::RaftError;
 use tracing::info;
 
 impl<S, T> RaftNode<S, T>
@@ -31,11 +31,8 @@ where
         let mut sent = 0usize;
         for i in 0..self.scratch_peers.len() {
             let peer = self.scratch_peers[i];
-            let msg = self.build_append_for_peer(peer)?;
-            if self
-                .encode_and_send_best_effort(peer, &RaftMessage::AppendEntries(msg))
-                .await
-            {
+            let (frame, _) = self.build_append_for_peer(peer)?;
+            if self.send_best_effort(peer, frame).await {
                 sent += 1;
             }
         }

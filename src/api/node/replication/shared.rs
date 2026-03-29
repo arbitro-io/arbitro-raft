@@ -1,17 +1,23 @@
 use std::time::Duration;
 
+use bytes::Bytes;
 use super::super::RaftNode;
-use crate::{AppendEntries, LogIndex, PeerId, RaftError, RaftMessage, Term};
+use crate::{LogIndex, PeerId, RaftError, Term};
 
 impl<S, T> RaftNode<S, T>
 where
     S: crate::RaftStorage,
     T: crate::RaftTransport,
 {
+    /// Build a ready-to-send AppendEntries frame for `peer` in **one allocation**.
+    ///
+    /// Returns `(frame, last_sent_index)` where `last_sent_index` is the highest
+    /// log index included in the frame (or `prev_log_index` when entries is empty).
+    /// `self.scratch_entries` is populated with the entries that were sent.
     pub(crate) fn build_append_for_peer(
         &mut self,
         peer: PeerId,
-    ) -> Result<AppendEntries, RaftError> {
+    ) -> Result<(Bytes, LogIndex), RaftError> {
         let progress = self
             .peer_progress
             .get(&peer)
@@ -28,14 +34,21 @@ where
         self.scratch_entries
             .truncate(self.config.limits.append_batch_entries.max(1));
 
-        AppendEntries::new_unchecked(
+        let last_idx = self.scratch_entries.last()
+            .map(|e| e.index)
+            .unwrap_or(prev_log_index);
+
+        let frame = crate::protocol::encode_append_entries_frame(
+            self.config.node_id,
             self.hard_state.current_term,
             self.config.node_id,
             prev_log_index,
             prev_log_term,
             self.soft_state.commit_index,
             &self.scratch_entries,
-        )
+        )?;
+
+        Ok((frame, last_idx))
     }
 
     pub(crate) async fn send_append_attempt(
@@ -43,13 +56,7 @@ where
         peer: PeerId,
         _attempt: u64,
     ) -> Result<Option<LogIndex>, RaftError> {
-        let msg = self.build_append_for_peer(peer)?;
-        let last_idx = self
-            .scratch_entries
-            .last()
-            .map(|e| e.index)
-            .unwrap_or(msg.prev_log_index());
-        let frame = self.encode_msg(&RaftMessage::AppendEntries(msg))?;
+        let (frame, last_idx) = self.build_append_for_peer(peer)?;
         if self.send_best_effort(peer, frame).await {
             Ok(Some(last_idx))
         } else {
@@ -59,7 +66,7 @@ where
 
     pub(crate) fn initialize_leader_progress(&mut self) -> Result<(), RaftError> {
         self.peer_progress.clear();
-        let last_index = self.storage.last_log_position()?.0;
+        let last_index = self.cached_last_log.0;
         for peer in self
             .config
             .peers
@@ -104,7 +111,7 @@ where
         if self.peer_progress.is_empty() {
             return Ok(());
         }
-        let last_index = self.storage.last_log_position()?.0;
+        let last_index = self.cached_last_log.0;
         if last_index <= self.soft_state.commit_index {
             return Ok(());
         }
@@ -124,10 +131,16 @@ where
             return Ok(());
         }
         // Safety rule: only commit if the quorum entry belongs to current_term.
-        if let Some(entry) = self.storage.entry_at(quorum_index)? {
-            if entry.term == self.hard_state.current_term {
-                self.soft_state.commit_index = quorum_index;
-            }
+        // Fast path: if quorum_index == cached last, term is already known.
+        let quorum_term = if quorum_index == self.cached_last_log.0 {
+            self.cached_last_log.1
+        } else {
+            self.storage.entry_at(quorum_index)?
+                .map(|e| e.term)
+                .unwrap_or(crate::Term(0))
+        };
+        if quorum_term == self.hard_state.current_term {
+            self.soft_state.commit_index = quorum_index;
         }
         Ok(())
     }

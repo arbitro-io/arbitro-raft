@@ -47,22 +47,6 @@ impl AppendEntries {
         Ok(Self { bytes })
     }
 
-    /// Build without post-construction validation.
-    ///
-    /// Entries come from trusted storage on the leader path — re-validating
-    /// bytes we just wrote is redundant work. Only use this inside the node.
-    pub(crate) fn new_unchecked(
-        term: Term,
-        leader_id: PeerId,
-        prev_log_index: LogIndex,
-        prev_log_term: Term,
-        leader_commit: LogIndex,
-        entries: &[LogEntry],
-    ) -> Result<Self, RaftError> {
-        let bytes = Self::build_bytes(term, leader_id, prev_log_index, prev_log_term, leader_commit, entries)?;
-        Ok(Self { bytes })
-    }
-
     fn build_bytes(
         term: Term,
         leader_id: PeerId,
