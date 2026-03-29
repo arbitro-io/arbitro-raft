@@ -14,6 +14,7 @@
 //      propose_batch_once(vec![p; N]) ≡ N clients hitting client_write simultaneously.
 //   5. Empty-payload baseline for direct comparison with openraft's minimal benchmark.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,15 +29,21 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 // ---------------------------------------------------------------------------
-// MemStorage — sorted by index, binary-search for reads
+// MemStorage — O(1) index lookup via base_index offset arithmetic.
 //
-// Entries are always appended in order so the Vec is always sorted.
-// read_entries and entry_at use partition_point (binary search) to avoid
-// O(N) scans that blow up when the log grows across iterations.
+// Raft guarantees indices are contiguous and monotonically increasing, so:
+//   entries[i].index == base_index + i   (always)
+//
+// This means we can find any index N in O(1):
+//   position = N - base_index
+//
+// base_index is set on first append and only resets if all entries are
+// truncated (conflict resolution). Snapshots are no-ops in this bench.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 struct MemStorage {
+    base_index: Arc<AtomicU64>,
     entries:    Arc<Mutex<Vec<LogEntry>>>,
     hard_state: Arc<Mutex<HardState>>,
 }
@@ -44,6 +51,7 @@ struct MemStorage {
 impl MemStorage {
     fn new() -> Self {
         Self {
+            base_index: Arc::new(AtomicU64::new(0)),
             entries:    Arc::new(Mutex::new(Vec::new())),
             hard_state: Arc::new(Mutex::new(HardState {
                 current_term: Term(1),
@@ -62,21 +70,36 @@ impl RaftStorage for MemStorage {
         Ok(())
     }
     fn append_entries(&self, new_entries: &[LogEntry]) -> Result<(), RaftError> {
-        self.entries.lock().unwrap().extend_from_slice(new_entries);
+        if new_entries.is_empty() { return Ok(()); }
+        let mut entries = self.entries.lock().unwrap();
+        if entries.is_empty() {
+            // First append — establish base_index. Mutex provides ordering.
+            self.base_index.store(new_entries[0].index.0, Ordering::Relaxed);
+        }
+        entries.extend_from_slice(new_entries);
         Ok(())
     }
     fn read_entries(&self, from: LogIndex, to: LogIndex, out: &mut Vec<LogEntry>) -> Result<(), RaftError> {
         let entries = self.entries.lock().unwrap();
-        // Binary search for the start of [from, to) — entries are sorted by index.
-        let start = entries.partition_point(|e| e.index < from);
-        let end   = entries.partition_point(|e| e.index < to);
-        out.extend_from_slice(&entries[start..end]);
+        if entries.is_empty() { return Ok(()); }
+        let base  = self.base_index.load(Ordering::Relaxed);
+        let start = (from.0.saturating_sub(base)) as usize;
+        let end   = (to.0.saturating_sub(base)) as usize;
+        let end   = end.min(entries.len());
+        if start < end {
+            out.extend_from_slice(&entries[start..end]);
+        }
         Ok(())
     }
     fn truncate_suffix(&self, from: LogIndex) -> Result<(), RaftError> {
         let mut entries = self.entries.lock().unwrap();
-        let cut = entries.partition_point(|e| e.index < from);
+        if entries.is_empty() { return Ok(()); }
+        let base = self.base_index.load(Ordering::Relaxed);
+        let cut  = (from.0.saturating_sub(base)) as usize;
         entries.truncate(cut);
+        if entries.is_empty() {
+            self.base_index.store(0, Ordering::Relaxed);
+        }
         Ok(())
     }
     fn save_snapshot(&self, _meta: &SnapshotMeta, _snapshot: &[u8]) -> Result<(), RaftError> {
@@ -91,9 +114,11 @@ impl RaftStorage for MemStorage {
     }
     fn entry_at(&self, index: LogIndex) -> Result<Option<LogEntry>, RaftError> {
         let entries = self.entries.lock().unwrap();
-        // Binary search — entries sorted by index.
-        let pos = entries.partition_point(|e| e.index <= index);
-        Ok(entries.get(pos.wrapping_sub(1)).filter(|e| e.index == index).cloned())
+        if entries.is_empty() { return Ok(None); }
+        let base = self.base_index.load(Ordering::Relaxed);
+        if index.0 < base { return Ok(None); }
+        let pos = (index.0 - base) as usize;
+        Ok(entries.get(pos).cloned())
     }
 }
 
@@ -111,12 +136,13 @@ impl RaftStorage for MemStorage {
 // ---------------------------------------------------------------------------
 
 struct PeerState {
+    base_index: u64,                // index of log[0], 0 means empty
     log: Vec<(LogIndex, Term)>,
 }
 
 impl PeerState {
     fn new() -> Self {
-        Self { log: Vec::new() }
+        Self { base_index: 0, log: Vec::new() }
     }
 
     fn last_position(&self) -> (LogIndex, Term) {
@@ -124,7 +150,8 @@ impl PeerState {
     }
 
     fn term_at(&self, idx: LogIndex) -> Option<Term> {
-        let pos = self.log.partition_point(|&(i, _)| i < idx);
+        if self.log.is_empty() || idx.0 < self.base_index { return None; }
+        let pos = (idx.0 - self.base_index) as usize;
         self.log.get(pos).filter(|&&(i, _)| i == idx).map(|&(_, t)| t)
     }
 
@@ -150,11 +177,24 @@ impl PeerState {
             for ev in iter {
                 let idx  = ev.index();
                 let term = ev.term();
-                let pos  = self.log.partition_point(|&(i, _)| i < idx);
-                if let Some(&(ei, et)) = self.log.get(pos) {
-                    if ei == idx {
-                        if et == term { continue; }
-                        self.log.truncate(pos); // conflict — drop suffix
+                // O(1) offset lookup — Raft guarantees contiguous indices.
+                if self.log.is_empty() {
+                    self.base_index = idx.0;
+                    self.log.push((idx, term));
+                    continue;
+                }
+                if idx.0 < self.base_index {
+                    // Entry before our base — ignore (already truncated/snapshotted).
+                    continue;
+                }
+                let pos = (idx.0 - self.base_index) as usize;
+                if pos < self.log.len() {
+                    let (_, et) = self.log[pos];
+                    if et == term { continue; }
+                    // Conflict — truncate suffix from this position.
+                    self.log.truncate(pos);
+                    if self.log.is_empty() {
+                        self.base_index = idx.0;
                     }
                 }
                 self.log.push((idx, term));
