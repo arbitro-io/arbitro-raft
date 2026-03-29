@@ -12,11 +12,10 @@ pub use context::{
 };
 pub use response::{
     encode_dispatch_response, DispatchResponseView, RAFT_DISPATCH_RESPONSE_FRAME_HEADER_SIZE,
-    RAFT_DISPATCH_RESPONSE_MAGIC, RAFT_DISPATCH_RESPONSE_VERSION,
 };
 pub use spec::{
-    DispatchAckPolicy, DispatchFailPolicy, DispatchNodeRole, DispatchOptions, DispatchRoute,
-    DispatchScope, DispatchSpec,
+    DispatchAckOptions, DispatchAckPolicy, DispatchFailOptions, DispatchFailPolicy,
+    DispatchNodeRole, DispatchOptions, DispatchRoute, DispatchScope, DispatchSpec,
 };
 pub use tx::{
     DispatchFailure, DispatchHandle, DispatchPeerResult, DispatchPeerState, DispatchResult,
@@ -24,4 +23,6 @@ pub use tx::{
 };
 pub use view::{
     DispatchView, RAFT_DISPATCH_FRAME_HEADER_SIZE, RAFT_DISPATCH_MAGIC, RAFT_DISPATCH_VERSION,
+    RAFT_DISPATCH_RESPONSE_MAGIC, RAFT_DISPATCH_RESPONSE_VERSION,
 };
+

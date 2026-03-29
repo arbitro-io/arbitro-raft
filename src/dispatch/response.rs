@@ -2,11 +2,9 @@ use bytes::{Bytes, BytesMut};
 use zerocopy::byteorder::little_endian::{U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Ref};
 
+use crate::dispatch::view::{RAFT_DISPATCH_RESPONSE_MAGIC, RAFT_DISPATCH_RESPONSE_VERSION};
 use crate::dispatch::{DispatchResponse, DispatchResponseKind, DispatchSpec};
 use crate::RaftError;
-
-pub const RAFT_DISPATCH_RESPONSE_MAGIC: u32 = 0x4452_5350;
-pub const RAFT_DISPATCH_RESPONSE_VERSION: u8 = 1;
 
 #[derive(IntoBytes, FromBytes, KnownLayout, Immutable, Clone, Copy, Debug)]
 #[repr(C)]

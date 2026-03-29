@@ -8,6 +8,10 @@ use crate::RaftError;
 pub const RAFT_DISPATCH_MAGIC: u32 = 0x4453_5054;
 pub const RAFT_DISPATCH_VERSION: u8 = 1;
 
+// Response frame constants — centralized here per §3 protocol constants rule
+pub const RAFT_DISPATCH_RESPONSE_MAGIC: u32 = 0x4452_5350;
+pub const RAFT_DISPATCH_RESPONSE_VERSION: u8 = 1;
+
 #[derive(IntoBytes, FromBytes, KnownLayout, Immutable, Clone, Copy, Debug)]
 #[repr(C)]
 pub(crate) struct DispatchFrameHeader {

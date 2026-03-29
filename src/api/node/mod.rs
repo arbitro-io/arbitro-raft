@@ -111,6 +111,10 @@ where
         &self.hard_state
     }
 
+    pub fn commit_index(&self) -> LogIndex {
+        self.soft_state.commit_index
+    }
+
     #[inline]
     pub fn peer_progress(&self, peer: PeerId) -> Option<(LogIndex, LogIndex)> {
         self.peer_progress

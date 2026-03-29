@@ -10,15 +10,16 @@ pub mod traits;
 pub mod types;
 pub mod validation;
 
-pub use api::{ArbitroRaft, RaftCustomRegistry, RaftNode};
+pub use api::{ArbitroRaft, ClientHandle, RaftCustomRegistry, RaftNode};
 pub use config::BootstrapPeer;
 pub use config::{LimitsConfig, NodeConfig, TimingConfig};
 pub use dispatch::{
-    encode_dispatch_response, DispatchAckPolicy, DispatchBuilder, DispatchContextView,
-    DispatchEnvelope, DispatchFailPolicy, DispatchFailure, DispatchHandle, DispatchNodeRole,
-    DispatchOptions, DispatchPeerResult, DispatchPeerState, DispatchRequester, DispatchResponder,
-    DispatchResponse, DispatchResponseKind, DispatchResponseView, DispatchResult, DispatchRoute,
-    DispatchScope, DispatchSpec, DispatchStreamView, DispatchTx, DispatchTxResponder, DispatchView,
+    encode_dispatch_response, DispatchAckOptions, DispatchAckPolicy, DispatchBuilder,
+    DispatchContextView, DispatchEnvelope, DispatchFailOptions, DispatchFailPolicy, DispatchFailure,
+    DispatchHandle, DispatchNodeRole, DispatchOptions, DispatchPeerResult, DispatchPeerState,
+    DispatchRequester, DispatchResponder, DispatchResponse, DispatchResponseKind,
+    DispatchResponseView, DispatchResult, DispatchRoute, DispatchScope, DispatchSpec,
+    DispatchStreamView, DispatchTx, DispatchTxResponder, DispatchView,
     RAFT_DISPATCH_FRAME_HEADER_SIZE, RAFT_DISPATCH_MAGIC, RAFT_DISPATCH_RESPONSE_FRAME_HEADER_SIZE,
     RAFT_DISPATCH_RESPONSE_MAGIC, RAFT_DISPATCH_RESPONSE_VERSION, RAFT_DISPATCH_VERSION,
 };
