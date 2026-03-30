@@ -97,20 +97,79 @@ Building a high-throughput consensus engine requires specific trade-offs:
 
 ---
 
-## Minimal Usage
+## Usage
+
+### Writing entries
 
 ```rust
 use arbitro_raft::{ArbitroRaft, NodeConfig, RaftNode};
+use bytes::Bytes;
 
-fn build<S, T>(config: NodeConfig, storage: S, transport: T) -> ArbitroRaft<S, T>
-where
-    S: arbitro_raft::RaftStorage,
-    T: arbitro_raft::RaftTransport,
-{
-    let node = RaftNode::new(config, storage, transport).unwrap();
-    ArbitroRaft::new(node)
+// Build the node (you supply RaftStorage + RaftTransport).
+let mut node = RaftNode::new(config, storage, transport).unwrap();
+let mut raft = ArbitroRaft::new(node);
+
+// Single entry — blocks until quorum commits it, returns its LogIndex.
+let index = raft.propose_once(Bytes::from("my-payload")).await?;
+
+// Batch — one network round-trip for N entries.
+let indexes = raft.propose_batch_once(vec![
+    Bytes::from("a"),
+    Bytes::from("b"),
+    Bytes::from("c"),
+]).await?;
+
+// Concurrent writes from many tasks — obtain a clonable handle,
+// then run the event loop in the background.
+let handle = raft.client_handle();
+tokio::spawn(async move { raft.run().await });
+
+let index = handle.write(Bytes::from("concurrent")).await?;
+```
+
+### Custom RPCs via Dispatch
+
+`DispatchSpec` turns any typed `(Params, Response)` pair into a routable RPC
+with configurable delivery policies (scope, ack quorum, failure tolerance,
+timeout). The same handler code works locally and across TCP peers unchanged.
+
+```rust
+use arbitro_raft::{DispatchAckPolicy, DispatchPeerState, DispatchScope, DispatchSpec};
+use bytes::Bytes;
+
+// 1. Define the spec once — DispatchSpec is Copy, pass by value freely.
+fn ping() -> DispatchSpec<String, String> {
+    DispatchSpec::new(
+        0x01,                                               // command ID (u8)
+        |s| Ok(Bytes::copy_from_slice(s.as_bytes())),      // encode params
+        |b| Ok(String::from_utf8_lossy(b).into_owned()),   // decode params
+        |s| Ok(Bytes::copy_from_slice(s.as_bytes())),      // encode response
+        |b| Ok(String::from_utf8_lossy(b).into_owned()),   // decode response
+    )
+    .with_scope(DispatchScope::All)         // target: all peers (or Followers / Leader / LocalOnly)
+    .with_ack_policy(DispatchAckPolicy::Quorum) // wait for quorum before returning
+}
+
+// 2. Register the handler on every node — runs when it receives a PING.
+node.on_with(ping(), |question: String, ctx| Box::pin(async move {
+    let answer = format!("pong: {question}");
+    ctx.accept_bytes(Bytes::copy_from_slice(answer.as_bytes())).await
+}))?;
+
+// 3. Dispatch from the leader — returns a handle immediately.
+let handle = node.dispatch(ping(), "hello".to_string()).await?;
+
+// 4. Await the required responses.
+let result = handle.wait().await?;
+for peer in &result.peers {
+    if let DispatchPeerState::Accepted(reply) = &peer.state {
+        println!("node {:?} replied: {reply}", peer.peer);
+    }
 }
 ```
+
+See [`examples/basic_raft.rs`](examples/basic_raft.rs) and
+[`examples/dispatch_rpc.rs`](examples/dispatch_rpc.rs) for runnable versions.
 
 ---
 
