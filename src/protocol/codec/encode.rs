@@ -50,6 +50,7 @@ pub(crate) fn encode_append_entries_frame(
         from:     U64::new(from.0),
         body_len: U32::new(body_len as u32),
         reserved: U32::new(0),
+        _pad:     U64::new(0),
     }.as_bytes());
 
     // AppendEntries fixed header.
@@ -99,6 +100,7 @@ pub fn encode_message_into(
         from:     U64::new(from.0),
         body_len: U32::new(body_len as u32),
         reserved: U32::new(0),
+        _pad:     U64::new(0),
     };
     buf.extend_from_slice(header.as_bytes());
 

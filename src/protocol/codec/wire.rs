@@ -24,13 +24,14 @@ pub const KIND_CUSTOM_RESPONSE:      u8 = 8;
 #[derive(IntoBytes, FromBytes, KnownLayout, Immutable, Clone, Copy, Debug)]
 #[repr(C)]
 pub(crate) struct RaftFrameHeader {
-    pub(crate) magic:    U32,
-    pub(crate) version:  u8,
-    pub(crate) kind:     u8,
-    pub(crate) flags:    U16,
-    pub(crate) from:     U64,
-    pub(crate) body_len: U32,
-    pub(crate) reserved: U32,
+    pub(crate) magic:    U32,     // [0..4]
+    pub(crate) version:  u8,      // [4]
+    pub(crate) kind:     u8,      // [5]
+    pub(crate) flags:    U16,     // [6..8]
+    pub(crate) from:     U64,     // [8..16]
+    pub(crate) body_len: U32,     // [16..20]
+    pub(crate) reserved: U32,     // [20..24]
+    pub(crate) _pad:     U64,     // [24..32] — aligns header to 32 bytes (power-of-2, half cache line)
 }
 
 #[derive(IntoBytes, FromBytes, KnownLayout, Immutable, Clone, Copy, Debug)]

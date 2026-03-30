@@ -269,7 +269,7 @@ impl RaftTransport for TcpTransport {
 //   total header = 24 bytes, then body_len bytes of body
 // ---------------------------------------------------------------------------
 
-const HEADER_SIZE: usize = 24;
+const HEADER_SIZE: usize = 32;
 const BODY_LEN_OFFSET: usize = 16;
 
 async fn read_frame(stream: &mut TcpStream, buf: &mut BytesMut) -> Option<Bytes> {
