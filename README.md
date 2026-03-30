@@ -106,4 +106,36 @@ See [`examples/basic_raft.rs`](examples/basic_raft.rs) and [`examples/dispatch_r
 
 ---
 
+## Roadmap
+
+### `v0.1.0` — Core consensus ✅ (current)
+- [x] Leader election (term-based voting, randomised timeouts)
+- [x] Log replication (`AppendEntries`, quorum commit)
+- [x] Heartbeat / follower timeout
+- [x] Transport abstraction (`RaftTransport` trait)
+- [x] Storage abstraction (`RaftStorage` trait)
+- [x] `MemStorage` reference implementation
+- [x] `TcpTransport` reference implementation
+- [x] `propose_once` / `propose_batch_once` single-node API
+- [x] `ClientHandle` concurrent-write API
+- [x] Custom RPC layer (`DispatchSpec`, `on_with`, `dispatch`)
+- [x] 32-byte cache-aligned wire header
+
+### `v0.2.0` — Robustness
+- [ ] **Log compaction / snapshotting** — install-snapshot RPC, truncate log prefix
+- [ ] **Learner nodes** — catch-up members that do not vote until fully replicated
+- [ ] **Single-server membership changes** — add/remove one peer at a time (§4.1)
+- [ ] **Leader transfer** — graceful leadership handoff without election timeout
+- [ ] **Check-quorum** — leader steps down if it cannot hear from a quorum
+
+### `v0.3.0` — Performance & linearisability
+- [ ] **Pre-vote** — candidate asks peers before incrementing term, prevents disruptive elections
+- [ ] **ReadIndex** — linearisable reads without writing to the log
+- [ ] **Lease-based reads** — bounded-clock leader-lease for lower-latency reads
+- [ ] **Pipeline replication** — overlap multiple `AppendEntries` RPCs per follower
+- [ ] **Joint consensus** — safe arbitrary membership changes (§6)
+- [ ] **Witness / non-voting replicas** — quorum participation without full log storage
+
+---
+
 *Built by [@automatizadovip](https://github.com/automatizadovip).*
