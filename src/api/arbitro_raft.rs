@@ -1,9 +1,13 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use futures::channel::{mpsc, oneshot};
+use futures::channel::mpsc;
+use futures::task::AtomicWaker;
 use futures::{FutureExt, StreamExt};
 
 use crate::{
@@ -12,17 +16,95 @@ use crate::{
 };
 
 // ---------------------------------------------------------------------------
+// Slot — lock-free single-use notification primitive.
+//
+// Replaces oneshot::channel for commit notifications. The raft task stores
+// the committed LogIndex via an atomic and wakes the waiting client task.
+// No mutex, no Arc<Mutex<Option<T>>> — just two word-sized fields.
+//
+// Sentinel values:
+//   SLOT_PENDING    (0)        — not yet committed
+//   SLOT_NOT_LEADER (u64::MAX) — leader stepped down before commit
+//   any other value            — committed LogIndex
+// ---------------------------------------------------------------------------
+
+const SLOT_PENDING: u64 = 0;
+const SLOT_NOT_LEADER: u64 = u64::MAX;
+
+struct Slot {
+    state: AtomicU64,
+    waker: AtomicWaker,
+}
+
+impl Slot {
+    #[inline]
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: AtomicU64::new(SLOT_PENDING),
+            waker: AtomicWaker::new(),
+        })
+    }
+
+    #[inline]
+    fn notify_committed(&self, index: LogIndex) {
+        self.state.store(index.0, Ordering::Release);
+        self.waker.wake();
+    }
+
+    #[inline]
+    fn notify_error(&self) {
+        self.state.store(SLOT_NOT_LEADER, Ordering::Release);
+        self.waker.wake();
+    }
+
+    #[inline]
+    fn decode(v: u64) -> Result<LogIndex, RaftError> {
+        if v == SLOT_NOT_LEADER {
+            Err(RaftError::NotLeader { leader_hint: None })
+        } else {
+            Ok(LogIndex(v))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WriteFuture — returned internally by ClientHandle::write.
+// ---------------------------------------------------------------------------
+
+struct WriteFuture {
+    slot: Arc<Slot>,
+}
+
+impl Future for WriteFuture {
+    type Output = Result<LogIndex, RaftError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let v = self.slot.state.load(Ordering::Acquire);
+        if v != SLOT_PENDING {
+            return Poll::Ready(Slot::decode(v));
+        }
+        self.slot.waker.register(cx.waker());
+        // Re-check after registration to close the register → store race.
+        let v = self.slot.state.load(Ordering::Acquire);
+        if v != SLOT_PENDING {
+            return Poll::Ready(Slot::decode(v));
+        }
+        Poll::Pending
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Internal types — not exposed directly; ClientHandle is the public surface.
 // ---------------------------------------------------------------------------
 
 struct ClientProposal {
     payload: Bytes,
-    tx:      oneshot::Sender<Result<LogIndex, RaftError>>,
+    slot:    Arc<Slot>,
 }
 
 struct CommitWaiter {
     index: LogIndex,
-    tx:    oneshot::Sender<Result<LogIndex, RaftError>>,
+    slot:  Arc<Slot>,
 }
 
 // ---------------------------------------------------------------------------
@@ -45,12 +127,11 @@ impl ClientHandle {
     /// Submit `payload` and wait until it is committed by a quorum.
     /// Returns the [`LogIndex`] assigned to the entry.
     pub async fn write(&self, payload: Bytes) -> Result<LogIndex, RaftError> {
-        let (tx, rx) = oneshot::channel();
+        let slot = Slot::new();
         self.tx
-            .unbounded_send(ClientProposal { payload, tx })
+            .unbounded_send(ClientProposal { payload, slot: slot.clone() })
             .map_err(|_| RaftError::Transport("raft node stopped".into()))?;
-        rx.await
-            .map_err(|_| RaftError::Transport("raft node stopped".into()))?
+        WriteFuture { slot }.await
     }
 }
 
@@ -68,8 +149,8 @@ pub struct ArbitroRaft<S, T> {
     client_rx:         mpsc::UnboundedReceiver<ClientProposal>,
     /// Scratch — payloads drained from client_rx this tick, cleared before each use.
     pending_batch:     Vec<Bytes>,
-    /// Scratch — oneshot senders parallel to pending_batch, drained together.
-    pending_senders:   Vec<oneshot::Sender<Result<LogIndex, RaftError>>>,
+    /// Scratch — slots parallel to pending_batch, drained together.
+    pending_slots:     Vec<Arc<Slot>>,
     /// Entries replicated but not yet committed; resolved as commit_index advances.
     commit_waiters:    Vec<CommitWaiter>,
 }
@@ -92,7 +173,7 @@ where
             client_tx,
             client_rx,
             pending_batch:     Vec::with_capacity(4096),
-            pending_senders:   Vec::with_capacity(4096),
+            pending_slots:     Vec::with_capacity(4096),
             commit_waiters:    Vec::with_capacity(4096),
         };
         raft.reset_election_deadline();
@@ -196,31 +277,19 @@ where
     T: RaftTransport,
 {
     async fn run_leader_once(&mut self) -> Result<(), RaftError> {
-        // 1. Drain inbound client proposals → pending_batch + pending_senders.
+        // 1. Drain inbound client proposals → pending_batch + pending_slots.
         //    NOTE: do NOT clear first — items may have been pushed by the idle-path select
-        //    arm on the previous tick; clearing would drop their oneshot senders uncompleted.
-        while let Ok(proposal) = self.client_rx.try_recv() {
-            self.pending_batch.push(proposal.payload);
-            self.pending_senders.push(proposal.tx);
-            if self.pending_batch.len() >= self.node.config.limits.append_batch_entries { break; }
+        //    arm on the previous tick; clearing would drop slots without notifying clients.
+        let limit = self.node.config.limits.append_batch_entries;
+        while self.pending_batch.len() < limit {
+            match self.client_rx.try_recv() {
+                Ok(p) => { self.pending_batch.push(p.payload); self.pending_slots.push(p.slot); }
+                Err(_) => break,
+            }
         }
 
         if !self.pending_batch.is_empty() {
-            match self.node.replicate_batch_async(&self.pending_batch).await {
-                Ok(indices) => {
-                    for (idx, tx) in indices.into_iter().zip(self.pending_senders.drain(..)) {
-                        self.commit_waiters.push(CommitWaiter { index: idx, tx });
-                    }
-                }
-                Err(e) => {
-                    for tx in self.pending_senders.drain(..) {
-                        let _ = tx.send(Err(RaftError::NotLeader { leader_hint: None }));
-                    }
-                    self.pending_batch.clear();
-                    return Err(e);
-                }
-            }
-            self.pending_batch.clear();
+            self.replicate_pending().await?;
         }
 
         // 2. Burst-drain available inbound frames.
@@ -258,15 +327,53 @@ where
                     if !self.node.is_leader() { self.fail_commit_waiters(); }
                 }
                 // else: timeout, heartbeat sent on next tick
+                return Ok(());
             }
             proposal = self.client_rx.next() => {
                 if let Some(p) = proposal {
                     self.pending_batch.push(p.payload);
-                    self.pending_senders.push(p.tx);
+                    self.pending_slots.push(p.slot);
+                    // Drain all remaining proposals in one shot — form the full batch
+                    // immediately so we replicate below without waiting for the next tick.
+                    while self.pending_batch.len() < limit {
+                        match self.client_rx.try_recv() {
+                            Ok(p2) => { self.pending_batch.push(p2.payload); self.pending_slots.push(p2.slot); }
+                            Err(_) => break,
+                        }
+                    }
                 }
+                // Fall through — replicate the batch formed above.
             }
         }
 
+        // Replicate batch accumulated by the proposal arm (skipped if frame arm returned).
+        if !self.pending_batch.is_empty() {
+            self.replicate_pending().await?;
+        }
+
+        Ok(())
+    }
+
+    /// Replicate `pending_batch`, pair results with `pending_slots` → `commit_waiters`.
+    async fn replicate_pending(&mut self) -> Result<(), RaftError> {
+        match self.node.replicate_batch_async(&self.pending_batch).await {
+            Ok((first_index, _)) => {
+                for (i, slot) in self.pending_slots.drain(..).enumerate() {
+                    self.commit_waiters.push(CommitWaiter {
+                        index: LogIndex(first_index.0 + i as u64),
+                        slot,
+                    });
+                }
+            }
+            Err(e) => {
+                for slot in self.pending_slots.drain(..) {
+                    slot.notify_error();
+                }
+                self.pending_batch.clear();
+                return Err(e);
+            }
+        }
+        self.pending_batch.clear();
         Ok(())
     }
 
@@ -311,14 +418,27 @@ where
     }
 
     /// Resolve all commit_waiters whose index ≤ current commit_index.
-    /// Uses swap_remove for O(1) removal without allocation.
+    ///
+    /// Fast path: when the entire batch commits at once (normal case), drain
+    /// in insertion order via a single pass with no swap_remove overhead.
     fn drain_commit_waiters(&mut self) {
         let commit_index = self.node.commit_index();
+        if self.commit_waiters.is_empty() { return; }
+
+        // Fast path — full batch committed (common in bench + low-contention).
+        if self.commit_waiters.last().map_or(false, |w| w.index <= commit_index) {
+            for w in self.commit_waiters.drain(..) {
+                w.slot.notify_committed(w.index);
+            }
+            return;
+        }
+
+        // Slow path — partial commit, swap_remove to avoid shifting.
         let mut i = 0;
         while i < self.commit_waiters.len() {
             if self.commit_waiters[i].index <= commit_index {
                 let w = self.commit_waiters.swap_remove(i);
-                let _ = w.tx.send(Ok(w.index));
+                w.slot.notify_committed(w.index);
             } else {
                 i += 1;
             }
@@ -328,7 +448,7 @@ where
     /// Fail all pending commit_waiters — called on step-down.
     fn fail_commit_waiters(&mut self) {
         for w in self.commit_waiters.drain(..) {
-            let _ = w.tx.send(Err(RaftError::NotLeader { leader_hint: None }));
+            w.slot.notify_error();
         }
     }
 

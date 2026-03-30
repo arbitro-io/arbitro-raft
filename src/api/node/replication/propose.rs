@@ -174,10 +174,15 @@ where
         Ok(self.scratch_indexes.clone())
     }
 
+    /// Fire-and-forget batch replication.
+    ///
+    /// Returns `(first_index, count)` — the indices assigned are the contiguous
+    /// range `[first_index, first_index + count)`. Callers reconstruct each index
+    /// as `LogIndex(first_index.0 + i)`, avoiding a `Vec<LogIndex>` allocation.
     pub async fn replicate_batch_async(
         &mut self,
         payloads: &[Bytes],
-    ) -> Result<Vec<LogIndex>, RaftError> {
+    ) -> Result<(LogIndex, usize), RaftError> {
         if !self.is_leader() {
             return Err(RaftError::NotLeader {
                 leader_hint: self
@@ -187,7 +192,7 @@ where
             });
         }
         if payloads.is_empty() {
-            return Ok(Vec::new());
+            return Ok((LogIndex(0), 0));
         }
         // Progress must be initialized BEFORE append — same reason as propose_batch_once.
         self.ensure_leader_progress_initialized()?;
@@ -196,17 +201,15 @@ where
         // without re-reading the new entries from storage after the write.
         let (prev_log_index, prev_log_term) = self.cached_last_log;
 
+        let first_index = LogIndex(prev_log_index.0 + 1);
         self.scratch_entries.clear();
-        self.scratch_indexes.clear();
-        let mut next_raw = prev_log_index.0 + 1;
+        let mut next_raw = first_index.0;
         for payload in payloads {
-            let next_index = LogIndex(next_raw);
             self.scratch_entries.push(LogEntry {
                 term:    self.hard_state.current_term,
-                index:   next_index,
+                index:   LogIndex(next_raw),
                 payload: EntryPayload(payload.clone()),
             });
-            self.scratch_indexes.push(next_index);
             next_raw += 1;
         }
         self.storage.append_entries(&self.scratch_entries)?;
@@ -239,6 +242,6 @@ where
             )?;
             self.send_best_effort(peer, frame).await;
         }
-        Ok(self.scratch_indexes.clone())
+        Ok((first_index, payloads.len()))
     }
 }
