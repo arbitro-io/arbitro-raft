@@ -76,31 +76,55 @@ where
             }),
         );
 
+        // Prepare parallel fan-out
+        let msg = RaftMessage::Custom(envelope.bytes());
+        let frame = crate::protocol::encode_message_to_bytes(self.config.node_id, &msg)?;
+
+        // Note: we must keep the responder and route alive while the future is evaluated.
+        // They must be declared BEFORE local_invoke so they are dropped AFTER it.
+        let route = self.route_for_peer(self.config.node_id);
+        let responder = LocalDispatchResponder {
+            local_peer: self.config.node_id,
+            command: envelope.command(),
+            pending: &self.pending_custom,
+            tx_id: envelope.tx_id(),
+        };
+
+        let mut sends = Vec::with_capacity(targets.len());
+        let mut local_invoke = None;
+
         for peer in targets {
             if peer == self.config.node_id {
-                let route = DispatchRoute {
-                    role: if self.is_leader() {
-                        DispatchNodeRole::Leader
-                    } else {
-                        DispatchNodeRole::Follower
-                    },
-                    is_origin: true,
-                };
-                let responder = LocalDispatchResponder {
-                    local_peer: self.config.node_id,
-                    command: envelope.command(),
-                    pending: &self.pending_custom,
-                    tx_id: envelope.tx_id(),
-                };
-                self.custom_registry
-                    .invoke_bytes_scoped(envelope.bytes(), &responder, route)
-                    .await?;
+                local_invoke = Some(self.custom_registry.invoke_bytes_scoped(
+                    envelope.bytes(),
+                    &responder,
+                    route,
+                ));
                 continue;
             }
-
-            let msg = RaftMessage::Custom(envelope.bytes());
-            self.send_message(peer, &msg).await;
+            sends.push(self.transport.send_frame_owned(peer, frame.clone()));
         }
+
+        // Execute all concurrently
+        if let Some(local) = local_invoke {
+            let (local_res, net_results) =
+                futures::future::join(local, futures::future::join_all(sends)).await;
+
+            local_res?; // Bubble up local registry errors
+            for res in net_results {
+                if let Err(e) = res {
+                    tracing::error!(error = %e, "dispatch fan-out failed for peer");
+                }
+            }
+        } else {
+            let net_results = futures::future::join_all(sends).await;
+            for res in net_results {
+                if let Err(e) = res {
+                    tracing::error!(error = %e, "dispatch fan-out failed for peer");
+                }
+            }
+        }
+
         Ok(handle)
     }
 

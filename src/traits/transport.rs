@@ -27,6 +27,12 @@ pub trait RaftTransport: Send + Sync {
     /// directly to the OS.
     fn send_vectored(&self, peer: PeerId, slices: &[&[u8]]) -> impl std::future::Future<Output = Result<(), RaftError>> + Send;
 
+    /// Send a Raft message using an owned buffer (Zero-copy sharing).
+    ///
+    /// The transport takes ownership of the `Bytes` object, allowing the 
+    /// sender to dispatch multiple parallel sends without lifetime issues.
+    fn send_frame_owned(&self, peer: PeerId, frame: bytes::Bytes) -> impl std::future::Future<Output = Result<(), RaftError>> + Send;
+
 
     /// Receive the next incoming raw frame from any peer into the provided buffer.
     ///

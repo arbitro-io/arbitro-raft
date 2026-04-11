@@ -22,7 +22,6 @@ use arbitro_raft::{
     EntryPayload, HardState, LogEntry, LogIndex, NodeConfig, PeerId, RaftError, RaftMessage,
     RaftNode, RaftStorage, RaftTransport, SnapshotMeta, Term,
 };
-use async_trait::async_trait;
 
 // ── Minimal storage / transport ── (Simplistic for example)
 
@@ -141,13 +140,18 @@ impl RaftTransport for NoopTransport {
     ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
         async move { Ok(()) }
     }
+    fn send_frame_owned(
+        &self,
+        _: PeerId,
+        _: bytes::Bytes,
+    ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
+        async move { Ok(()) }
+    }
     fn recv_frame(
         &self,
         _: &mut [u8],
     ) -> impl std::future::Future<Output = Result<usize, RaftError>> + Send {
-        async move {
-            futures::future::pending().await
-        }
+        async move { futures::future::pending().await }
     }
     fn recv_frame_timeout(
         &self,

@@ -3,8 +3,8 @@ use std::time::Duration;
 use super::super::progress::{AppendAdvance, AppendAttemptState};
 use super::super::RaftNode;
 use crate::{
-    AppendEntriesResp, EntryPayload, InboundRaftMessage, LogEntry, LogIndex, PeerId, RaftError,
-    RaftMessage,
+    protocol::codec::encode_message_to_bytes, AppendEntries, AppendEntriesResp, EntryPayload,
+    InboundRaftMessage, LogEntry, LogIndex, PeerId, RaftError, RaftMessage,
 };
 
 impl<S, T> RaftNode<S, T>
@@ -48,6 +48,8 @@ where
 
     /// Collect remote peers into `scratch_peers`, send one `AppendEntries` attempt to each,
     /// and populate `scratch_pending` with peers that received the frame.
+    /// Collect remote peers into `scratch_peers`, send one `AppendEntries` attempt to each
+    /// in parallel (fan-out), and populate `scratch_pending` with peers that received the frame.
     async fn send_initial_appends(&mut self) -> Result<(), RaftError> {
         self.scratch_peers.clear();
         for peer in self
@@ -59,10 +61,53 @@ where
         {
             self.scratch_peers.push(peer);
         }
-        self.scratch_pending.clear();
+
+        if self.scratch_peers.is_empty() {
+            return Ok(());
+        }
+
+        // 1. Prepare the message once
+        let (last_log_index, _) = self.storage.last_log_position()?;
+        // Entries were already appended to local log and are in scratch_entries
+        let entries_ref = unsafe {
+            std::mem::transmute::<&[LogEntry<'static>], &[LogEntry<'_>]>(
+                self.scratch_entries.as_slice(),
+            )
+        };
+
+        let prev_log_index = LogIndex(last_log_index.0 - entries_ref.len() as u64);
+        let prev_log_term = self.term_at(prev_log_index)?;
+
+        let req = AppendEntries {
+            term: self.hard_state.current_term.0.into(),
+            leader_id: self.config.node_id.0.into(),
+            prev_log_index: prev_log_index.0.into(),
+            prev_log_term: prev_log_term.0.into(),
+            leader_commit: self.soft_state.commit_index.0.into(),
+            entry_count: (entries_ref.len() as u32).into(),
+            _pad: 0.into(),
+        };
+        let msg = RaftMessage::AppendEntriesVectored(&req, entries_ref);
+
+        // 2. Encode to Bytes once (Sharing ownership across parallel sends)
+        let frame = encode_message_to_bytes(self.config.node_id, &msg)?;
+
+        // 3. Dispatch parallel sends (Fan-out)
+        let mut sends = Vec::with_capacity(self.scratch_peers.len());
+        let transport = &self.transport; // Shared reference for parallel access
         for i in 0..self.scratch_peers.len() {
             let peer = self.scratch_peers[i];
-            if let Some(sent_last_index) = self.send_append_attempt(peer, 1).await? {
+            let f = frame.clone(); // O(1) clone
+            sends.push(async move { (peer, transport.send_frame_owned(peer, f).await) });
+        }
+
+        self.scratch_pending.clear();
+        let results = futures::future::join_all(sends).await;
+
+        // 4. Record successes
+        let sent_last_index = last_log_index;
+        for (peer, res) in results {
+            if res.is_ok() {
                 self.scratch_pending.insert(
                     peer,
                     AppendAttemptState {
@@ -72,6 +117,7 @@ where
                 );
             }
         }
+
         Ok(())
     }
 
@@ -281,27 +327,21 @@ where
             self.cached_last_log = (last.index, last.term);
         }
 
-        // --- Vectored Encoding ---
-        self.scratch_vectored.clear();
-        let vectored_ref = unsafe {
-            std::mem::transmute::<&mut Vec<(*const u8, usize)>, &mut Vec<&[u8]>>(
-                &mut self.scratch_vectored,
-            )
+        // --- Parallel Fan-out Encoding ---
+        let req = AppendEntries {
+            term: self.hard_state.current_term.0.into(),
+            leader_id: self.config.node_id.0.into(),
+            prev_log_index: prev_log_index.0.into(),
+            prev_log_term: prev_log_term.0.into(),
+            leader_commit: self.soft_state.commit_index.0.into(),
+            entry_count: (entries_ref.len() as u32).into(),
+            _pad: 0.into(),
         };
+        let msg = RaftMessage::AppendEntriesVectored(&req, entries_ref);
+        let frame = encode_message_to_bytes(self.config.node_id, &msg)?;
 
-        crate::protocol::encode_append_entries_vectored(
-            self.config.node_id,
-            self.hard_state.current_term,
-            self.config.node_id,
-            prev_log_index,
-            prev_log_term,
-            self.soft_state.commit_index,
-            entries_ref,
-            &mut self.scratch_outbound,
-            vectored_ref,
-        )?;
-
-        // Broadcast to all peers
+        let mut sends = Vec::new();
+        let transport = &self.transport;
         for peer in self
             .config
             .peers
@@ -309,9 +349,18 @@ where
             .copied()
             .filter(|p| *p != self.config.node_id)
         {
-            let _ = self.transport.send_vectored(peer, vectored_ref).await;
+            let f = frame.clone();
+            sends.push(async move { transport.send_frame_owned(peer, f).await });
         }
-        self.scratch_vectored.clear();
+
+        // Wait for all sends to complete (at the syscall level)
+        let results = futures::future::join_all(sends).await;
+        for res in results {
+            if let Err(e) = res {
+                tracing::error!(error = %e, "parallel fan-out send failed");
+            }
+        }
+
         self.scratch_entries.clear();
 
         Ok((first_index, payloads.len()))

@@ -309,6 +309,40 @@ impl RaftTransport for TcpTransport {
         }
     }
 
+    fn send_frame_owned(
+        &self,
+        peer: PeerId,
+        frame: bytes::Bytes,
+    ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
+        let peer_addrs = self.peer_addrs.clone();
+        let connections = self.connections.clone();
+        async move {
+            let addr = *peer_addrs
+                .get(&peer)
+                .ok_or_else(|| RaftError::Transport(format!("unknown peer {:?}", peer)))?;
+
+            let stream = {
+                let mut conns = connections.lock().await;
+                if let Some(s) = conns.get(&peer) {
+                    s.clone()
+                } else {
+                    let s = TcpStream::connect(addr)
+                        .await
+                        .map_err(|e| RaftError::Transport(e.to_string()))?;
+                    let s = Arc::new(tokio::sync::Mutex::new(s));
+                    conns.insert(peer, s.clone());
+                    s
+                }
+            };
+
+            let mut s = stream.lock().await;
+            s.write_all(&frame)
+                .await
+                .map_err(|e| RaftError::Transport(e.to_string()))?;
+            Ok(())
+        }
+    }
+
     fn recv_frame(
         &self,
         out: &mut [u8],

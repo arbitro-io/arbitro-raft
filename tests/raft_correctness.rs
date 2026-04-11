@@ -67,6 +67,18 @@ impl RaftTransport for TestTransport {
         }
     }
 
+    fn send_frame_owned(
+        &self,
+        _peer: PeerId,
+        frame: bytes::Bytes,
+    ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
+        let tx = self.tx.clone();
+        async move {
+            let _ = tx.unbounded_send(frame.to_vec());
+            Ok(())
+        }
+    }
+
     fn recv_frame(
         &self,
         out: &mut [u8],
@@ -374,6 +386,56 @@ fn invariant_wire_encode_decode_roundtrip_is_lossless() {
 
     let decoded: Vec<_> = ae_view.entries().unwrap().collect();
     assert_eq!(decoded[0].index, LogIndex(1));
+    assert_eq!(decoded[1].payload.0, b"bb");
+}
+
+#[test]
+fn invariant_wire_encode_to_bytes_roundtrip_is_lossless() {
+    use arbitro_raft::{encode_message_to_bytes, AppendEntries, Term};
+
+    let p1 = b"a";
+    let p2 = b"bb";
+
+    let entries = vec![
+        LogEntry {
+            term: Term(3),
+            index: LogIndex(1),
+            payload: EntryPayload(p1),
+        },
+        LogEntry {
+            term: Term(3),
+            index: LogIndex(2),
+            payload: EntryPayload(p2),
+        },
+    ];
+
+    let ae = AppendEntries {
+        term: Term(3).0.into(),
+        leader_id: PeerId(1).0.into(),
+        prev_log_index: 0.into(),
+        prev_log_term: 0.into(),
+        leader_commit: 0.into(),
+        entry_count: (entries.len() as u32).into(),
+        _pad: 0.into(),
+    };
+
+    let msg = RaftMessage::AppendEntriesVectored(&ae, &entries);
+
+    // Test the new Bytes-based encoder
+    let frame = encode_message_to_bytes(PeerId(1), &msg).unwrap();
+    let inbound = decode_message(&frame).unwrap();
+
+    assert_eq!(inbound.from, PeerId(1));
+    let ae_view = inbound.as_append_entries().unwrap();
+    assert_eq!(ae_view.term(), Term(3));
+    assert_eq!(ae_view.leader_id(), PeerId(1));
+    assert_eq!(ae_view.entry_count(), 2);
+
+    let decoded: Vec<_> = ae_view.entries().unwrap().collect();
+    assert_eq!(decoded[0].term, Term(3));
+    assert_eq!(decoded[0].index, LogIndex(1));
+    assert_eq!(decoded[0].payload.0, b"a");
+    assert_eq!(decoded[1].index, LogIndex(2));
     assert_eq!(decoded[1].payload.0, b"bb");
 }
 

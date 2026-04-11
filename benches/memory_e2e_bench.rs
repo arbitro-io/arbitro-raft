@@ -281,6 +281,42 @@ impl MemTransport {
             _ => None,
         }
     }
+
+    /// Helper for simulated transport logic in benchmarks
+    fn handle_sim_inbound(&self, peer: PeerId, frame: &[u8]) -> Result<(), RaftError> {
+        let inbound = decode_message(frame)?;
+        if let Some(ae) = inbound.as_append_entries() {
+            let term = ae.term();
+
+            let (success, match_index) = match self.peer_state(peer) {
+                Some(state) => state.lock().unwrap().process_append(&ae),
+                None => (false, LogIndex(0)),
+            };
+
+            let resp = AppendEntriesResp {
+                term: term.0.into(),
+                success: if success { 1 } else { 0 },
+                match_index: match_index.0.into(),
+                _pad: [0; 7],
+            };
+
+            let mut header_buf = [0u8; 128];
+            let mut vectors = Vec::new();
+            encode_message_vectored(
+                peer,
+                &RaftMessage::AppendEntriesResp(&resp),
+                &mut header_buf,
+                &mut vectors,
+            )?;
+
+            let mut resp_frame = Vec::new();
+            for v in vectors {
+                resp_frame.extend_from_slice(v);
+            }
+            let _ = self.tx.unbounded_send(resp_frame);
+        }
+        Ok(())
+    }
 }
 
 impl RaftTransport for MemTransport {
@@ -289,46 +325,21 @@ impl RaftTransport for MemTransport {
         peer: PeerId,
         slices: &[&[u8]],
     ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
-        let mut frame = Vec::new(); // benchmark mock allows some allocation, but node doesn't
+        let mut frame = Vec::new();
         for s in slices {
             frame.extend_from_slice(s);
         }
 
-        let result = (|| -> Result<(), RaftError> {
-            let inbound = decode_message(&frame)?;
-            if let Some(ae) = inbound.as_append_entries() {
-                let term = ae.term();
+        let result = self.handle_sim_inbound(peer, &frame);
+        async move { result }
+    }
 
-                let (success, match_index) = match self.peer_state(peer) {
-                    Some(state) => state.lock().unwrap().process_append(&ae),
-                    None => (false, LogIndex(0)),
-                };
-
-                let resp = AppendEntriesResp {
-                    term: term.0.into(),
-                    success: if success { 1 } else { 0 },
-                    match_index: match_index.0.into(),
-                    _pad: [0; 7],
-                };
-
-                let mut header_buf = [0u8; 128];
-                let mut vectors = Vec::new();
-                encode_message_vectored(
-                    peer,
-                    &RaftMessage::AppendEntriesResp(&resp),
-                    &mut header_buf,
-                    &mut vectors,
-                )?;
-
-                let mut resp_frame = Vec::new();
-                for v in vectors {
-                    resp_frame.extend_from_slice(v);
-                }
-                let _ = self.tx.unbounded_send(resp_frame);
-            }
-            Ok(())
-        })();
-
+    fn send_frame_owned(
+        &self,
+        peer: PeerId,
+        frame: bytes::Bytes,
+    ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
+        let result = self.handle_sim_inbound(peer, &frame);
         async move { result }
     }
 
