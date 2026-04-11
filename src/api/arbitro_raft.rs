@@ -30,22 +30,25 @@ use crate::{
 const SLOT_PENDING: u64 = 0;
 const SLOT_NOT_LEADER: u64 = u64::MAX;
 
+#[repr(C, align(64))]
 struct Slot {
     state: AtomicU64,
     waker: AtomicWaker,
 }
 
-impl Slot {
-    #[inline]
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
+impl Default for Slot {
+    fn default() -> Self {
+        Self {
             state: AtomicU64::new(SLOT_PENDING),
             waker: AtomicWaker::new(),
-        })
+        }
     }
+}
 
+impl Slot {
     #[inline]
     fn notify_committed(&self, index: LogIndex) {
+        // Non-zero state marks it as "not pending" (free for lease after waker is done)
         self.state.store(index.0, Ordering::Release);
         self.waker.wake();
     }
@@ -66,29 +69,102 @@ impl Slot {
     }
 }
 
+/// Opaque identifier for a leased notification slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotId(u32);
+
+pub(crate) struct SlotRegistry {
+    arena: Box<[Slot]>,
+    cursor: AtomicU64,
+}
+
+impl SlotRegistry {
+    pub fn new(capacity: usize) -> Arc<Self> {
+        let mut slots = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            slots.push(Slot {
+                state: AtomicU64::new(SLOT_NOT_LEADER),
+                waker: AtomicWaker::new(),
+            });
+        }
+        Arc::new(Self {
+            arena: slots.into_boxed_slice(),
+            cursor: AtomicU64::new(0),
+        })
+    }
+
+    #[inline]
+    pub fn lease(&self) -> Option<SlotId> {
+        let cap = self.arena.len() as u64;
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed);
+
+        for i in 0..cap {
+            let idx = ((start + i) % cap) as usize;
+            let slot = &self.arena[idx];
+
+            // A slot is free if its state is NOT SLOT_PENDING.
+            // When we lease it, we atomically move it to SLOT_PENDING.
+            let current = slot.state.load(Ordering::Acquire);
+            if current != SLOT_PENDING {
+                if slot
+                    .state
+                    .compare_exchange(current, SLOT_PENDING, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return Some(SlotId(idx as u32));
+                }
+            }
+        }
+        None
+    }
+
+    #[inline]
+    pub fn release(&self, id: SlotId) {
+        // Technically, notify_committed/notify_error already moves state away from SLOT_PENDING.
+        // Release is mainly for cleanup if a proposal never reaches the raft task.
+        let slot = &self.arena[id.0 as usize];
+        if slot.state.load(Ordering::Acquire) == SLOT_PENDING {
+            slot.state.store(SLOT_NOT_LEADER, Ordering::Release);
+        }
+    }
+
+    #[inline]
+    fn get(&self, id: SlotId) -> &Slot {
+        &self.arena[id.0 as usize]
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WriteFuture — returned internally by ClientHandle::write.
 // ---------------------------------------------------------------------------
 
 struct WriteFuture {
-    slot: Arc<Slot>,
+    registry: Arc<SlotRegistry>,
+    id: SlotId,
 }
 
 impl Future for WriteFuture {
     type Output = Result<LogIndex, RaftError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let v = self.slot.state.load(Ordering::Acquire);
+        let slot = self.registry.get(self.id);
+        let v = slot.state.load(Ordering::Acquire);
         if v != SLOT_PENDING {
             return Poll::Ready(Slot::decode(v));
         }
-        self.slot.waker.register(cx.waker());
+        slot.waker.register(cx.waker());
         // Re-check after registration to close the register → store race.
-        let v = self.slot.state.load(Ordering::Acquire);
+        let v = slot.state.load(Ordering::Acquire);
         if v != SLOT_PENDING {
             return Poll::Ready(Slot::decode(v));
         }
         Poll::Pending
+    }
+}
+
+impl Drop for WriteFuture {
+    fn drop(&mut self) {
+        self.registry.release(self.id);
     }
 }
 
@@ -98,12 +174,12 @@ impl Future for WriteFuture {
 
 struct ClientProposal {
     payload: Vec<u8>,
-    slot: Arc<Slot>,
+    slot_id: SlotId,
 }
 
 struct CommitWaiter {
     index: LogIndex,
-    slot: Arc<Slot>,
+    slot_id: SlotId,
 }
 
 // ---------------------------------------------------------------------------
@@ -120,20 +196,33 @@ struct CommitWaiter {
 #[derive(Clone)]
 pub struct ClientHandle {
     tx: mpsc::UnboundedSender<ClientProposal>,
+    registry: Arc<SlotRegistry>,
 }
 
 impl ClientHandle {
     /// Submit `payload` and wait until it is committed by a quorum.
     /// Returns the [`LogIndex`] assigned to the entry.
     pub async fn write(&self, payload: &[u8]) -> Result<LogIndex, RaftError> {
-        let slot = Slot::new();
+        let id = self
+            .registry
+            .lease()
+            .ok_or_else(|| RaftError::Transport("no free notification slots".into()))?;
+
         self.tx
             .unbounded_send(ClientProposal {
                 payload: payload.to_vec(),
-                slot: slot.clone(),
+                slot_id: id,
             })
-            .map_err(|_| RaftError::Transport("raft node stopped".into()))?;
-        WriteFuture { slot }.await
+            .map_err(|_| {
+                self.registry.release(id);
+                RaftError::Transport("raft node stopped".into())
+            })?;
+
+        WriteFuture {
+            registry: self.registry.clone(),
+            id,
+        }
+        .await
     }
 }
 
@@ -149,10 +238,12 @@ pub struct ArbitroRaft<S, T> {
     election_state: u64,
     client_tx: mpsc::UnboundedSender<ClientProposal>,
     client_rx: mpsc::UnboundedReceiver<ClientProposal>,
+    /// Shared registry for commit notifications.
+    registry: Arc<SlotRegistry>,
     /// Scratch — payloads drained from client_rx this tick, cleared before each use.
     pending_batch: Vec<Vec<u8>>,
     /// Scratch — slots parallel to pending_batch, drained together.
-    pending_slots: Vec<Arc<Slot>>,
+    pending_slots: Vec<SlotId>,
     /// Entries replicated but not yet committed; resolved as commit_index advances.
     commit_waiters: Vec<CommitWaiter>,
     /// Long-lived inbound buffer to avoid per-frame allocations.
@@ -168,6 +259,7 @@ where
 {
     pub fn new(node: RaftNode<S, T>) -> Self {
         let (client_tx, client_rx) = mpsc::unbounded();
+        let registry_cap = node.config.limits.append_batch_entries * 2;
         let mut raft = Self {
             election_state: seed(node.node_id()),
             node,
@@ -176,6 +268,7 @@ where
             next_heartbeat_at: Instant::now(),
             client_tx,
             client_rx,
+            registry: SlotRegistry::new(registry_cap.max(4096)),
             pending_batch: Vec::with_capacity(4096),
             pending_slots: Vec::with_capacity(4096),
             commit_waiters: Vec::with_capacity(4096),
@@ -216,6 +309,7 @@ where
     pub fn client_handle(&self) -> ClientHandle {
         ClientHandle {
             tx: self.client_tx.clone(),
+            registry: self.registry.clone(),
         }
     }
 
@@ -315,7 +409,7 @@ where
             match self.client_rx.try_recv() {
                 Ok(p) => {
                     self.pending_batch.push(p.payload);
-                    self.pending_slots.push(p.slot);
+                    self.pending_slots.push(p.slot_id);
                 }
                 Err(_) => break,
             }
@@ -374,12 +468,12 @@ where
             proposal = self.client_rx.next() => {
                 if let Some(p) = proposal {
                     self.pending_batch.push(p.payload);
-                    self.pending_slots.push(p.slot);
+                    self.pending_slots.push(p.slot_id);
                     // Drain all remaining proposals in one shot — form the full batch
                     // immediately so we replicate below without waiting for the next tick.
                     while self.pending_batch.len() < limit {
                         match self.client_rx.try_recv() {
-                            Ok(p2) => { self.pending_batch.push(p2.payload); self.pending_slots.push(p2.slot); }
+                            Ok(p2) => { self.pending_batch.push(p2.payload); self.pending_slots.push(p2.slot_id); }
                             Err(_) => break,
                         }
                     }
@@ -406,16 +500,16 @@ where
 
         match self.node.replicate_batch_async(&payloads).await {
             Ok((first_index, _)) => {
-                for (i, slot) in self.pending_slots.drain(..).enumerate() {
+                for (i, slot_id) in self.pending_slots.drain(..).enumerate() {
                     self.commit_waiters.push(CommitWaiter {
                         index: LogIndex(first_index.0 + i as u64),
-                        slot,
+                        slot_id,
                     });
                 }
             }
             Err(e) => {
-                for slot in self.pending_slots.drain(..) {
-                    slot.notify_error();
+                for slot_id in self.pending_slots.drain(..) {
+                    self.registry.get(slot_id).notify_error();
                 }
                 self.pending_batch.clear();
                 return Err(e);
@@ -498,7 +592,7 @@ where
             .map_or(false, |w| w.index <= commit_index)
         {
             for w in self.commit_waiters.drain(..) {
-                w.slot.notify_committed(w.index);
+                self.registry.get(w.slot_id).notify_committed(w.index);
             }
             return;
         }
@@ -508,7 +602,7 @@ where
         while i < self.commit_waiters.len() {
             if self.commit_waiters[i].index <= commit_index {
                 let w = self.commit_waiters.swap_remove(i);
-                w.slot.notify_committed(w.index);
+                self.registry.get(w.slot_id).notify_committed(w.index);
             } else {
                 i += 1;
             }
@@ -518,7 +612,7 @@ where
     /// Fail all pending commit_waiters — called on step-down.
     fn fail_commit_waiters(&mut self) {
         for w in self.commit_waiters.drain(..) {
-            w.slot.notify_error();
+            self.registry.get(w.slot_id).notify_error();
         }
     }
 
