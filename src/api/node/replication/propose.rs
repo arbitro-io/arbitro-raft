@@ -107,56 +107,90 @@ where
         timeout: Duration,
     ) -> Result<usize, RaftError> {
         let mut accepted = 1usize;
-        let mut inbound_buf = vec![0; 64 * 1024]; // Temporary inbound scratch for quorum check loop, outside hot-path
-        while accepted < needed && !self.scratch_pending.is_empty() {
+
+        // Use pre-allocated quorum buffer
+        self.scratch_quorum_buf.clear();
+        if self.scratch_quorum_buf.capacity() < 64 * 1024 {
+            self.scratch_quorum_buf.reserve(64 * 1024);
+        }
+        unsafe { self.scratch_quorum_buf.set_len(64 * 1024) };
+
+        // RAII Guard to ensure the buffer is returned to self even on error/panic.
+        struct BufferGuard<'a, S, T> {
+            node: &'a mut RaftNode<S, T>,
+            buf: Vec<u8>,
+        }
+        impl<S, T> Drop for BufferGuard<'_, S, T> {
+            fn drop(&mut self) {
+                self.node.scratch_quorum_buf = std::mem::take(&mut self.buf);
+            }
+        }
+
+        let mut guard = BufferGuard {
+            buf: std::mem::take(&mut self.scratch_quorum_buf),
+            node: self,
+        };
+
+        while accepted < needed && !guard.node.scratch_pending.is_empty() {
             // Burst-drain: consume all immediately-available frames before yielding.
-            while let Some(n) = self
+            while let Some(n) = guard
+                .node
                 .transport
-                .recv_frame_timeout(Duration::ZERO, &mut inbound_buf)
+                .recv_frame_timeout(Duration::ZERO, &mut guard.buf)
                 .await?
             {
-                let inbound = crate::decode_message(&inbound_buf[..n])?;
+                let inbound = crate::decode_message(&guard.buf[..n])?;
                 let from = inbound.from;
                 match inbound.message {
                     RaftMessage::AppendEntriesResp(resp) => {
-                        self.process_append_resp(from, resp, last_index, &mut accepted)
+                        guard
+                            .node
+                            .process_append_resp(from, resp, last_index, &mut accepted)
                             .await?;
                     }
                     message => {
-                        self.handle_inbound(InboundRaftMessage { from, message })
+                        guard
+                            .node
+                            .handle_inbound(InboundRaftMessage { from, message })
                             .await?;
                     }
                 }
-                if accepted >= needed || self.scratch_pending.is_empty() {
+                if accepted >= needed || guard.node.scratch_pending.is_empty() {
                     break;
                 }
             }
-            if accepted >= needed || self.scratch_pending.is_empty() {
+            if accepted >= needed || guard.node.scratch_pending.is_empty() {
                 break;
             }
 
             // Blocking wait: yield only when the queue is actually empty.
-            let n = match self
+            if let Some(n) = guard
+                .node
                 .transport
-                .recv_frame_timeout(timeout, &mut inbound_buf)
+                .recv_frame_timeout(timeout, &mut guard.buf)
                 .await?
             {
-                Some(r) => r,
-                None => break,
-            };
-            let inbound = crate::decode_message(&inbound_buf[..n])?;
-            let from = inbound.from;
-            match inbound.message {
-                RaftMessage::AppendEntriesResp(resp) => {
-                    self.process_append_resp(from, resp, last_index, &mut accepted)
-                        .await?;
+                let inbound = crate::decode_message(&guard.buf[..n])?;
+                let from = inbound.from;
+                match inbound.message {
+                    RaftMessage::AppendEntriesResp(resp) => {
+                        guard
+                            .node
+                            .process_append_resp(from, resp, last_index, &mut accepted)
+                            .await?;
+                    }
+                    message => {
+                        guard
+                            .node
+                            .handle_inbound(InboundRaftMessage { from, message })
+                            .await?;
+                    }
                 }
-                message => {
-                    self.handle_inbound(InboundRaftMessage { from, message })
-                        .await?;
-                }
+            } else {
+                break;
             }
         }
+
         Ok(accepted)
     }
 
@@ -171,7 +205,7 @@ where
     pub async fn propose_batch_once(
         &mut self,
         payloads: &[&[u8]],
-    ) -> Result<Vec<LogIndex>, RaftError> {
+    ) -> Result<&[LogIndex], RaftError> {
         if !self.is_leader() {
             return Err(RaftError::NotLeader {
                 leader_hint: self
@@ -181,7 +215,7 @@ where
             });
         }
         if payloads.is_empty() {
-            return Ok(Vec::new());
+            return Ok(&[]);
         }
         // Progress must be initialized BEFORE append so that next_index covers
         // the entries we are about to write.
@@ -198,7 +232,7 @@ where
         }
         self.soft_state.commit_index = last_index;
         self.drain_inbound_ready().await?;
-        Ok(self.scratch_indexes.clone())
+        Ok(&self.scratch_indexes)
     }
 
     /// Fire-and-forget batch replication.

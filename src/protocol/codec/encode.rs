@@ -18,16 +18,15 @@ pub fn encode_message_vectored<'a>(
     out_vectored.clear();
 
     let body_len = body_total_len(msg);
-    let st_len = body_struct_len(msg);
-    let total_header_len = RAFT_FRAME_HEADER_SIZE + st_len;
+    let total_header_len = RAFT_FRAME_HEADER_SIZE;
 
     if header_buf.len() < total_header_len {
         return Err(RaftError::Protocol("header buffer too small".into()));
     }
 
-    // 1. Write headers first (scoping the mutable borrow)
+    // 1. Write Frame Header ONLY (Cero copias de cuerpos de structs)
     {
-        let (h_bytes, body_bytes) = header_buf.split_at_mut(RAFT_FRAME_HEADER_SIZE);
+        let (h_bytes, _) = header_buf.split_at_mut(RAFT_FRAME_HEADER_SIZE);
 
         // Frame Header
         let (h_ref, _) = Ref::<_, RaftFrameHeader>::from_prefix(h_bytes)
@@ -41,34 +40,11 @@ pub fn encode_message_vectored<'a>(
         header.body_len.set(body_len as u32);
         header.reserved.set(0);
         header._pad.set(0);
-
-        // Body Struct (if any)
-        if st_len > 0 {
-            match msg {
-                RaftMessage::RequestVote(m) => body_bytes[..st_len].copy_from_slice(m.as_bytes()),
-                RaftMessage::RequestVoteResp(m) => {
-                    body_bytes[..st_len].copy_from_slice(m.as_bytes())
-                }
-                RaftMessage::AppendEntries(m, _) => {
-                    body_bytes[..st_len].copy_from_slice(m.as_bytes())
-                }
-                RaftMessage::AppendEntriesResp(m) => {
-                    body_bytes[..st_len].copy_from_slice(m.as_bytes())
-                }
-                RaftMessage::InstallSnapshot(m, _) => {
-                    body_bytes[..st_len].copy_from_slice(m.as_bytes())
-                }
-                RaftMessage::InstallSnapshotResp(m) => {
-                    body_bytes[..st_len].copy_from_slice(m.as_bytes())
-                }
-                _ => {}
-            }
-        }
     }
 
-    // 2. Collection (Immutable phase)
     match msg {
         RaftMessage::AppendEntriesVectored(m, entries) => {
+            // Specialized function handles everything including frame header and clearing out_vectored
             return encode_append_entries_vectored(
                 from,
                 Term(m.term.get()),
@@ -81,20 +57,41 @@ pub fn encode_message_vectored<'a>(
                 out_vectored,
             );
         }
-        RaftMessage::Custom(payload) | RaftMessage::CustomResponse(payload) => {
+        RaftMessage::RequestVote(m) => {
             out_vectored.push(&header_buf[..RAFT_FRAME_HEADER_SIZE]);
-            if !payload.is_empty() {
-                out_vectored.push(payload);
+            out_vectored.push(m.as_bytes());
+        }
+        RaftMessage::RequestVoteResp(m) => {
+            out_vectored.push(&header_buf[..RAFT_FRAME_HEADER_SIZE]);
+            out_vectored.push(m.as_bytes());
+        }
+        RaftMessage::AppendEntries(m, p) => {
+            out_vectored.push(&header_buf[..RAFT_FRAME_HEADER_SIZE]);
+            out_vectored.push(m.as_bytes());
+            if !p.is_empty() {
+                out_vectored.push(p);
             }
         }
-        RaftMessage::AppendEntries(_, payload) | RaftMessage::InstallSnapshot(_, payload) => {
-            out_vectored.push(&header_buf[..total_header_len]);
-            if !payload.is_empty() {
-                out_vectored.push(payload);
+        RaftMessage::AppendEntriesResp(m) => {
+            out_vectored.push(&header_buf[..RAFT_FRAME_HEADER_SIZE]);
+            out_vectored.push(m.as_bytes());
+        }
+        RaftMessage::InstallSnapshot(m, p) => {
+            out_vectored.push(&header_buf[..RAFT_FRAME_HEADER_SIZE]);
+            out_vectored.push(m.as_bytes());
+            if !p.is_empty() {
+                out_vectored.push(p);
             }
         }
-        _ => {
-            out_vectored.push(&header_buf[..total_header_len]);
+        RaftMessage::InstallSnapshotResp(m) => {
+            out_vectored.push(&header_buf[..RAFT_FRAME_HEADER_SIZE]);
+            out_vectored.push(m.as_bytes());
+        }
+        RaftMessage::Custom(p) | RaftMessage::CustomResponse(p) => {
+            out_vectored.push(&header_buf[..RAFT_FRAME_HEADER_SIZE]);
+            if !p.is_empty() {
+                out_vectored.push(p);
+            }
         }
     }
 
@@ -211,26 +208,12 @@ fn kind_of(msg: &RaftMessage) -> u8 {
     }
 }
 
-fn body_struct_len(msg: &RaftMessage) -> usize {
-    match msg {
-        RaftMessage::RequestVote(_) => std::mem::size_of::<RequestVote>(),
-        RaftMessage::RequestVoteResp(_) => std::mem::size_of::<RequestVoteResp>(),
-        RaftMessage::AppendEntries(_, _) => std::mem::size_of::<AppendEntries>(),
-        RaftMessage::AppendEntriesVectored(_, _) => std::mem::size_of::<AppendEntries>(),
-        RaftMessage::AppendEntriesResp(_) => std::mem::size_of::<AppendEntriesResp>(),
-        RaftMessage::InstallSnapshot(_, _) => std::mem::size_of::<InstallSnapshot>(),
-        RaftMessage::InstallSnapshotResp(_) => std::mem::size_of::<InstallSnapshotResp>(),
-        RaftMessage::Custom(_) => 0,
-        RaftMessage::CustomResponse(_) => 0,
-    }
-}
-
 fn body_total_len(msg: &RaftMessage) -> usize {
     match msg {
         RaftMessage::RequestVote(m) => m.as_bytes().len(),
         RaftMessage::RequestVoteResp(m) => m.as_bytes().len(),
         RaftMessage::AppendEntries(m, p) => m.as_bytes().len() + p.len(),
-        RaftMessage::AppendEntriesVectored(m, entries) => {
+        RaftMessage::AppendEntriesVectored(_m, entries) => {
             let mut len = std::mem::size_of::<AppendEntries>();
             for e in *entries {
                 len += std::mem::size_of::<EntryHeader>() + e.payload.0.len();

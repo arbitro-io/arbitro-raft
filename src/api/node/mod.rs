@@ -38,12 +38,13 @@ pub struct RaftNode<S, T> {
     pub(crate) scratch_entries: Vec<LogEntry<'static>>,
     pub(crate) scratch_indexes: Vec<LogIndex>,
     pub(crate) scratch_peers: Vec<PeerId>,
+    pub(crate) scratch_quorum_buf: Vec<u8>,
+    pub(crate) scratch_vectored: Vec<(*const u8, usize)>,
     pub(crate) scratch_pending: PeerMap<AppendAttemptState>,
     #[allow(dead_code)] // reserved for per-peer attempt timing instrumentation
     pub(crate) scratch_started: HashMap<PeerId, std::time::Instant>,
     pub(crate) scratch_outbound: Vec<u8>,
     pub(crate) scratch_payload: Vec<u8>,
-    pub(crate) scratch_vectored: Vec<(*const u8, usize)>,
 
     /// Cached last-log position — kept in sync with every append/truncate so
     /// `try_advance_commit_index` and leader-progress init avoid a storage read.
@@ -51,8 +52,18 @@ pub struct RaftNode<S, T> {
 }
 
 // SAFETY: All raw pointers in scratch_vectored are ephemeral and cleared after use.
-unsafe impl<S, T> Send for RaftNode<S, T> where S: Send, T: Send {}
-unsafe impl<S, T> Sync for RaftNode<S, T> where S: Sync, T: Sync {}
+unsafe impl<S, T> Send for RaftNode<S, T>
+where
+    S: Send,
+    T: Send,
+{
+}
+unsafe impl<S, T> Sync for RaftNode<S, T>
+where
+    S: Sync,
+    T: Sync,
+{
+}
 
 impl<S, T> RaftNode<S, T>
 where
@@ -70,6 +81,7 @@ where
             // commit_index is volatile — always 0 on restart, advanced by AppendEntries.
             commit_index: LogIndex(0),
         };
+        let peer_count = config.peers.len();
         Ok(Self {
             config,
             storage,
@@ -80,14 +92,15 @@ where
             pending_custom: HashMap::new(),
             peer_progress: PeerMap::new(),
             pending_snapshots: HashMap::new(),
-            scratch_entries: Vec::new(),
-            scratch_indexes: Vec::new(),
-            scratch_peers: Vec::new(),
+            scratch_entries: Vec::with_capacity(1024),
+            scratch_indexes: Vec::with_capacity(1024),
+            scratch_peers: Vec::with_capacity(peer_count),
+            scratch_quorum_buf: vec![0u8; 64 * 1024],
+            scratch_vectored: Vec::with_capacity(2048),
             scratch_pending: PeerMap::new(),
             scratch_started: HashMap::new(),
-            scratch_outbound: vec![0; 64 * 1024], // 64KB initial buffer, will grow if needed
+            scratch_outbound: vec![0; 1024 * 1024], // 1MB pre-allocated scratch for outbound encoding
             scratch_payload: vec![0; 16 * 1024 * 1024], // 16MB pre-allocated scratch for storage reads
-            scratch_vectored: Vec::with_capacity(1024),
             cached_last_log,
         })
     }

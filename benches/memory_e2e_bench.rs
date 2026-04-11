@@ -283,92 +283,108 @@ impl MemTransport {
     }
 }
 
-#[async_trait]
 impl RaftTransport for MemTransport {
-    async fn send_vectored(&self, peer: PeerId, slices: &[&[u8]]) -> Result<(), RaftError> {
-        let mut frame = Vec::new();
+    fn send_vectored(
+        &self,
+        peer: PeerId,
+        slices: &[&[u8]],
+    ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
+        let mut frame = Vec::new(); // benchmark mock allows some allocation, but node doesn't
         for s in slices {
             frame.extend_from_slice(s);
         }
 
-        let inbound = decode_message(&frame)?;
-        if let Some(ae) = inbound.as_append_entries() {
-            let term = ae.term();
+        let result = (|| -> Result<(), RaftError> {
+            let inbound = decode_message(&frame)?;
+            if let Some(ae) = inbound.as_append_entries() {
+                let term = ae.term();
 
-            let (success, match_index) = match self.peer_state(peer) {
-                Some(state) => state.lock().unwrap().process_append(&ae),
-                None => (false, LogIndex(0)),
-            };
+                let (success, match_index) = match self.peer_state(peer) {
+                    Some(state) => state.lock().unwrap().process_append(&ae),
+                    None => (false, LogIndex(0)),
+                };
 
-            let resp = AppendEntriesResp {
-                term: term.0.into(),
-                success: if success { 1 } else { 0 },
-                match_index: match_index.0.into(),
-                _pad: [0; 7],
-            };
+                let resp = AppendEntriesResp {
+                    term: term.0.into(),
+                    success: if success { 1 } else { 0 },
+                    match_index: match_index.0.into(),
+                    _pad: [0; 7],
+                };
 
-            let mut header_buf = [0u8; 128];
-            let mut vectors = Vec::new();
-            encode_message_vectored(
-                peer,
-                &RaftMessage::AppendEntriesResp(&resp),
-                &mut header_buf,
-                &mut vectors,
-            )?;
+                let mut header_buf = [0u8; 128];
+                let mut vectors = Vec::new();
+                encode_message_vectored(
+                    peer,
+                    &RaftMessage::AppendEntriesResp(&resp),
+                    &mut header_buf,
+                    &mut vectors,
+                )?;
 
-            let mut resp_frame = Vec::new();
-            for v in vectors {
-                resp_frame.extend_from_slice(v);
-            }
-            let _ = self.tx.unbounded_send(resp_frame);
-        }
-        Ok(())
-    }
-
-    async fn recv_frame(&self, out: &mut [u8]) -> Result<usize, RaftError> {
-        loop {
-            if let Ok(frame) = self.rx.lock().unwrap().try_recv() {
-                let len = frame.len();
-                if out.len() < len {
-                    return Err(RaftError::Transport("buffer too small".into()));
+                let mut resp_frame = Vec::new();
+                for v in vectors {
+                    resp_frame.extend_from_slice(v);
                 }
-                out[..len].copy_from_slice(&frame);
-                return Ok(len);
+                let _ = self.tx.unbounded_send(resp_frame);
             }
-            tokio::task::yield_now().await;
+            Ok(())
+        })();
+
+        async move { result }
+    }
+
+    fn recv_frame(
+        &self,
+        out: &mut [u8],
+    ) -> impl std::future::Future<Output = Result<usize, RaftError>> + Send {
+        // We use a manual capture of the mut buffer lifetime by wrapping in a future
+        // Note: For benchmarks, copying to 'out' is standard.
+        async move {
+            loop {
+                if let Ok(frame) = self.rx.lock().unwrap().try_recv() {
+                    let len = frame.len();
+                    if out.len() < len {
+                        return Err(RaftError::Transport("buffer too small".into()));
+                    }
+                    out[..len].copy_from_slice(&frame);
+                    return Ok(len);
+                }
+                tokio::task::yield_now().await;
+            }
         }
     }
 
-    async fn recv_frame_timeout(
+    fn recv_frame_timeout(
         &self,
         timeout: Duration,
         out: &mut [u8],
-    ) -> Result<Option<usize>, RaftError> {
-        if timeout.is_zero() {
-            if let Ok(frame) = self.rx.lock().unwrap().try_recv() {
-                let len = frame.len();
-                if out.len() < len {
-                    return Err(RaftError::Transport("buffer too small".into()));
+    ) -> impl std::future::Future<Output = Result<Option<usize>, RaftError>> + Send {
+        async move {
+            if timeout.is_zero() {
+                if let Ok(frame) = self.rx.lock().unwrap().try_recv() {
+                    let len = frame.len();
+                    if out.len() < len {
+                        return Err(RaftError::Transport("buffer too small".into()));
+                    }
+                    out[..len].copy_from_slice(&frame);
+                    return Ok(Some(len));
                 }
-                out[..len].copy_from_slice(&frame);
-                return Ok(Some(len));
-            }
-            return Ok(None);
-        }
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Ok(frame) = self.rx.lock().unwrap().try_recv() {
-                let len = frame.len();
-                if out.len() < len {
-                    return Err(RaftError::Transport("buffer too small".into()));
-                }
-                out[..len].copy_from_slice(&frame);
-                return Ok(Some(len));
-            }
-            if Instant::now() >= deadline {
                 return Ok(None);
             }
-            tokio::task::yield_now().await;
+            let deadline = Instant::now() + timeout;
+            loop {
+                if let Ok(frame) = self.rx.lock().unwrap().try_recv() {
+                    let len = frame.len();
+                    if out.len() < len {
+                        return Err(RaftError::Transport("buffer too small".into()));
+                    }
+                    out[..len].copy_from_slice(&frame);
+                    return Ok(Some(len));
+                }
+                if Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                tokio::task::yield_now().await;
+            }
         }
     }
 }

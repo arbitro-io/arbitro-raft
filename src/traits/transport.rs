@@ -19,26 +19,25 @@ use crate::{PeerId, RaftError};
 /// **Recv:** The transport reads raw bytes from the wire and returns them via
 /// `recv_frame`. `RaftNode` decodes them with `decode_message_view` and
 /// dispatches to the appropriate handler.
-#[async_trait]
 pub trait RaftTransport: Send + Sync {
     /// Send a Raft message split into multiple slices (Vectored I/O).
     ///
     /// This eliminates copies of large payloads by allowing the transport
     /// to pass multiple buffers (e.g. headers in one, payload in another) 
     /// directly to the OS.
-    async fn send_vectored(&self, peer: PeerId, slices: &[&[u8]]) -> Result<(), RaftError>;
+    fn send_vectored(&self, peer: PeerId, slices: &[&[u8]]) -> impl std::future::Future<Output = Result<(), RaftError>> + Send;
 
 
     /// Receive the next incoming raw frame from any peer into the provided buffer.
     ///
     /// The transport writes exactly the frame bytes into `out` and returns the length.
     /// Blocks until a frame arrives.
-    async fn recv_frame(&self, out: &mut [u8]) -> Result<usize, RaftError>;
+    fn recv_frame(&self, out: &mut [u8]) -> impl std::future::Future<Output = Result<usize, RaftError>> + Send;
 
     /// Receive the next incoming raw frame into the provided buffer, returning `None` if `timeout` elapses.
-    async fn recv_frame_timeout(
+    fn recv_frame_timeout(
         &self,
         timeout: Duration,
         out: &mut [u8],
-    ) -> Result<Option<usize>, RaftError>;
+    ) -> impl std::future::Future<Output = Result<Option<usize>, RaftError>> + Send;
 }

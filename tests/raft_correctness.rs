@@ -23,17 +23,17 @@ use arbitro_raft::{
 
 struct TestTransport {
     tx: futures::channel::mpsc::UnboundedSender<Vec<u8>>,
-    rx: tokio::sync::Mutex<futures::channel::mpsc::UnboundedReceiver<Vec<u8>>>,
+    rx: Arc<tokio::sync::Mutex<futures::channel::mpsc::UnboundedReceiver<Vec<u8>>>>,
 }
 
 impl TestTransport {
     fn new() -> (Self, futures::channel::mpsc::UnboundedReceiver<Vec<u8>>) {
-        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let (_tx, rx) = futures::channel::mpsc::unbounded();
         let (out_tx, out_rx) = futures::channel::mpsc::unbounded();
         (
             Self {
                 tx: out_tx,
-                rx: tokio::sync::Mutex::new(rx),
+                rx: Arc::new(tokio::sync::Mutex::new(rx)),
             },
             out_rx,
         )
@@ -44,53 +44,68 @@ impl TestTransport {
         let (itx, irx) = futures::channel::mpsc::unbounded::<Vec<u8>>();
         let transport = Self {
             tx,
-            rx: tokio::sync::Mutex::new(irx),
+            rx: Arc::new(tokio::sync::Mutex::new(irx)),
         };
         (transport, itx)
     }
 }
 
-#[async_trait]
 impl RaftTransport for TestTransport {
-    async fn send_vectored(&self, _peer: PeerId, slices: &[&[u8]]) -> Result<(), RaftError> {
+    fn send_vectored(
+        &self,
+        _peer: PeerId,
+        slices: &[&[u8]],
+    ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
         let mut frame = Vec::new();
         for s in slices {
             frame.extend_from_slice(s);
         }
-        let _ = self.tx.unbounded_send(frame);
-        Ok(())
-    }
-
-    async fn recv_frame(&self, out: &mut [u8]) -> Result<usize, RaftError> {
-        let mut rx = self.rx.lock().await;
-        let frame = rx
-            .next()
-            .await
-            .ok_or(RaftError::Transport("closed".into()))?;
-        let len = frame.len();
-        if out.len() < len {
-            return Err(RaftError::Transport("buffer too small".into()));
+        let tx = self.tx.clone();
+        async move {
+            let _ = tx.unbounded_send(frame);
+            Ok(())
         }
-        out[..len].copy_from_slice(&frame);
-        Ok(len)
     }
 
-    async fn recv_frame_timeout(
+    fn recv_frame(
+        &self,
+        out: &mut [u8],
+    ) -> impl std::future::Future<Output = Result<usize, RaftError>> + Send {
+        let rx = self.rx.clone();
+        async move {
+            let mut rx = rx.lock().await;
+            let frame = rx
+                .next()
+                .await
+                .ok_or(RaftError::Transport("closed".into()))?;
+            let len = frame.len();
+            if out.len() < len {
+                return Err(RaftError::Transport("buffer too small".into()));
+            }
+            out[..len].copy_from_slice(&frame);
+            Ok(len)
+        }
+    }
+
+    fn recv_frame_timeout(
         &self,
         timeout: Duration,
         out: &mut [u8],
-    ) -> Result<Option<usize>, RaftError> {
-        let mut rx = self.rx.lock().await;
-        match tokio::time::timeout(timeout, rx.next()).await {
-            Ok(Some(frame)) => {
-                let len = frame.len();
-                if out.len() < len {
-                    return Err(RaftError::Transport("buffer too small".into()));
+    ) -> impl std::future::Future<Output = Result<Option<usize>, RaftError>> + Send {
+        let rx = self.rx.clone();
+        async move {
+            let mut rx = rx.lock().await;
+            match tokio::time::timeout(timeout, rx.next()).await {
+                Ok(Some(frame)) => {
+                    let len = frame.len();
+                    if out.len() < len {
+                        return Err(RaftError::Transport("buffer too small".into()));
+                    }
+                    out[..len].copy_from_slice(&frame);
+                    Ok(Some(len))
                 }
-                out[..len].copy_from_slice(&frame);
-                Ok(Some(len))
+                _ => Ok(None),
             }
-            _ => Ok(None),
         }
     }
 }

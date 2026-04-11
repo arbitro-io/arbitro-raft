@@ -1,11 +1,11 @@
 use super::RaftNode;
-use crate::{
-    DispatchContextView, DispatchHandle, DispatchNodeRole,
-    DispatchResponder, DispatchResponse, DispatchResponseKind, DispatchRoute,
-    DispatchScope, DispatchSpec, DispatchTx, PeerId, RaftError, RaftMessage,
-};
-use crate::dispatch::DispatchResponseView;
 use crate::dispatch::encode_dispatch_response;
+use crate::dispatch::DispatchResponseView;
+use crate::{
+    DispatchContextView, DispatchHandle, DispatchNodeRole, DispatchResponder, DispatchResponse,
+    DispatchResponseKind, DispatchRoute, DispatchScope, DispatchSpec, DispatchTx, PeerId,
+    RaftError, RaftMessage,
+};
 use async_trait::async_trait;
 use std::future::Future;
 use std::pin::Pin;
@@ -204,8 +204,8 @@ impl<T: crate::RaftTransport> DispatchResponder for NodeDispatchResponder<'_, T>
     async fn send_response(&self, response: DispatchResponse) -> Result<(), RaftError> {
         let inner = encode_dispatch_response(&response);
         let msg = RaftMessage::CustomResponse(&inner);
-        
-        let mut header_buf = [0u8; 128]; 
+
+        let mut header_buf = [0u8; 128];
         let mut vectors = Vec::with_capacity(4);
 
         crate::protocol::encode_message_vectored(

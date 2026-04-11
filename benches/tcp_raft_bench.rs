@@ -255,97 +255,113 @@ impl PeerState {
 // ---------------------------------------------------------------------------
 
 struct TcpTransport {
-    inbound_rx: Mutex<UnboundedReceiver<Vec<u8>>>,
-    peer_addrs: HashMap<PeerId, SocketAddr>,
-    connections: tokio::sync::Mutex<HashMap<PeerId, Arc<tokio::sync::Mutex<TcpStream>>>>,
+    inbound_rx: Arc<Mutex<UnboundedReceiver<Vec<u8>>>>,
+    peer_addrs: Arc<HashMap<PeerId, SocketAddr>>,
+    connections: Arc<tokio::sync::Mutex<HashMap<PeerId, Arc<tokio::sync::Mutex<TcpStream>>>>>,
 }
 
 impl TcpTransport {
     fn new(rx: UnboundedReceiver<Vec<u8>>, peer_addrs: HashMap<PeerId, SocketAddr>) -> Self {
         Self {
-            inbound_rx: Mutex::new(rx),
-            peer_addrs,
-            connections: tokio::sync::Mutex::new(HashMap::new()),
+            inbound_rx: Arc::new(Mutex::new(rx)),
+            peer_addrs: Arc::new(peer_addrs),
+            connections: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 }
 
-#[async_trait]
 impl RaftTransport for TcpTransport {
-    async fn send_vectored(&self, peer: PeerId, slices: &[&[u8]]) -> Result<(), RaftError> {
-        let addr = *self
-            .peer_addrs
-            .get(&peer)
-            .ok_or_else(|| RaftError::Transport(format!("unknown peer {:?}", peer)))?;
+    fn send_vectored(
+        &self,
+        peer: PeerId,
+        slices: &[&[u8]],
+    ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
+        let peer_addrs = self.peer_addrs.clone();
+        let connections = self.connections.clone();
+        let slices_owned = slices.iter().map(|s| s.to_vec()).collect::<Vec<_>>();
 
-        let stream = {
-            let mut conns = self.connections.lock().await;
-            if let Some(s) = conns.get(&peer) {
-                s.clone()
-            } else {
-                let s = TcpStream::connect(addr)
+        async move {
+            let addr = *peer_addrs
+                .get(&peer)
+                .ok_or_else(|| RaftError::Transport(format!("unknown peer {:?}", peer)))?;
+
+            let stream = {
+                let mut conns = connections.lock().await;
+                if let Some(s) = conns.get(&peer) {
+                    s.clone()
+                } else {
+                    let s = TcpStream::connect(addr)
+                        .await
+                        .map_err(|e| RaftError::Transport(e.to_string()))?;
+                    let s = Arc::new(tokio::sync::Mutex::new(s));
+                    conns.insert(peer, s.clone());
+                    s
+                }
+            };
+
+            let mut s = stream.lock().await;
+            for slice in slices_owned {
+                s.write_all(&slice)
                     .await
                     .map_err(|e| RaftError::Transport(e.to_string()))?;
-                s.set_nodelay(true).ok();
-                let s = Arc::new(tokio::sync::Mutex::new(s));
-                conns.insert(peer, s.clone());
-                s
             }
-        };
-
-        let mut s = stream.lock().await;
-        for slice in slices {
-            s.write_all(slice)
-                .await
-                .map_err(|e| RaftError::Transport(e.to_string()))?;
+            Ok(())
         }
-        Ok(())
     }
 
-    async fn recv_frame(&self, out: &mut [u8]) -> Result<usize, RaftError> {
-        loop {
-            if let Ok(frame) = self.inbound_rx.lock().unwrap().try_recv() {
-                let len = frame.len();
-                if out.len() < len {
-                    return Err(RaftError::Transport("buffer too small".into()));
+    fn recv_frame(
+        &self,
+        out: &mut [u8],
+    ) -> impl std::future::Future<Output = Result<usize, RaftError>> + Send {
+        let inbound_rx = self.inbound_rx.clone();
+        async move {
+            loop {
+                if let Ok(frame) = inbound_rx.lock().unwrap().try_recv() {
+                    let len = frame.len();
+                    if out.len() < len {
+                        return Err(RaftError::Transport("buffer too small".into()));
+                    }
+                    out[..len].copy_from_slice(&frame);
+                    return Ok(len);
                 }
-                out[..len].copy_from_slice(&frame);
-                return Ok(len);
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
         }
     }
 
-    async fn recv_frame_timeout(
+    fn recv_frame_timeout(
         &self,
         timeout: Duration,
         out: &mut [u8],
-    ) -> Result<Option<usize>, RaftError> {
-        if timeout.is_zero() {
-            if let Ok(frame) = self.inbound_rx.lock().unwrap().try_recv() {
-                let len = frame.len();
-                if out.len() < len {
-                    return Err(RaftError::Transport("buffer too small".into()));
+    ) -> impl std::future::Future<Output = Result<Option<usize>, RaftError>> + Send {
+        let inbound_rx = self.inbound_rx.clone();
+        async move {
+            if timeout.is_zero() {
+                if let Ok(frame) = inbound_rx.lock().unwrap().try_recv() {
+                    let len = frame.len();
+                    if out.len() < len {
+                        return Err(RaftError::Transport("buffer too small".into()));
+                    }
+                    out[..len].copy_from_slice(&frame);
+                    return Ok(Some(len));
                 }
-                out[..len].copy_from_slice(&frame);
-                return Ok(Some(len));
-            }
-            return Ok(None);
-        }
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Ok(frame) = self.inbound_rx.lock().unwrap().try_recv() {
-                let len = frame.len();
-                if out.len() < len {
-                    return Err(RaftError::Transport("buffer too small".into()));
-                }
-                out[..len].copy_from_slice(&frame);
-                return Ok(Some(len));
-            }
-            if Instant::now() >= deadline {
                 return Ok(None);
             }
-            tokio::task::yield_now().await;
+            let deadline = Instant::now() + timeout;
+            loop {
+                if let Ok(frame) = inbound_rx.lock().unwrap().try_recv() {
+                    let len = frame.len();
+                    if out.len() < len {
+                        return Err(RaftError::Transport("buffer too small".into()));
+                    }
+                    out[..len].copy_from_slice(&frame);
+                    return Ok(Some(len));
+                }
+                if Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                tokio::task::yield_now().await;
+            }
         }
     }
 }

@@ -133,20 +133,28 @@ impl RaftStorage for MemStorage {
 
 struct NoopTransport;
 
-#[async_trait]
 impl RaftTransport for NoopTransport {
-    async fn send_vectored(&self, _: PeerId, _: &[&[u8]]) -> Result<(), RaftError> {
-        Ok(())
+    fn send_vectored(
+        &self,
+        _: PeerId,
+        _: &[&[u8]],
+    ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
+        async move { Ok(()) }
     }
-    async fn recv_frame(&self, _: &mut [u8]) -> Result<usize, RaftError> {
-        futures::future::pending().await
+    fn recv_frame(
+        &self,
+        _: &mut [u8],
+    ) -> impl std::future::Future<Output = Result<usize, RaftError>> + Send {
+        async move {
+            futures::future::pending().await
+        }
     }
-    async fn recv_frame_timeout(
+    fn recv_frame_timeout(
         &self,
         _: Duration,
         _: &mut [u8],
-    ) -> Result<Option<usize>, RaftError> {
-        Ok(None)
+    ) -> impl std::future::Future<Output = Result<Option<usize>, RaftError>> + Send {
+        async move { Ok(None) }
     }
 }
 

@@ -230,7 +230,7 @@ where
     pub async fn propose_batch_once(
         &mut self,
         payloads: &[&[u8]],
-    ) -> Result<Vec<LogIndex>, RaftError> {
+    ) -> Result<&[LogIndex], RaftError> {
         self.node.propose_batch_once(payloads).await
     }
 

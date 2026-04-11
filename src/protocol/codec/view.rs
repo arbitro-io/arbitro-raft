@@ -1,6 +1,6 @@
-use crate::{LogIndex, PeerId, Term};
-use crate::protocol::message::AppendEntriesEntryIter;
 use super::wire::AppendEntries;
+use crate::protocol::message::AppendEntriesEntryIter;
+use crate::{LogIndex, PeerId, Term};
 
 /// A zero-copy view over a received AppendEntries message and its contiguous entry payload.
 #[derive(Debug, Clone, Copy)]
@@ -49,7 +49,7 @@ impl<'a> AppendEntriesView<'a> {
         self.payload
     }
 
-    pub fn wire(&self) -> &'a AppendEntries {
-        self.wire
+    pub fn wire(&self) -> &AppendEntries {
+        &self.wire
     }
 }
