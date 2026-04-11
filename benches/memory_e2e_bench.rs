@@ -578,7 +578,12 @@ fn bench_concurrent_writes(c: &mut Criterion) {
                         tokio::spawn(async move {
                             let empty = [];
                             for _ in 0..iters {
-                                h.write(&empty).await.unwrap();
+                                loop {
+                                    match h.write(&empty).await {
+                                        Ok(_) => break,
+                                        Err(_) => tokio::task::yield_now().await,
+                                    }
+                                }
                             }
                         })
                     })

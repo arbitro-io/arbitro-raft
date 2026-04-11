@@ -1,3 +1,7 @@
+---
+trigger: always_on
+---
+
 # Testing Rules
 
 All benchmarks and tests must be executed within the WSL environment to ensure hardware consistency and avoid Windows-specific file locking issues.
@@ -9,3 +13,5 @@ Use the following format for all testing commands:
 
 Example:
 `wsl bash -lc "cd /mnt/d/.../arbitro-raft && cargo bench --bench memory_e2e_bench -- --nocapture"`
+
+no rsycn

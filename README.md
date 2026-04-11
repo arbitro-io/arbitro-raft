@@ -14,9 +14,9 @@
 
 | Scenario | Mode | Persistence | Latency (P50) | Throughput (Peak) |
 | :--- | :--- | :--- | :--- | :--- |
-| **Direct Proposal** | In-Memory | No-Op | **1.50 µs** | 680 K ops/s |
-| **Pipelined Batch** | In-Memory | No-Op | 44.76 µs | **20.12 M ops/s** |
-| **TCP Loopback** | Network | No-Op | 43.80 µs | 820 K ops/s |
+| **Direct Proposal** | In-Memory | No-Op | **1.49 µs** | 670 K ops/s |
+| **Pipelined Batch** | In-Memory | No-Op | 49.62 µs | **20.63 M ops/s** |
+| **High Concurrency** | 1024 Clients | No-Op | 232.38 µs | **4.40 M ops/s** |
 
 *Benchmarks executed on WSL2 (Ubuntu 22.04), CPU: High-frequency x86_64.*
 

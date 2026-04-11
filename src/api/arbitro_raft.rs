@@ -259,7 +259,8 @@ where
 {
     pub fn new(node: RaftNode<S, T>) -> Self {
         let (client_tx, client_rx) = mpsc::unbounded();
-        let registry_cap = node.config.limits.append_batch_entries * 2;
+        // Massively increase slot capacity (64k slots = 4MB RAM) to absorb extreme bursts.
+        let registry_cap = 65536;
         let mut raft = Self {
             election_state: seed(node.node_id()),
             node,
@@ -268,7 +269,7 @@ where
             next_heartbeat_at: Instant::now(),
             client_tx,
             client_rx,
-            registry: SlotRegistry::new(registry_cap.max(4096)),
+            registry: SlotRegistry::new(registry_cap),
             pending_batch: Vec::with_capacity(4096),
             pending_slots: Vec::with_capacity(4096),
             commit_waiters: Vec::with_capacity(4096),
