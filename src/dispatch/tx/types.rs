@@ -1,5 +1,3 @@
-use bytes::Bytes;
-
 use crate::dispatch::DispatchOptions;
 use crate::{PeerId, RaftError};
 
@@ -24,10 +22,10 @@ impl From<DispatchFailure> for RaftError {
 #[derive(Debug, Clone)]
 pub enum DispatchPeerState<R> {
     Pending,
-    Progress(Bytes),
+    Progress(Vec<u8>),
     Accepted(R),
-    Rejected(Bytes),
-    Failed(Bytes),
+    Rejected(Vec<u8>),
+    Failed(Vec<u8>),
     Disconnected,
 }
 

@@ -1,7 +1,5 @@
 use std::future::poll_fn;
 
-use bytes::Bytes;
-
 use crate::{PeerId, RaftError};
 
 use super::state::{DispatchCompletion, DispatchShared};
@@ -88,8 +86,8 @@ impl<R: Clone> DispatchTx<R> {
         Ok(())
     }
 
-    pub fn accept_raw(&self, peer: PeerId, payload: Bytes) -> Result<(), RaftError> {
-        let value = (self.decode_response)(payload.as_ref())?;
+    pub fn accept_raw(&self, peer: PeerId, payload: Vec<u8>) -> Result<(), RaftError> {
+        let value = (self.decode_response)(&payload)?;
         self.accept(peer, value)
     }
 
@@ -97,11 +95,11 @@ impl<R: Clone> DispatchTx<R> {
         self.update_peer_state(peer, |_| Ok(DispatchPeerState::Accepted(value)))
     }
 
-    pub fn reject(&self, peer: PeerId, reason: Bytes) -> Result<(), RaftError> {
+    pub fn reject(&self, peer: PeerId, reason: Vec<u8>) -> Result<(), RaftError> {
         self.update_peer_state(peer, |_| Ok(DispatchPeerState::Rejected(reason)))
     }
 
-    pub fn progress(&self, peer: PeerId, payload: Bytes) -> Result<(), RaftError> {
+    pub fn progress(&self, peer: PeerId, payload: Vec<u8>) -> Result<(), RaftError> {
         self.update_peer_state(peer, |current| {
             if matches!(
                 current,
@@ -116,7 +114,7 @@ impl<R: Clone> DispatchTx<R> {
         })
     }
 
-    pub fn fail(&self, peer: PeerId, error: Bytes) -> Result<(), RaftError> {
+    pub fn fail(&self, peer: PeerId, error: Vec<u8>) -> Result<(), RaftError> {
         self.update_peer_state(peer, |_| Ok(DispatchPeerState::Failed(error)))
     }
 

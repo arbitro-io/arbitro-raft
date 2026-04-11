@@ -2,8 +2,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock, RwLock};
 
-use bytes::Bytes;
-
 use crate::dispatch::{
     DispatchContextView, DispatchRequester, DispatchResponder, DispatchRoute, DispatchScope,
     DispatchSpec, DispatchView,
@@ -11,11 +9,12 @@ use crate::dispatch::{
 use crate::RaftError;
 
 type DispatchFuture<'a> = Pin<Box<dyn Future<Output = Result<(), RaftError>> + Send + 'a>>;
-type ErasedHandler =
-    Arc<dyn for<'a> Fn(DispatchView, DispatchContextView<'a>) -> DispatchFuture<'a> + Send + Sync>;
+type ErasedHandler = Arc<
+    dyn for<'a> Fn(DispatchView<'a>, DispatchContextView<'a>) -> DispatchFuture<'a> + Send + Sync,
+>;
 
 struct DispatchRegistration {
-    scope:   DispatchScope,
+    scope: DispatchScope,
     handler: ErasedHandler,
 }
 
@@ -27,18 +26,20 @@ pub struct RaftCustomRegistry {
     handlers: RwLock<Vec<Option<DispatchRegistration>>>,
     /// Frozen read-only copy — populated by `seal()`.
     /// Once set, `invoke_bytes_for` reads from here without any lock.
-    sealed:   OnceLock<Box<[SealedSlot]>>,
+    sealed: OnceLock<Box<[SealedSlot]>>,
 }
 
 impl Default for RaftCustomRegistry {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RaftCustomRegistry {
     pub fn new() -> Self {
         Self {
             handlers: RwLock::new(std::iter::repeat_with(|| None).take(256).collect()),
-            sealed:   OnceLock::new(),
+            sealed: OnceLock::new(),
         }
     }
 
@@ -48,14 +49,10 @@ impl RaftCustomRegistry {
         let guard = self
             .handlers
             .read()
-            .map_err(|_| RaftError::Dispatch("dispatch registry read lock poisoned".into()))?;
+            .map_err(|_| RaftError::Dispatch("lock poisoned".into()))?;
         let frozen: Box<[SealedSlot]> = guard
             .iter()
-            .map(|entry| {
-                entry
-                    .as_ref()
-                    .map(|e| (e.scope, Arc::clone(&e.handler)))
-            })
+            .map(|entry| entry.as_ref().map(|e| (e.scope, Arc::clone(&e.handler))))
             .collect();
         // Ignore if already sealed — idempotent.
         let _ = self.sealed.set(frozen);
@@ -73,8 +70,8 @@ impl RaftCustomRegistry {
                 "cannot register handlers after seal()".into(),
             ));
         }
-        let command       = spec.command();
-        let scope         = spec.defaults().scope;
+        let command = spec.command();
+        let scope = spec.defaults().scope;
         let spec_for_handler = spec;
         let erased: ErasedHandler = Arc::new(move |dispatch, ctx| {
             let params = match dispatch.params(&spec_for_handler) {
@@ -92,14 +89,17 @@ impl RaftCustomRegistry {
         let mut guard = self
             .handlers
             .write()
-            .map_err(|_| RaftError::Dispatch("dispatch registry write lock poisoned".into()))?;
+            .map_err(|_| RaftError::Dispatch("lock poisoned".into()))?;
         if guard[command as usize].is_some() {
             return Err(RaftError::Dispatch(format!(
                 "dispatch command {} already registered",
                 command
             )));
         }
-        guard[command as usize] = Some(DispatchRegistration { scope, handler: erased });
+        guard[command as usize] = Some(DispatchRegistration {
+            scope,
+            handler: erased,
+        });
         Ok(())
     }
 
@@ -110,7 +110,7 @@ impl RaftCustomRegistry {
         let guard = self
             .handlers
             .read()
-            .map_err(|_| RaftError::Dispatch("dispatch registry read lock poisoned".into()))?;
+            .map_err(|_| RaftError::Dispatch("lock poisoned".into()))?;
         Ok(guard[command as usize].is_some())
     }
 
@@ -121,55 +121,58 @@ impl RaftCustomRegistry {
         let guard = self
             .handlers
             .read()
-            .map_err(|_| RaftError::Dispatch("dispatch registry read lock poisoned".into()))?;
+            .map_err(|_| RaftError::Dispatch("lock poisoned".into()))?;
         Ok(guard[command as usize].as_ref().map(|e| e.scope))
     }
 
-    pub async fn invoke_bytes(
+    pub async fn invoke_bytes<'a>(
         &self,
-        frame:     Bytes,
+        frame: &'a [u8],
         responder: &dyn DispatchResponder,
-    ) -> Result<DispatchView, RaftError> {
+    ) -> Result<DispatchView<'a>, RaftError> {
         self.invoke_bytes_for(frame, responder, None, None).await
     }
 
-    pub async fn invoke_bytes_with(
+    pub async fn invoke_bytes_with<'a>(
         &self,
-        frame:     Bytes,
+        frame: &'a [u8],
         responder: &dyn DispatchResponder,
         requester: Option<&dyn DispatchRequester>,
-    ) -> Result<DispatchView, RaftError> {
-        self.invoke_bytes_for(frame, responder, requester, None).await
+    ) -> Result<DispatchView<'a>, RaftError> {
+        self.invoke_bytes_for(frame, responder, requester, None)
+            .await
     }
 
-    pub async fn invoke_bytes_scoped(
+    pub async fn invoke_bytes_scoped<'a>(
         &self,
-        frame:     Bytes,
+        frame: &'a [u8],
         responder: &dyn DispatchResponder,
-        route:     DispatchRoute,
-    ) -> Result<DispatchView, RaftError> {
-        self.invoke_bytes_for(frame, responder, None, Some(route)).await
+        route: DispatchRoute,
+    ) -> Result<DispatchView<'a>, RaftError> {
+        self.invoke_bytes_for(frame, responder, None, Some(route))
+            .await
     }
 
-    pub async fn invoke_bytes_with_scoped(
+    pub async fn invoke_bytes_with_scoped<'a>(
         &self,
-        frame:     Bytes,
-        responder: &dyn DispatchResponder,
-        requester: Option<&dyn DispatchRequester>,
-        route:     DispatchRoute,
-    ) -> Result<DispatchView, RaftError> {
-        self.invoke_bytes_for(frame, responder, requester, Some(route)).await
-    }
-
-    async fn invoke_bytes_for(
-        &self,
-        frame:     Bytes,
+        frame: &'a [u8],
         responder: &dyn DispatchResponder,
         requester: Option<&dyn DispatchRequester>,
-        route:     Option<DispatchRoute>,
-    ) -> Result<DispatchView, RaftError> {
+        route: DispatchRoute,
+    ) -> Result<DispatchView<'a>, RaftError> {
+        self.invoke_bytes_for(frame, responder, requester, Some(route))
+            .await
+    }
+
+    async fn invoke_bytes_for<'a>(
+        &self,
+        frame: &'a [u8],
+        responder: &dyn DispatchResponder,
+        requester: Option<&dyn DispatchRequester>,
+        route: Option<DispatchRoute>,
+    ) -> Result<DispatchView<'a>, RaftError> {
         let dispatch = DispatchView::parse(frame)?;
-        let cmd      = dispatch.command() as usize;
+        let cmd = dispatch.command() as usize;
 
         // Fast path: locked snapshot avoids the RwLock after seal().
         let handler: ErasedHandler = if let Some(sealed) = self.sealed.get() {
@@ -193,7 +196,7 @@ impl RaftCustomRegistry {
             let guard = self
                 .handlers
                 .read()
-                .map_err(|_| RaftError::Dispatch("dispatch registry read lock poisoned".into()))?;
+                .map_err(|_| RaftError::Dispatch("lock poisoned".into()))?;
             let entry = guard[cmd].as_ref().ok_or_else(|| {
                 RaftError::Dispatch(format!(
                     "no dispatch handler registered for command {}",
@@ -221,7 +224,7 @@ impl RaftCustomRegistry {
             ),
             None => DispatchContextView::new(dispatch.tx_id(), dispatch.command(), responder),
         };
-        handler(dispatch.clone(), ctx).await?;
+        handler(dispatch, ctx).await?;
         Ok(dispatch)
     }
 }

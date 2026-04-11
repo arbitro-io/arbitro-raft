@@ -1,12 +1,11 @@
-use bytes::{Bytes, BytesMut};
 use zerocopy::byteorder::little_endian::{U32, U64};
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Ref};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Ref, Unaligned};
 
 use crate::dispatch::view::{RAFT_DISPATCH_RESPONSE_MAGIC, RAFT_DISPATCH_RESPONSE_VERSION};
 use crate::dispatch::{DispatchResponse, DispatchResponseKind, DispatchSpec};
 use crate::RaftError;
 
-#[derive(IntoBytes, FromBytes, KnownLayout, Immutable, Clone, Copy, Debug)]
+#[derive(IntoBytes, FromBytes, KnownLayout, Immutable, Unaligned, Clone, Copy, Debug)]
 #[repr(C)]
 pub(crate) struct DispatchResponseFrameHeader {
     pub magic: U32,
@@ -21,14 +20,14 @@ pub(crate) struct DispatchResponseFrameHeader {
 pub const RAFT_DISPATCH_RESPONSE_FRAME_HEADER_SIZE: usize =
     std::mem::size_of::<DispatchResponseFrameHeader>();
 
-#[derive(Debug, Clone)]
-pub struct DispatchResponseView {
-    frame: Bytes,
+#[derive(Debug, Clone, Copy)]
+pub struct DispatchResponseView<'a> {
+    frame: &'a [u8],
 }
 
-impl DispatchResponseView {
-    pub fn parse(frame: Bytes) -> Result<Self, RaftError> {
-        let (header, rest) = Ref::<_, DispatchResponseFrameHeader>::from_prefix(frame.as_ref())
+impl<'a> DispatchResponseView<'a> {
+    pub fn parse(frame: &'a [u8]) -> Result<Self, RaftError> {
+        let (header, rest) = Ref::<_, DispatchResponseFrameHeader>::from_prefix(frame)
             .map_err(|_| RaftError::Dispatch("short dispatch response header".into()))?;
         let header = Ref::into_ref(header);
         if header.magic.get() != RAFT_DISPATCH_RESPONSE_MAGIC {
@@ -42,7 +41,7 @@ impl DispatchResponseView {
                 header.version
             )));
         }
-        if rest.len() != header.body_len.get() as usize {
+        if rest.len() < header.body_len.get() as usize {
             return Err(RaftError::Dispatch(
                 "dispatch response body length mismatch".into(),
             ));
@@ -54,14 +53,14 @@ impl DispatchResponseView {
     }
 
     fn header(&self) -> &DispatchResponseFrameHeader {
-        let (header, _) = Ref::<_, DispatchResponseFrameHeader>::from_prefix(self.frame.as_ref())
+        let (header, _) = Ref::<_, DispatchResponseFrameHeader>::from_prefix(self.frame)
             .expect("dispatch response view always stores a validated header");
         Ref::into_ref(header)
     }
 
     #[inline]
-    pub fn frame_bytes(&self) -> &Bytes {
-        &self.frame
+    pub fn frame_bytes(&self) -> &'a [u8] {
+        self.frame
     }
 
     #[inline]
@@ -86,13 +85,13 @@ impl DispatchResponseView {
     }
 
     #[inline]
-    pub fn body(&self) -> &[u8] {
+    pub fn body(&self) -> &'a [u8] {
         &self.frame[RAFT_DISPATCH_RESPONSE_FRAME_HEADER_SIZE..]
     }
 
     #[inline]
-    pub fn body_bytes(&self) -> Bytes {
-        self.frame.slice(RAFT_DISPATCH_RESPONSE_FRAME_HEADER_SIZE..)
+    pub fn body_bytes(&self) -> &'a [u8] {
+        &self.frame[RAFT_DISPATCH_RESPONSE_FRAME_HEADER_SIZE..]
     }
 
     pub fn decode_with<P, R>(&self, spec: &DispatchSpec<P, R>) -> Result<R, RaftError> {
@@ -107,7 +106,7 @@ impl DispatchResponseView {
     }
 }
 
-pub fn encode_dispatch_response(response: &DispatchResponse) -> Bytes {
+pub fn encode_dispatch_response(response: &DispatchResponse) -> Vec<u8> {
     let header = DispatchResponseFrameHeader {
         magic: U32::new(RAFT_DISPATCH_RESPONSE_MAGIC),
         version: RAFT_DISPATCH_RESPONSE_VERSION,
@@ -123,10 +122,10 @@ pub fn encode_dispatch_response(response: &DispatchResponse) -> Bytes {
         body_len: U32::new(response.payload.len() as u32),
     };
 
-    let mut out = BytesMut::with_capacity(
+    let mut out = Vec::with_capacity(
         std::mem::size_of::<DispatchResponseFrameHeader>() + response.payload.len(),
     );
     out.extend_from_slice(header.as_bytes());
-    out.extend_from_slice(response.payload.as_ref());
-    out.freeze()
+    out.extend_from_slice(&response.payload);
+    out
 }

@@ -1,17 +1,15 @@
 use std::marker::PhantomData;
 use std::time::Duration;
 
-use bytes::Bytes;
-
 use crate::dispatch::DispatchBuilder;
 use crate::RaftError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchScope {
-    All      = 0,
-    Others   = 1,
+    All = 0,
+    Others = 1,
     Followers = 2,
-    Leader   = 3,
+    Leader = 3,
     LocalOnly = 4,
 }
 
@@ -23,27 +21,33 @@ pub enum DispatchNodeRole {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DispatchRoute {
-    pub role:      DispatchNodeRole,
+    pub role: DispatchNodeRole,
     pub is_origin: bool,
 }
 
 impl DispatchRoute {
     pub const fn leader(is_origin: bool) -> Self {
-        Self { role: DispatchNodeRole::Leader, is_origin }
+        Self {
+            role: DispatchNodeRole::Leader,
+            is_origin,
+        }
     }
 
     pub const fn follower(is_origin: bool) -> Self {
-        Self { role: DispatchNodeRole::Follower, is_origin }
+        Self {
+            role: DispatchNodeRole::Follower,
+            is_origin,
+        }
     }
 }
 
 impl DispatchScope {
     pub const fn allows(self, route: DispatchRoute) -> bool {
         match self {
-            DispatchScope::All      => true,
-            DispatchScope::Others   => !route.is_origin,
+            DispatchScope::All => true,
+            DispatchScope::Others => !route.is_origin,
             DispatchScope::Followers => matches!(route.role, DispatchNodeRole::Follower),
-            DispatchScope::Leader   => matches!(route.role, DispatchNodeRole::Leader),
+            DispatchScope::Leader => matches!(route.role, DispatchNodeRole::Leader),
             DispatchScope::LocalOnly => route.is_origin,
         }
     }
@@ -51,28 +55,28 @@ impl DispatchScope {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchAckPolicy {
-    All        = 0,
-    Quorum     = 1,
-    AtLeast    = 2,
-    Percent    = 3,
+    All = 0,
+    Quorum = 1,
+    AtLeast = 2,
+    Percent = 3,
     BestEffort = 4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchFailPolicy {
-    AllowFailures      = 0,
-    NoFailures         = 1,
-    MaxFailures        = 2,
-    MaxFailurePercent  = 3,
-    FailFast           = 4,
+    AllowFailures = 0,
+    NoFailures = 1,
+    MaxFailures = 2,
+    MaxFailurePercent = 3,
+    FailFast = 4,
 }
 
 /// Acknowledgement policy with its associated thresholds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DispatchAckOptions {
-    pub policy:  DispatchAckPolicy,
+    pub policy: DispatchAckPolicy,
     /// Minimum number of accepts required (used by `AtLeast`).
-    pub count:   u16,
+    pub count: u16,
     /// Minimum percentage of accepts required (used by `Percent`).
     pub percent: u8,
 }
@@ -80,27 +84,27 @@ pub struct DispatchAckOptions {
 /// Failure policy with its associated thresholds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DispatchFailOptions {
-    pub policy:  DispatchFailPolicy,
+    pub policy: DispatchFailPolicy,
     /// Maximum number of failures allowed (used by `MaxFailures`).
-    pub count:   u16,
+    pub count: u16,
     /// Maximum percentage of failures allowed (used by `MaxFailurePercent`).
     pub percent: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DispatchOptions {
-    pub scope:   DispatchScope,
-    pub ack:     DispatchAckOptions,
-    pub fail:    DispatchFailOptions,
+    pub scope: DispatchScope,
+    pub ack: DispatchAckOptions,
+    pub fail: DispatchFailOptions,
     pub timeout: Duration,
-    pub trace:   bool,
+    pub trace: bool,
 }
 
 impl Default for DispatchAckOptions {
     fn default() -> Self {
         Self {
-            policy:  DispatchAckPolicy::Quorum,
-            count:   1,
+            policy: DispatchAckPolicy::Quorum,
+            count: 1,
             percent: 100,
         }
     }
@@ -109,8 +113,8 @@ impl Default for DispatchAckOptions {
 impl Default for DispatchFailOptions {
     fn default() -> Self {
         Self {
-            policy:  DispatchFailPolicy::AllowFailures,
-            count:   0,
+            policy: DispatchFailPolicy::AllowFailures,
+            count: 0,
             percent: 0,
         }
     }
@@ -119,37 +123,39 @@ impl Default for DispatchFailOptions {
 impl Default for DispatchOptions {
     fn default() -> Self {
         Self {
-            scope:   DispatchScope::All,
-            ack:     DispatchAckOptions::default(),
-            fail:    DispatchFailOptions::default(),
+            scope: DispatchScope::All,
+            ack: DispatchAckOptions::default(),
+            fail: DispatchFailOptions::default(),
             timeout: Duration::from_secs(2),
-            trace:   false,
+            trace: false,
         }
     }
 }
 
 pub struct DispatchSpec<P, R> {
-    command:         u8,
-    defaults:        DispatchOptions,
-    encode_params:   fn(&P) -> Result<Bytes, RaftError>,
-    decode_params:   fn(&[u8]) -> Result<P, RaftError>,
-    encode_response: fn(&R) -> Result<Bytes, RaftError>,
+    command: u8,
+    defaults: DispatchOptions,
+    encode_params: fn(&P) -> Result<Vec<u8>, RaftError>,
+    decode_params: fn(&[u8]) -> Result<P, RaftError>,
+    encode_response: fn(&R) -> Result<Vec<u8>, RaftError>,
     decode_response: fn(&[u8]) -> Result<R, RaftError>,
-    _marker:         PhantomData<fn(P) -> R>,
+    _marker: PhantomData<fn(P) -> R>,
 }
 
 impl<P, R> Clone for DispatchSpec<P, R> {
-    fn clone(&self) -> Self { *self }
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 impl<P, R> Copy for DispatchSpec<P, R> {}
 
 impl<P, R> DispatchSpec<P, R> {
     pub fn new(
-        command:         u8,
-        encode_params:   fn(&P) -> Result<Bytes, RaftError>,
-        decode_params:   fn(&[u8]) -> Result<P, RaftError>,
-        encode_response: fn(&R) -> Result<Bytes, RaftError>,
+        command: u8,
+        encode_params: fn(&P) -> Result<Vec<u8>, RaftError>,
+        decode_params: fn(&[u8]) -> Result<P, RaftError>,
+        encode_response: fn(&R) -> Result<Vec<u8>, RaftError>,
         decode_response: fn(&[u8]) -> Result<R, RaftError>,
     ) -> Self {
         Self {
@@ -163,9 +169,13 @@ impl<P, R> DispatchSpec<P, R> {
         }
     }
 
-    pub fn command(&self) -> u8 { self.command }
+    pub fn command(&self) -> u8 {
+        self.command
+    }
 
-    pub fn defaults(&self) -> DispatchOptions { self.defaults }
+    pub fn defaults(&self) -> DispatchOptions {
+        self.defaults
+    }
 
     pub fn with_scope(mut self, scope: DispatchScope) -> Self {
         self.defaults.scope = scope;
@@ -212,7 +222,7 @@ impl<P, R> DispatchSpec<P, R> {
         self
     }
 
-    pub fn encode_params(&self, params: &P) -> Result<Bytes, RaftError> {
+    pub fn encode_params(&self, params: &P) -> Result<Vec<u8>, RaftError> {
         (self.encode_params)(params)
     }
 
@@ -220,7 +230,7 @@ impl<P, R> DispatchSpec<P, R> {
         (self.decode_params)(bytes)
     }
 
-    pub fn encode_response(&self, value: &R) -> Result<Bytes, RaftError> {
+    pub fn encode_response(&self, value: &R) -> Result<Vec<u8>, RaftError> {
         (self.encode_response)(value)
     }
 

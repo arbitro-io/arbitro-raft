@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 
 use crate::{PeerId, RaftError};
 
@@ -22,21 +21,24 @@ use crate::{PeerId, RaftError};
 /// dispatches to the appropriate handler.
 #[async_trait]
 pub trait RaftTransport: Send + Sync {
-    /// Send a pre-encoded Raft frame to a peer.
+    /// Send a Raft message split into multiple slices (Vectored I/O).
     ///
-    /// Best-effort: a transport error does not imply the peer is permanently
-    /// unreachable. The node decides whether to retry based on Raft timeout logic.
-    async fn send_frame(&self, peer: PeerId, frame: Bytes) -> Result<(), RaftError>;
+    /// This eliminates copies of large payloads by allowing the transport
+    /// to pass multiple buffers (e.g. headers in one, payload in another) 
+    /// directly to the OS.
+    async fn send_vectored(&self, peer: PeerId, slices: &[&[u8]]) -> Result<(), RaftError>;
 
-    /// Receive the next incoming raw frame from any peer.
+
+    /// Receive the next incoming raw frame from any peer into the provided buffer.
     ///
-    /// Returns raw bytes exactly as received. The caller decodes with
-    /// `decode_message_view`. Blocks until a frame arrives.
-    async fn recv_frame(&self) -> Result<Bytes, RaftError>;
+    /// The transport writes exactly the frame bytes into `out` and returns the length.
+    /// Blocks until a frame arrives.
+    async fn recv_frame(&self, out: &mut [u8]) -> Result<usize, RaftError>;
 
-    /// Receive the next incoming raw frame, returning `None` if `timeout` elapses.
+    /// Receive the next incoming raw frame into the provided buffer, returning `None` if `timeout` elapses.
     async fn recv_frame_timeout(
         &self,
         timeout: Duration,
-    ) -> Result<Option<Bytes>, RaftError>;
+        out: &mut [u8],
+    ) -> Result<Option<usize>, RaftError>;
 }

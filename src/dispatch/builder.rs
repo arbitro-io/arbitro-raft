@@ -1,7 +1,6 @@
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bytes::{Bytes, BytesMut};
 use zerocopy::byteorder::little_endian::{U32, U64};
 use zerocopy::IntoBytes;
 
@@ -15,40 +14,56 @@ use crate::dispatch::{DispatchHandle, DispatchSpec, DispatchTx};
 use crate::{PeerId, RaftError};
 
 pub struct DispatchBuilder<'a, P, R> {
-    spec:    &'a DispatchSpec<P, R>,
-    params:  P,
+    spec: &'a DispatchSpec<P, R>,
+    params: P,
     options: DispatchOptions,
 }
 
 pub struct DispatchEnvelope<P, R> {
-    tx_id:   u64,
+    tx_id: u64,
     command: u8,
-    bytes:   Bytes,
+    bytes: Vec<u8>,
     options: DispatchOptions,
     _marker: PhantomData<fn(P) -> R>,
 }
 
 impl<P, R> DispatchEnvelope<P, R> {
-    pub fn tx_id(&self) -> u64 { self.tx_id }
+    pub fn tx_id(&self) -> u64 {
+        self.tx_id
+    }
 
-    pub(crate) fn options_internal(&self) -> DispatchOptions { self.options }
+    pub(crate) fn options_internal(&self) -> DispatchOptions {
+        self.options
+    }
 
-    pub fn bytes(&self) -> &Bytes { &self.bytes }
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 
-    pub fn command(&self) -> u8 { self.command }
+    pub fn command(&self) -> u8 {
+        self.command
+    }
 
-    pub fn into_bytes(self) -> Bytes { self.bytes }
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
 
-    pub fn options(&self) -> DispatchOptions { self.options }
+    pub fn options(&self) -> DispatchOptions {
+        self.options
+    }
 
-    pub fn view(&self) -> Result<DispatchView, RaftError> {
-        DispatchView::parse(self.bytes.clone())
+    pub fn view(&self) -> Result<DispatchView<'_>, RaftError> {
+        DispatchView::parse(&self.bytes)
     }
 }
 
 impl<'a, P, R> DispatchBuilder<'a, P, R> {
     pub fn new(spec: &'a DispatchSpec<P, R>, params: P) -> Self {
-        Self { spec, params, options: spec.defaults() }
+        Self {
+            spec,
+            params,
+            options: spec.defaults(),
+        }
     }
 
     pub fn scope(mut self, scope: DispatchScope) -> Self {
@@ -99,31 +114,30 @@ impl<'a, P, R> DispatchBuilder<'a, P, R> {
     pub fn build(self) -> Result<DispatchEnvelope<P, R>, RaftError> {
         static NEXT_TX_ID: AtomicU64 = AtomicU64::new(1);
 
-        let body   = self.spec.encode_params(&self.params)?;
-        let tx_id  = NEXT_TX_ID.fetch_add(1, Ordering::Relaxed);
+        let body = self.spec.encode_params(&self.params)?;
+        let tx_id = NEXT_TX_ID.fetch_add(1, Ordering::Relaxed);
         let header = DispatchFrameHeader {
-            magic:      U32::new(RAFT_DISPATCH_MAGIC),
-            version:    RAFT_DISPATCH_VERSION,
-            command:    self.spec.command(),
-            scope:      self.options.scope as u8,
+            magic: U32::new(RAFT_DISPATCH_MAGIC),
+            version: RAFT_DISPATCH_VERSION,
+            command: self.spec.command(),
+            scope: self.options.scope as u8,
             ack_policy: self.options.ack.policy as u8,
             fail_policy: self.options.fail.policy as u8,
-            trace:      self.options.trace as u8,
-            _pad:       [0; 2],
-            tx_id:      U64::new(tx_id),
+            trace: self.options.trace as u8,
+            _pad: [0; 2],
+            tx_id: U64::new(tx_id),
             timeout_ms: U32::new(self.options.timeout.as_millis().min(u32::MAX as u128) as u32),
-            body_len:   U32::new(body.len() as u32),
+            body_len: U32::new(body.len() as u32),
         };
 
-        let mut out =
-            BytesMut::with_capacity(std::mem::size_of::<DispatchFrameHeader>() + body.len());
+        let mut out = Vec::with_capacity(std::mem::size_of::<DispatchFrameHeader>() + body.len());
         out.extend_from_slice(header.as_bytes());
-        out.extend_from_slice(body.as_ref());
+        out.extend_from_slice(&body);
 
         Ok(DispatchEnvelope {
             tx_id,
             command: self.spec.command(),
-            bytes:   out.freeze(),
+            bytes: out,
             options: self.options,
             _marker: PhantomData,
         })

@@ -1,11 +1,8 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-
-use bytes::Bytes;
-
 use crate::{
-    HardState, InboundRaftMessageView, LogEntry, LogIndex, NodeConfig, PeerId, RaftCustomRegistry,
+    HardState, InboundRaftMessage, LogEntry, LogIndex, NodeConfig, PeerId, RaftCustomRegistry,
     RaftError, RaftMessage, Role, SoftState, Term, TimingConfig,
 };
 
@@ -18,6 +15,10 @@ mod snapshot;
 pub(crate) use dispatch::PendingCustomDispatch;
 pub(crate) use progress::{AppendAttemptState, PeerMap, PeerProgress, PendingSnapshot};
 
+/// RaftNode implements the core Raft state machine logic.
+/// To allow the node to be long-lived (not bound by ephemeral lifetimes),
+/// the preallocated scratchpads use 'static internally but are safely
+/// cleared before and after every transient use.
 pub struct RaftNode<S, T> {
     pub(crate) config: NodeConfig,
     pub(crate) storage: S,
@@ -31,17 +32,27 @@ pub struct RaftNode<S, T> {
 
     // Scratchpads — pre-allocated buffers reused across calls on the hot path.
     // Always call .clear() before use; never assume they are empty.
-    pub(crate) scratch_entries: Vec<LogEntry>,
+
+    // Safety: we use 'static here only for the preallocated storage.
+    // Elements are cleared after every call.
+    pub(crate) scratch_entries: Vec<LogEntry<'static>>,
     pub(crate) scratch_indexes: Vec<LogIndex>,
     pub(crate) scratch_peers: Vec<PeerId>,
     pub(crate) scratch_pending: PeerMap<AppendAttemptState>,
     #[allow(dead_code)] // reserved for per-peer attempt timing instrumentation
     pub(crate) scratch_started: HashMap<PeerId, std::time::Instant>,
+    pub(crate) scratch_outbound: Vec<u8>,
+    pub(crate) scratch_payload: Vec<u8>,
+    pub(crate) scratch_vectored: Vec<(*const u8, usize)>,
 
     /// Cached last-log position — kept in sync with every append/truncate so
     /// `try_advance_commit_index` and leader-progress init avoid a storage read.
     pub(crate) cached_last_log: (LogIndex, Term),
 }
+
+// SAFETY: All raw pointers in scratch_vectored are ephemeral and cleared after use.
+unsafe impl<S, T> Send for RaftNode<S, T> where S: Send, T: Send {}
+unsafe impl<S, T> Sync for RaftNode<S, T> where S: Sync, T: Sync {}
 
 impl<S, T> RaftNode<S, T>
 where
@@ -74,6 +85,9 @@ where
             scratch_peers: Vec::new(),
             scratch_pending: PeerMap::new(),
             scratch_started: HashMap::new(),
+            scratch_outbound: vec![0; 64 * 1024], // 64KB initial buffer, will grow if needed
+            scratch_payload: vec![0; 16 * 1024 * 1024], // 16MB pre-allocated scratch for storage reads
+            scratch_vectored: Vec::with_capacity(1024),
             cached_last_log,
         })
     }
@@ -130,11 +144,6 @@ where
     }
 
     /// Forces this node to become leader for the given term bypassing election.
-    ///
-    /// # Stability
-    ///
-    /// **Benchmark and test helper only.** This bypasses the Raft election protocol.
-    /// MUST NOT be called in production code. May be removed in any minor release.
     #[doc(hidden)]
     pub fn become_leader_for_benchmark(&mut self, term: Term) {
         self.soft_state.is_leader = true;
@@ -145,52 +154,60 @@ where
     }
 
     /// Receive one raw frame from the transport, decode it, and dispatch to the
-    /// appropriate handler.
-    pub async fn handle_once(&mut self) -> Result<(), RaftError> {
-        let raw = self.transport.recv_frame().await?;
-        let inbound = crate::decode_message_view(raw)?;
+    /// appropriate handler. `inbound_buf` is provided by the outer loop to avoid allocs.
+    pub async fn handle_once(&mut self, inbound_buf: &mut [u8]) -> Result<(), RaftError> {
+        let n = self.transport.recv_frame(inbound_buf).await?;
+        let inbound = crate::decode_message(&inbound_buf[..n])?;
         self.handle_inbound(inbound).await
     }
 
     /// O(1) dispatch — switch compiles to a jump table in optimized builds.
     pub async fn handle_inbound(
         &mut self,
-        inbound: InboundRaftMessageView,
+        inbound: InboundRaftMessage<'_>,
     ) -> Result<(), RaftError> {
+        let from = inbound.from;
         match inbound.message {
-            crate::RaftMessageView::RequestVote(msg) => self.handle_request_vote(msg).await,
-            crate::RaftMessageView::RequestVoteResp(msg) => {
-                self.handle_request_vote_response(msg).await
+            RaftMessage::RequestVote(msg) => self.handle_request_vote(from, msg).await,
+            RaftMessage::RequestVoteResp(msg) => self.handle_request_vote_response(from, msg).await,
+            RaftMessage::AppendEntries(msg, payload) => {
+                self.handle_append_entries(from, msg, payload).await
             }
-            crate::RaftMessageView::AppendEntries(msg) => self.handle_append_entries(msg).await,
-            crate::RaftMessageView::AppendEntriesResp(msg) => {
-                self.handle_append_entries_response(msg).await
+            RaftMessage::AppendEntriesResp(msg) => {
+                self.handle_append_entries_response(from, msg).await
             }
-            crate::RaftMessageView::InstallSnapshot(msg) => self.handle_install_snapshot(msg).await,
-            crate::RaftMessageView::InstallSnapshotResp(msg) => {
-                self.handle_install_snapshot_response(msg).await
+            RaftMessage::InstallSnapshot(msg, payload) => {
+                self.handle_install_snapshot(from, msg, payload).await
             }
-            crate::RaftMessageView::Custom(msg) => self.handle_custom_message(msg).await,
-            crate::RaftMessageView::CustomResponse(msg) => self.handle_custom_response(msg).await,
+            RaftMessage::InstallSnapshotResp(msg) => {
+                self.handle_install_snapshot_response(from, msg).await
+            }
+            RaftMessage::Custom(payload) => self.handle_custom_message(from, payload).await,
+            RaftMessage::CustomResponse(payload) => {
+                self.handle_custom_response(from, payload).await
+            }
+            RaftMessage::AppendEntriesVectored(_, _) => {
+                // Inbound vectored messages are not expected in v0.1.
+                // Protocol only uses vectored for OUTBOUND.
+                Err(RaftError::Protocol("unexpected vectored inbound".into()))
+            }
         }
     }
 
     pub(crate) fn step_down(&mut self, new_term: Term) -> Result<(), RaftError> {
         self.hard_state.current_term = new_term;
         self.hard_state.voted_for = None;
-        // Persist before any outbound send (guide §Orden de persistencia)
+        // Persist before any outbound send
         self.storage.save_hard_state(&self.hard_state)?;
         self.soft_state.role = Role::Follower;
         self.soft_state.is_leader = false;
         self.soft_state.leader_id = None;
-        // commit_index is monotone — do not reset on step_down
         self.peer_progress.clear();
         self.pending_snapshots.clear();
         Ok(())
     }
 
     /// Truncate the log and refresh the last-log cache.
-    /// Always use this instead of calling `storage.truncate_suffix()` directly.
     #[inline]
     pub(crate) fn storage_truncate(&mut self, from: LogIndex) -> Result<(), RaftError> {
         self.storage.truncate_suffix(from)?;
@@ -198,27 +215,36 @@ where
         Ok(())
     }
 
-    /// Encode a `RaftMessage` into a pre-allocated `Bytes` frame ready for the transport.
-    #[inline]
-    pub(crate) fn encode_msg(&self, msg: &RaftMessage) -> Result<Bytes, RaftError> {
-        crate::encode_message(self.config.node_id, msg)
-    }
+    /// Encodes and sends a message using Vectored I/O to avoid payload copies.
+    pub(crate) async fn send_message(&mut self, peer: PeerId, msg: &RaftMessage<'_>) -> bool {
+        self.scratch_vectored.clear();
 
-    /// Encode a message and send best-effort (log on failure, never panic).
-    pub(crate) async fn encode_and_send_best_effort(
-        &self,
-        peer: PeerId,
-        msg: &RaftMessage,
-    ) -> bool {
-        match self.encode_msg(msg) {
-            Ok(frame) => self.send_best_effort(peer, frame).await,
-            Err(_) => false,
+        // SAFETY: We temporarily treat our raw pointer vector as a Vec<&[u8]>.
+        let vectored_ref = unsafe {
+            std::mem::transmute::<&mut Vec<(*const u8, usize)>, &mut Vec<&[u8]>>(
+                &mut self.scratch_vectored,
+            )
+        };
+
+        if crate::protocol::encode_message_vectored(
+            self.config.node_id,
+            msg,
+            &mut self.scratch_outbound,
+            vectored_ref,
+        )
+        .is_err()
+        {
+            return false;
         }
-    }
 
-    /// Send a pre-encoded frame best-effort (log on failure, never panic).
-    pub(crate) async fn send_best_effort(&self, peer: PeerId, frame: Bytes) -> bool {
-        self.transport.send_frame(peer, frame).await.is_ok()
+        let ok = self
+            .transport
+            .send_vectored(peer, vectored_ref)
+            .await
+            .is_ok();
+
+        self.scratch_vectored.clear();
+        ok
     }
 }
 
@@ -231,10 +257,6 @@ pub(crate) fn trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("ARBITRO_RAFT_TRACE").is_some())
 }
 
-/// Emit a trace-level log entry. Guarded by ARBITRO_RAFT_TRACE env var.
-///
-/// Uses tracing::trace! — never eprintln! — so this is a no-op at runtime
-/// unless the tracing subscriber has TRACE enabled.
 pub(crate) fn trace_log(node_id: PeerId, msg: impl AsRef<str>) {
     if trace_enabled() {
         tracing::trace!(node = node_id.0, "{}", msg.as_ref());

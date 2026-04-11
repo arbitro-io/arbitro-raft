@@ -1,21 +1,52 @@
-use bytes::Bytes;
 use zerocopy::{FromBytes, Immutable, KnownLayout, Ref};
 
-use crate::{RaftError};
+use crate::{InboundRaftMessage, PeerId, RaftError, RaftMessage};
 
 use super::wire::{
-    parse_prefix, AppendEntriesBody, AppendEntriesRespBody, EntryHeaderView, InstallSnapshotBody,
-    InstallSnapshotRespBody, RaftFrameView, RequestVoteBody, RequestVoteRespBody,
-    KIND_APPEND_ENTRIES, KIND_APPEND_ENTRIES_RESP, KIND_CUSTOM, KIND_CUSTOM_RESPONSE,
-    KIND_INSTALL_SNAPSHOT, KIND_INSTALL_SNAPSHOT_RESP, KIND_REQUEST_VOTE, KIND_REQUEST_VOTE_RESP,
-    RAFT_MAGIC, RAFT_VERSION,
+    AppendEntries, AppendEntriesResp, EntryHeader, InstallSnapshot, InstallSnapshotResp,
+    RaftFrameHeader, RequestVote, RequestVoteResp, KIND_APPEND_ENTRIES, KIND_APPEND_ENTRIES_RESP,
+    KIND_CUSTOM, KIND_CUSTOM_RESPONSE, KIND_INSTALL_SNAPSHOT, KIND_INSTALL_SNAPSHOT_RESP,
+    KIND_REQUEST_VOTE, KIND_REQUEST_VOTE_RESP, RAFT_MAGIC, RAFT_VERSION,
 };
 
-// ── Frame parse ───────────────────────────────────────────────────────────────
+// ── Shared parse helper ───────────────────────────────────────────────────────
 
-pub fn parse_raft_frame_view(frame: Bytes) -> Result<RaftFrameView, RaftError> {
-    let (header, rest) = super::wire::RaftFrameHeader::ref_from_prefix(&frame)
-        .ok_or_else(|| RaftError::Protocol("short raft frame header".into()))?;
+#[inline]
+pub(crate) fn parse_prefix<'a, T>(buf: &'a [u8], name: &str) -> Result<(&'a T, &'a [u8]), RaftError>
+where
+    T: FromBytes + KnownLayout + Immutable,
+{
+    Ref::<&'a [u8], T>::from_prefix(buf)
+        .ok()
+        .map(|(r, rest)| (Ref::into_ref(r), rest))
+        .ok_or_else(|| RaftError::Protocol(format!("short {}", name)))
+}
+
+// ── AppendEntries body validation ─────────────────────────────────────────────
+
+pub(crate) fn validate_append_entries_body(
+    entry_count: u32,
+    mut body: &[u8],
+) -> Result<(), RaftError> {
+    for _ in 0..entry_count {
+        let (header, rest) = parse_prefix::<EntryHeader>(body, "append entry header")?;
+        let len = header.payload_len.get() as usize;
+        if rest.len() < len {
+            return Err(RaftError::Protocol("short append entry payload".into()));
+        }
+        body = &rest[len..];
+    }
+    if !body.is_empty() {
+        return Err(RaftError::Protocol("append entries trailing bytes".into()));
+    }
+    Ok(())
+}
+
+// ── Top-level decode ──────────────────────────────────────────────────────────
+
+pub fn decode_message<'a>(frame: &'a [u8]) -> Result<InboundRaftMessage<'a>, RaftError> {
+    let (header, rest) = parse_prefix::<RaftFrameHeader>(frame, "raft frame header")?;
+
     if header.magic.get() != RAFT_MAGIC {
         return Err(RaftError::Protocol("invalid raft frame magic".into()));
     }
@@ -33,138 +64,72 @@ pub fn parse_raft_frame_view(frame: Bytes) -> Result<RaftFrameView, RaftError> {
             rest.len()
         )));
     }
-    Ok(RaftFrameView { frame })
-}
 
-// ── Per-kind view constructors ────────────────────────────────────────────────
+    let from = PeerId(header.from.get());
+    let body = rest;
 
-pub fn parse_request_vote_view(
-    frame: RaftFrameView,
-) -> Result<super::super::view::RequestVoteView, RaftError> {
-    validate_body_exact::<RequestVoteBody>(&frame, "request vote body")?;
-    let from = frame.from();
-    Ok(super::super::view::RequestVoteView::new(from, frame))
-}
+    let message = match header.kind {
+        KIND_REQUEST_VOTE => {
+            let (wire, body_rest) = parse_prefix::<RequestVote>(body, "request vote body")?;
+            if !body_rest.is_empty() {
+                return Err(RaftError::Protocol("request vote trailing bytes".into()));
+            }
+            RaftMessage::RequestVote(wire)
+        }
+        KIND_REQUEST_VOTE_RESP => {
+            let (wire, body_rest) =
+                parse_prefix::<RequestVoteResp>(body, "request vote resp body")?;
+            if !body_rest.is_empty() {
+                return Err(RaftError::Protocol(
+                    "request vote resp trailing bytes".into(),
+                ));
+            }
+            RaftMessage::RequestVoteResp(wire)
+        }
+        KIND_APPEND_ENTRIES => {
+            let (wire, body_rest) = parse_prefix::<AppendEntries>(body, "append entries body")?;
+            validate_append_entries_body(wire.entry_count.get(), body_rest)?;
+            RaftMessage::AppendEntries(wire, body_rest)
+        }
+        KIND_APPEND_ENTRIES_RESP => {
+            let (wire, body_rest) =
+                parse_prefix::<AppendEntriesResp>(body, "append entries resp body")?;
+            if !body_rest.is_empty() {
+                return Err(RaftError::Protocol(
+                    "append entries resp trailing bytes".into(),
+                ));
+            }
+            RaftMessage::AppendEntriesResp(wire)
+        }
+        KIND_INSTALL_SNAPSHOT => {
+            let (wire, body_rest) = parse_prefix::<InstallSnapshot>(body, "install snapshot body")?;
+            let chunk_len = wire.chunk_len.get() as usize;
+            if body_rest.len() != chunk_len {
+                return Err(RaftError::Protocol(
+                    "install snapshot chunk length mismatch".into(),
+                ));
+            }
+            RaftMessage::InstallSnapshot(wire, body_rest)
+        }
+        KIND_INSTALL_SNAPSHOT_RESP => {
+            let (wire, body_rest) =
+                parse_prefix::<InstallSnapshotResp>(body, "install snapshot resp body")?;
+            if !body_rest.is_empty() {
+                return Err(RaftError::Protocol(
+                    "install snapshot resp trailing bytes".into(),
+                ));
+            }
+            RaftMessage::InstallSnapshotResp(wire)
+        }
+        KIND_CUSTOM => RaftMessage::Custom(body),
+        KIND_CUSTOM_RESPONSE => RaftMessage::CustomResponse(body),
+        other => {
+            return Err(RaftError::Protocol(format!(
+                "unknown raft message kind {}",
+                other
+            )))
+        }
+    };
 
-pub fn parse_request_vote_resp_view(
-    frame: RaftFrameView,
-) -> Result<super::super::view::RequestVoteRespView, RaftError> {
-    validate_body_exact::<RequestVoteRespBody>(&frame, "request vote resp body")?;
-    let from = frame.from();
-    Ok(super::super::view::RequestVoteRespView::new(from, frame))
-}
-
-pub fn parse_append_entries_view(
-    frame: RaftFrameView,
-) -> Result<super::super::view::AppendEntriesView, RaftError> {
-    validate_append_entries_body(frame.body())?;
-    let from = frame.from();
-    Ok(super::super::view::AppendEntriesView::new(from, frame))
-}
-
-pub fn parse_append_entries_resp_view(
-    frame: RaftFrameView,
-) -> Result<super::super::view::AppendEntriesRespView, RaftError> {
-    validate_body_exact::<AppendEntriesRespBody>(&frame, "append entries resp body")?;
-    let from = frame.from();
-    Ok(super::super::view::AppendEntriesRespView::new(from, frame))
-}
-
-pub fn parse_install_snapshot_view(
-    frame: RaftFrameView,
-) -> Result<super::super::view::InstallSnapshotView, RaftError> {
-    let body = frame.body();
-    let (wire, _) = parse_prefix::<InstallSnapshotBody>(body, "install snapshot body")?;
-    let payload_start = std::mem::size_of::<InstallSnapshotBody>();
-    let payload_end   = payload_start
-        .checked_add(wire.chunk_len.get() as usize)
-        .ok_or_else(|| RaftError::Protocol("snapshot chunk overflow".into()))?;
-    if payload_end != body.len() {
-        return Err(RaftError::Protocol("install snapshot length mismatch".into()));
-    }
-    let from = frame.from();
-    Ok(super::super::view::InstallSnapshotView::new(from, frame))
-}
-
-pub fn parse_install_snapshot_resp_view(
-    frame: RaftFrameView,
-) -> Result<super::super::view::InstallSnapshotRespView, RaftError> {
-    validate_body_exact::<InstallSnapshotRespBody>(&frame, "install snapshot resp body")?;
-    let from = frame.from();
-    Ok(super::super::view::InstallSnapshotRespView::new(from, frame))
-}
-
-pub fn parse_custom_message_view(
-    frame: RaftFrameView,
-) -> Result<super::super::view::RaftCustomMessageView, RaftError> {
-    let body   = frame.frame().slice(frame.body_offset()..(frame.body_offset() + frame.body().len()));
-    let custom = crate::DispatchView::parse(body)?;
-    let from   = frame.from();
-    Ok(super::super::view::RaftCustomMessageView::new(from, custom))
-}
-
-pub fn parse_custom_response_view(
-    frame: RaftFrameView,
-) -> Result<super::super::view::RaftCustomResponseView, RaftError> {
-    let body     = frame.frame().slice(frame.body_offset()..(frame.body_offset() + frame.body().len()));
-    let response = crate::DispatchResponseView::parse(body)?;
-    let from     = frame.from();
-    Ok(super::super::view::RaftCustomResponseView::new(from, response))
-}
-
-// ── AppendEntries body validation ─────────────────────────────────────────────
-
-pub(crate) fn validate_append_entries_body(body: &[u8]) -> Result<(), RaftError> {
-    let (wire, _) = parse_prefix::<AppendEntriesBody>(body, "append entries body")?;
-    let mut offset = std::mem::size_of::<AppendEntriesBody>();
-    for _ in 0..wire.entry_count.get() {
-        let entry = EntryHeaderView::parse(body, offset)?;
-        offset    = entry.payload_end();
-    }
-    if offset != body.len() {
-        return Err(RaftError::Protocol("append entries trailing bytes".into()));
-    }
-    Ok(())
-}
-
-// ── Top-level decode ──────────────────────────────────────────────────────────
-
-pub fn decode_message_view(
-    frame: Bytes,
-) -> Result<super::super::view::InboundRaftMessageView, RaftError> {
-    let inbound = super::super::view::RaftMessageView::parse(frame)?;
-    if super::trace_enabled() {
-        let kind = match &inbound.message {
-            super::super::view::RaftMessageView::RequestVote(_)         => KIND_REQUEST_VOTE,
-            super::super::view::RaftMessageView::RequestVoteResp(_)     => KIND_REQUEST_VOTE_RESP,
-            super::super::view::RaftMessageView::AppendEntries(_)       => KIND_APPEND_ENTRIES,
-            super::super::view::RaftMessageView::AppendEntriesResp(_)   => KIND_APPEND_ENTRIES_RESP,
-            super::super::view::RaftMessageView::InstallSnapshot(_)     => KIND_INSTALL_SNAPSHOT,
-            super::super::view::RaftMessageView::InstallSnapshotResp(_) => KIND_INSTALL_SNAPSHOT_RESP,
-            super::super::view::RaftMessageView::Custom(_)              => KIND_CUSTOM,
-            super::super::view::RaftMessageView::CustomResponse(_)      => KIND_CUSTOM_RESPONSE,
-        };
-        super::trace_log(inbound.from, format!("decode kind={}", kind));
-    }
-    Ok(inbound)
-}
-
-pub fn decode_message(frame: Bytes) -> Result<crate::InboundRaftMessage, RaftError> {
-    Ok(decode_message_view(frame)?.into_owned())
-}
-
-// ── Body validation helper ────────────────────────────────────────────────────
-
-fn validate_body_exact<T>(frame: &RaftFrameView, name: &str) -> Result<(), RaftError>
-where
-    T: FromBytes + KnownLayout + Immutable,
-{
-    let (_, rest) = Ref::<_, T>::from_prefix(frame.body())
-        .ok()
-        .map(|(r, rest)| (Ref::into_ref(r), rest))
-        .ok_or_else(|| RaftError::Protocol(format!("short {}", name)))?;
-    if !rest.is_empty() {
-        return Err(RaftError::Protocol(format!("{} trailing bytes", name)));
-    }
-    Ok(())
+    Ok(InboundRaftMessage { from, message })
 }

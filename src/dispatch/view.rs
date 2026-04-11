@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use zerocopy::byteorder::little_endian::{U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Ref};
 
@@ -8,7 +7,6 @@ use crate::RaftError;
 pub const RAFT_DISPATCH_MAGIC: u32 = 0x4453_5054;
 pub const RAFT_DISPATCH_VERSION: u8 = 1;
 
-// Response frame constants — centralized here per §3 protocol constants rule
 pub const RAFT_DISPATCH_RESPONSE_MAGIC: u32 = 0x4452_5350;
 pub const RAFT_DISPATCH_RESPONSE_VERSION: u8 = 1;
 
@@ -30,16 +28,16 @@ pub(crate) struct DispatchFrameHeader {
 
 pub const RAFT_DISPATCH_FRAME_HEADER_SIZE: usize = std::mem::size_of::<DispatchFrameHeader>();
 
-#[derive(Debug, Clone)]
-pub struct DispatchView {
-    frame: Bytes,
+#[derive(Debug, Clone, Copy)]
+pub struct DispatchView<'a> {
+    frame: &'a [u8],
 }
 
-impl DispatchView {
-    pub fn parse(frame: Bytes) -> Result<Self, RaftError> {
-        let (header, rest) = Ref::<_, DispatchFrameHeader>::from_prefix(frame.as_ref())
+impl<'a> DispatchView<'a> {
+    pub fn parse(frame: &'a [u8]) -> Result<Self, RaftError> {
+        let (header_ref, rest) = Ref::<_, DispatchFrameHeader>::from_prefix(frame)
             .map_err(|_| RaftError::Dispatch("short dispatch frame header".into()))?;
-        let header = Ref::into_ref(header);
+        let header = Ref::into_ref(header_ref);
         if header.magic.get() != RAFT_DISPATCH_MAGIC {
             return Err(RaftError::Dispatch("invalid dispatch magic".into()));
         }
@@ -49,7 +47,7 @@ impl DispatchView {
                 header.version
             )));
         }
-        if rest.len() != header.body_len.get() as usize {
+        if rest.len() < header.body_len.get() as usize {
             return Err(RaftError::Dispatch("dispatch body length mismatch".into()));
         }
         if header.scope > 4 { return Err(RaftError::Dispatch("unknown dispatch scope".into())); }
@@ -59,14 +57,14 @@ impl DispatchView {
     }
 
     fn header(&self) -> &DispatchFrameHeader {
-        let (header, _) = Ref::<_, DispatchFrameHeader>::from_prefix(self.frame.as_ref())
+        let (header, _) = Ref::<_, DispatchFrameHeader>::from_prefix(self.frame)
             .expect("dispatch view always stores a validated header");
         Ref::into_ref(header)
     }
 
     #[inline]
-    pub fn frame_bytes(&self) -> &Bytes {
-        &self.frame
+    pub fn frame_bytes(&self) -> &'a [u8] {
+        self.frame
     }
 
     #[inline]
@@ -126,7 +124,7 @@ impl DispatchView {
     }
 
     #[inline]
-    pub fn body(&self) -> &[u8] {
+    pub fn body(&self) -> &'a [u8] {
         &self.frame[RAFT_DISPATCH_FRAME_HEADER_SIZE..]
     }
 

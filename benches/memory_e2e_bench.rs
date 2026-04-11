@@ -6,45 +6,40 @@
 //
 // Design principles vs the previous version:
 //   1. Uses propose_once / propose_batch_once — real backpressure, blocks until quorum.
-//      The old version used unbounded_send + commit_index polling, which had no backpressure
-//      and made all client-count scenarios collapse into the same flat throughput.
 //   2. Leader is created once per benchmark run (inside iter_custom), not per sample.
 //   3. No yield_now() spin loop — propose_once returns on commit, no polling needed.
 //   4. Batch scenarios simulate N concurrent clients by proposing N entries in one round.
-//      propose_batch_once(vec![p; N]) ≡ N clients hitting client_write simultaneously.
 //   5. Empty-payload baseline for direct comparison with openraft's minimal benchmark.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arbitro_raft::{decode_message_view, encode_message};
 use arbitro_raft::{
-    AppendEntriesResp, ArbitroRaft, BootstrapPeer, ClusterId, HardState, LogEntry, LogIndex,
-    NodeConfig, PeerId, RaftError, RaftMessage, RaftStorage, RaftTransport, SnapshotMeta, Term,
+    decode_message, encode_message_vectored, protocol::codec::AppendEntriesView, AppendEntriesResp,
+    ArbitroRaft, BootstrapPeer, ClusterId, EntryPayload, HardState, LogEntry, LogIndex, NodeConfig,
+    PeerId, RaftError, RaftMessage, RaftStorage, RaftTransport, SnapshotMeta, Term,
 };
 use async_trait::async_trait;
-use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use futures::StreamExt;
 
 // ---------------------------------------------------------------------------
 // MemStorage — O(1) index lookup via base_index offset arithmetic.
-//
-// Raft guarantees indices are contiguous and monotonically increasing, so:
-//   entries[i].index == base_index + i   (always)
-//
-// This means we can find any index N in O(1):
-//   position = N - base_index
-//
-// base_index is set on first append and only resets if all entries are
-// truncated (conflict resolution). Snapshots are no-ops in this bench.
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct StoredEntry {
+    term: Term,
+    index: LogIndex,
+    payload: Vec<u8>,
+}
 
 #[derive(Clone)]
 struct MemStorage {
     base_index: Arc<AtomicU64>,
-    entries:    Arc<Mutex<Vec<LogEntry>>>,
+    entries: Arc<Mutex<Vec<StoredEntry>>>,
     hard_state: Arc<Mutex<HardState>>,
 }
 
@@ -52,10 +47,10 @@ impl MemStorage {
     fn new() -> Self {
         Self {
             base_index: Arc::new(AtomicU64::new(0)),
-            entries:    Arc::new(Mutex::new(Vec::new())),
+            entries: Arc::new(Mutex::new(Vec::new())),
             hard_state: Arc::new(Mutex::new(HardState {
                 current_term: Term(1),
-                voted_for:    None,
+                voted_for: None,
             })),
         }
     }
@@ -69,33 +64,72 @@ impl RaftStorage for MemStorage {
         *self.hard_state.lock().unwrap() = state.clone();
         Ok(())
     }
-    fn append_entries(&self, new_entries: &[LogEntry]) -> Result<(), RaftError> {
-        if new_entries.is_empty() { return Ok(()); }
+    fn append_entries(&self, new_entries: &[LogEntry<'_>]) -> Result<(), RaftError> {
+        if new_entries.is_empty() {
+            return Ok(());
+        }
         let mut entries = self.entries.lock().unwrap();
         if entries.is_empty() {
-            // First append — establish base_index. Mutex provides ordering.
-            self.base_index.store(new_entries[0].index.0, Ordering::Relaxed);
+            self.base_index
+                .store(new_entries[0].index.0, Ordering::Relaxed);
         }
-        entries.extend_from_slice(new_entries);
+        for e in new_entries {
+            entries.push(StoredEntry {
+                term: e.term,
+                index: e.index,
+                payload: e.payload.0.to_vec(),
+            });
+        }
         Ok(())
     }
-    fn read_entries(&self, from: LogIndex, to: LogIndex, out: &mut Vec<LogEntry>) -> Result<(), RaftError> {
+    fn read_entries<'a>(
+        &self,
+        from: LogIndex,
+        to: LogIndex,
+        out: &mut Vec<LogEntry<'a>>,
+        payload_buf: &'a mut [u8],
+    ) -> Result<usize, RaftError> {
         let entries = self.entries.lock().unwrap();
-        if entries.is_empty() { return Ok(()); }
-        let base  = self.base_index.load(Ordering::Relaxed);
-        let start = (from.0.saturating_sub(base)) as usize;
-        let end   = (to.0.saturating_sub(base)) as usize;
-        let end   = end.min(entries.len());
-        if start < end {
-            out.extend_from_slice(&entries[start..end]);
+        if entries.is_empty() {
+            return Ok(0);
         }
-        Ok(())
+        let base = self.base_index.load(Ordering::Relaxed);
+
+        let start_idx = (from.0.saturating_sub(base)) as usize;
+        let end_idx = (to.0.saturating_sub(base)) as usize;
+        let end_idx = end_idx.min(entries.len());
+
+        let mut offset = 0;
+        if start_idx < end_idx {
+            for e in &entries[start_idx..end_idx] {
+                let len = e.payload.len();
+                if offset + len > payload_buf.len() {
+                    return Err(RaftError::Storage("payload_buf too small".into()));
+                }
+                payload_buf[offset..offset + len].copy_from_slice(&e.payload);
+
+                // SAFETY: We ensure payload_buf lives as long as 'a
+                let payload_slice = unsafe {
+                    std::mem::transmute::<&[u8], &'a [u8]>(&payload_buf[offset..offset + len])
+                };
+
+                out.push(LogEntry {
+                    term: e.term,
+                    index: e.index,
+                    payload: EntryPayload(payload_slice),
+                });
+                offset += len;
+            }
+        }
+        Ok(offset)
     }
     fn truncate_suffix(&self, from: LogIndex) -> Result<(), RaftError> {
         let mut entries = self.entries.lock().unwrap();
-        if entries.is_empty() { return Ok(()); }
+        if entries.is_empty() {
+            return Ok(());
+        }
         let base = self.base_index.load(Ordering::Relaxed);
-        let cut  = (from.0.saturating_sub(base)) as usize;
+        let cut = (from.0.saturating_sub(base)) as usize;
         entries.truncate(cut);
         if entries.is_empty() {
             self.base_index.store(0, Ordering::Relaxed);
@@ -110,39 +144,56 @@ impl RaftStorage for MemStorage {
     }
     fn last_log_position(&self) -> Result<(LogIndex, Term), RaftError> {
         let entries = self.entries.lock().unwrap();
-        Ok(entries.last().map(|e| (e.index, e.term)).unwrap_or((LogIndex(0), Term(0))))
+        Ok(entries
+            .last()
+            .map(|e| (e.index, e.term))
+            .unwrap_or((LogIndex(0), Term(0))))
     }
-    fn entry_at(&self, index: LogIndex) -> Result<Option<LogEntry>, RaftError> {
+    fn entry_at<'a>(
+        &self,
+        index: LogIndex,
+        payload_buf: &'a mut [u8],
+    ) -> Result<Option<LogEntry<'a>>, RaftError> {
         let entries = self.entries.lock().unwrap();
-        if entries.is_empty() { return Ok(None); }
+        if entries.is_empty() {
+            return Ok(None);
+        }
         let base = self.base_index.load(Ordering::Relaxed);
-        if index.0 < base { return Ok(None); }
+        if index.0 < base {
+            return Ok(None);
+        }
         let pos = (index.0 - base) as usize;
-        Ok(entries.get(pos).cloned())
+        if let Some(e) = entries.get(pos) {
+            if payload_buf.len() < e.payload.len() {
+                return Err(RaftError::Storage("payload_buf too small".into()));
+            }
+            payload_buf[..e.payload.len()].copy_from_slice(&e.payload);
+            Ok(Some(LogEntry {
+                term: e.term,
+                index: e.index,
+                payload: EntryPayload(&payload_buf[..e.payload.len()]),
+            }))
+        } else {
+            Ok(None)
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
 // PeerState — real follower log for one simulated peer.
-//
-// Stores (index, term) pairs only — no payload — to avoid O(N*payload_size)
-// memory growth across iterations while still running real Raft follower logic:
-//   1. prev_log consistency check (rejects mismatched term at prev_index)
-//   2. conflict detection + suffix truncation
-//   3. entry append in order
-//   4. correct match_index in the response
-//
-// This is equivalent to OpenRaft's MemLogStore for protocol-overhead purposes.
 // ---------------------------------------------------------------------------
 
 struct PeerState {
-    base_index: u64,                // index of log[0], 0 means empty
+    base_index: u64,
     log: Vec<(LogIndex, Term)>,
 }
 
 impl PeerState {
     fn new() -> Self {
-        Self { base_index: 0, log: Vec::new() }
+        Self {
+            base_index: 0,
+            log: Vec::new(),
+        }
     }
 
     fn last_position(&self) -> (LogIndex, Term) {
@@ -150,48 +201,46 @@ impl PeerState {
     }
 
     fn term_at(&self, idx: LogIndex) -> Option<Term> {
-        if self.log.is_empty() || idx.0 < self.base_index { return None; }
+        if self.log.is_empty() || idx.0 < self.base_index {
+            return None;
+        }
         let pos = (idx.0 - self.base_index) as usize;
-        self.log.get(pos).filter(|&&(i, _)| i == idx).map(|&(_, t)| t)
+        self.log
+            .get(pos)
+            .filter(|&&(i, _)| i == idx)
+            .map(|&(_, t)| t)
     }
 
-    /// Run follower AppendEntries logic. Returns (success, match_index).
-    fn process_append(
-        &mut self,
-        ae: &arbitro_raft::AppendEntriesView,
-    ) -> (bool, LogIndex) {
-        let prev_idx  = ae.prev_log_index();
+    fn process_append(&mut self, ae: &AppendEntriesView<'_>) -> (bool, LogIndex) {
+        let prev_idx = ae.prev_log_index();
         let prev_term = ae.prev_log_term();
 
-        // Step 1: prev_log consistency check.
         if prev_idx.0 > 0 {
             match self.term_at(prev_idx) {
-                None    => return (false, self.last_position().0),
+                None => return (false, self.last_position().0),
                 Some(t) if t != prev_term => return (false, self.last_position().0),
-                _       => {}
+                _ => {}
             }
         }
 
-        // Step 2: append entries, truncating conflicts.
-        if let Ok(iter) = ae.entries() {
+        if let Some(iter) = ae.entries() {
             for ev in iter {
-                let idx  = ev.index();
-                let term = ev.term();
-                // O(1) offset lookup — Raft guarantees contiguous indices.
+                let idx = ev.index;
+                let term = ev.term;
                 if self.log.is_empty() {
                     self.base_index = idx.0;
                     self.log.push((idx, term));
                     continue;
                 }
                 if idx.0 < self.base_index {
-                    // Entry before our base — ignore (already truncated/snapshotted).
                     continue;
                 }
                 let pos = (idx.0 - self.base_index) as usize;
                 if pos < self.log.len() {
                     let (_, et) = self.log[pos];
-                    if et == term { continue; }
-                    // Conflict — truncate suffix from this position.
+                    if et == term {
+                        continue;
+                    }
                     self.log.truncate(pos);
                     if self.log.is_empty() {
                         self.base_index = idx.0;
@@ -207,18 +256,11 @@ impl PeerState {
 
 // ---------------------------------------------------------------------------
 // MemTransport — 2 real follower state machines that process AppendEntries.
-//
-// Uses std::sync::Mutex (not tokio::sync::Mutex) for the receiver.
-// recv_frame_timeout(Duration::ZERO) is the hot path — it never awaits,
-// so async mutex overhead is pure waste. std::sync::Mutex + try_lock is
-// a single atomic CAS with no scheduler involvement.
-//
-// peers[0] = PeerId(2), peers[1] = PeerId(3).
 // ---------------------------------------------------------------------------
 
 struct MemTransport {
-    tx:    UnboundedSender<Bytes>,
-    rx:    Mutex<UnboundedReceiver<Bytes>>,
+    tx: UnboundedSender<Vec<u8>>,
+    rx: Mutex<UnboundedReceiver<Vec<u8>>>,
     peers: [Mutex<PeerState>; 2],
 }
 
@@ -243,51 +285,90 @@ impl MemTransport {
 
 #[async_trait]
 impl RaftTransport for MemTransport {
-    async fn send_frame(&self, peer: PeerId, frame: Bytes) -> Result<(), RaftError> {
-        let inbound = decode_message_view(frame)?;
-        if let arbitro_raft::RaftMessageView::AppendEntries(ae) = &inbound.message {
+    async fn send_vectored(&self, peer: PeerId, slices: &[&[u8]]) -> Result<(), RaftError> {
+        let mut frame = Vec::new();
+        for s in slices {
+            frame.extend_from_slice(s);
+        }
+
+        let inbound = decode_message(&frame)?;
+        if let Some(ae) = inbound.as_append_entries() {
             let term = ae.term();
 
             let (success, match_index) = match self.peer_state(peer) {
-                Some(state) => state.lock().unwrap().process_append(ae),
-                None        => (false, LogIndex(0)),
+                Some(state) => state.lock().unwrap().process_append(&ae),
+                None => (false, LogIndex(0)),
             };
 
-            let resp = RaftMessage::AppendEntriesResp(AppendEntriesResp {
-                term,
-                success,
-                match_index,
-            });
-            let _ = self.tx.unbounded_send(encode_message(peer, &resp)?);
+            let resp = AppendEntriesResp {
+                term: term.0.into(),
+                success: if success { 1 } else { 0 },
+                match_index: match_index.0.into(),
+                _pad: [0; 7],
+            };
+
+            let mut header_buf = [0u8; 128];
+            let mut vectors = Vec::new();
+            encode_message_vectored(
+                peer,
+                &RaftMessage::AppendEntriesResp(&resp),
+                &mut header_buf,
+                &mut vectors,
+            )?;
+
+            let mut resp_frame = Vec::new();
+            for v in vectors {
+                resp_frame.extend_from_slice(v);
+            }
+            let _ = self.tx.unbounded_send(resp_frame);
         }
         Ok(())
     }
 
-    async fn recv_frame(&self) -> Result<Bytes, RaftError> {
-        // Blocking recv — only used outside the hot path (e.g. follower idle wait).
-        // futures channel doesn't have a sync blocking recv, so we spin with yield.
+    async fn recv_frame(&self, out: &mut [u8]) -> Result<usize, RaftError> {
         loop {
             if let Ok(frame) = self.rx.lock().unwrap().try_recv() {
-                return Ok(frame);
+                let len = frame.len();
+                if out.len() < len {
+                    return Err(RaftError::Transport("buffer too small".into()));
+                }
+                out[..len].copy_from_slice(&frame);
+                return Ok(len);
             }
             tokio::task::yield_now().await;
         }
     }
 
-    async fn recv_frame_timeout(&self, timeout: Duration) -> Result<Option<Bytes>, RaftError> {
+    async fn recv_frame_timeout(
+        &self,
+        timeout: Duration,
+        out: &mut [u8],
+    ) -> Result<Option<usize>, RaftError> {
         if timeout.is_zero() {
-            // Hot path: single try_recv, no await, no scheduler touch.
-            return Ok(self.rx.lock().unwrap().try_recv().ok());
+            if let Ok(frame) = self.rx.lock().unwrap().try_recv() {
+                let len = frame.len();
+                if out.len() < len {
+                    return Err(RaftError::Transport("buffer too small".into()));
+                }
+                out[..len].copy_from_slice(&frame);
+                return Ok(Some(len));
+            }
+            return Ok(None);
         }
         let deadline = Instant::now() + timeout;
         loop {
             if let Ok(frame) = self.rx.lock().unwrap().try_recv() {
-                return Ok(Some(frame));
+                let len = frame.len();
+                if out.len() < len {
+                    return Err(RaftError::Transport("buffer too small".into()));
+                }
+                out[..len].copy_from_slice(&frame);
+                return Ok(Some(len));
             }
             if Instant::now() >= deadline {
                 return Ok(None);
             }
-            tokio::time::sleep(Duration::from_micros(50)).await;
+            tokio::task::yield_now().await;
         }
     }
 }
@@ -302,18 +383,27 @@ fn make_config(node_id: PeerId) -> NodeConfig {
         cluster_id: ClusterId(1),
         peers: vec![PeerId(1), PeerId(2), PeerId(3)],
         bootstrap_peers: vec![
-            BootstrapPeer { id: PeerId(1), addr: "127.0.0.1:8001".parse().unwrap() },
-            BootstrapPeer { id: PeerId(2), addr: "127.0.0.1:8002".parse().unwrap() },
-            BootstrapPeer { id: PeerId(3), addr: "127.0.0.1:8003".parse().unwrap() },
+            BootstrapPeer {
+                id: PeerId(1),
+                addr: "127.0.0.1:8001".parse().unwrap(),
+            },
+            BootstrapPeer {
+                id: PeerId(2),
+                addr: "127.0.0.1:8002".parse().unwrap(),
+            },
+            BootstrapPeer {
+                id: PeerId(3),
+                addr: "127.0.0.1:8003".parse().unwrap(),
+            },
         ],
         ..Default::default()
     }
 }
 
 fn make_leader() -> ArbitroRaft<MemStorage, MemTransport> {
-    let storage   = MemStorage::new();
+    let storage = MemStorage::new();
     let transport = MemTransport::new();
-    let mut node  = arbitro_raft::RaftNode::new(make_config(PeerId(1)), storage, transport).unwrap();
+    let mut node = arbitro_raft::RaftNode::new(make_config(PeerId(1)), storage, transport).unwrap();
     node.become_leader_for_benchmark(Term(1));
     ArbitroRaft::new(node)
 }
@@ -327,11 +417,7 @@ fn make_runtime(workers: usize) -> tokio::runtime::Runtime {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Latency benchmark — single propose_once, persistent leader across iters
-//
-//    Reports the average round-trip latency for one entry to reach quorum.
-//    Empty payload = pure Raft overhead (matches openraft baseline).
-//    1 KB payload = realistic application entry size.
+// 1. Latency benchmark
 // ---------------------------------------------------------------------------
 
 fn bench_latency(c: &mut Criterion) {
@@ -342,29 +428,28 @@ fn bench_latency(c: &mut Criterion) {
 
     let rt = make_runtime(4);
 
-    // Empty payload — direct comparison with openraft "1 client / single write" latency
     group.throughput(Throughput::Elements(1));
     group.bench_function("propose_once/empty", |b| {
         b.to_async(&rt).iter_custom(|iters| async move {
             let mut raft = make_leader();
             let start = Instant::now();
+            let empty = [];
             for _ in 0..iters {
-                raft.propose_once(Bytes::new()).await.unwrap();
+                raft.propose_once(&empty).await.unwrap();
             }
             start.elapsed()
         });
     });
 
-    // 1 KB payload — common application workload
     group.bench_function("propose_once/1kb", |b| {
-        let payload = Bytes::from(vec![0xAA; 1024]);
+        let payload = vec![0xAA; 1024];
         b.to_async(&rt).iter_custom(move |iters| {
             let p = payload.clone();
             async move {
                 let mut raft = make_leader();
                 let start = Instant::now();
                 for _ in 0..iters {
-                    raft.propose_once(p.clone()).await.unwrap();
+                    raft.propose_once(&p).await.unwrap();
                 }
                 start.elapsed()
             }
@@ -375,13 +460,7 @@ fn bench_latency(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Batch throughput — propose_batch_once(N entries per round)
-//
-//    propose_batch_once(vec![p; N]) is equivalent to N concurrent clients all
-//    having their entries batched into a single AppendEntries round by the leader.
-//    This is how openraft achieves throughput scaling: more clients → larger batches.
-//
-//    Throughput = N / time_per_call → reported as elem/s (ops/s).
+// 2. Batch throughput
 // ---------------------------------------------------------------------------
 
 fn bench_batch_throughput(c: &mut Criterion) {
@@ -392,35 +471,34 @@ fn bench_batch_throughput(c: &mut Criterion) {
 
     let rt = make_runtime(4);
 
-    // Empty payload for fair comparison with openraft
     for &batch in &[1u64, 64, 256, 1024, 4096] {
         group.throughput(Throughput::Elements(batch));
         group.bench_function(format!("empty/clients_{batch}"), |b| {
             b.to_async(&rt).iter_custom(move |iters| async move {
                 let mut raft = make_leader();
-                let batch_payload = vec![Bytes::new(); batch as usize];
+                let empty = [];
+                let batch_payload: Vec<&[u8]> = vec![&empty; batch as usize];
                 let start = Instant::now();
                 for _ in 0..iters {
-                    raft.propose_batch_once(batch_payload.clone()).await.unwrap();
+                    raft.propose_batch_once(&batch_payload).await.unwrap();
                 }
                 start.elapsed()
             });
         });
     }
 
-    // 1 KB payload — realistic workload at key batch sizes
     for &batch in &[1u64, 4096] {
         group.throughput(Throughput::Elements(batch));
         group.bench_function(format!("1kb/clients_{batch}"), |b| {
-            let p = Bytes::from(vec![0xAA; 1024]);
+            let p = vec![0xAA; 1024];
             b.to_async(&rt).iter_custom(move |iters| {
                 let p = p.clone();
                 async move {
                     let mut raft = make_leader();
-                    let batch_payload = vec![p.clone(); batch as usize];
+                    let batch_payload: Vec<&[u8]> = vec![&p; batch as usize];
                     let start = Instant::now();
                     for _ in 0..iters {
-                        raft.propose_batch_once(batch_payload.clone()).await.unwrap();
+                        raft.propose_batch_once(&batch_payload).await.unwrap();
                     }
                     start.elapsed()
                 }
@@ -431,13 +509,6 @@ fn bench_batch_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-// ---------------------------------------------------------------------------
-// 3. Batch write throughput — propose_batch_once with batch_size > 1
-//
-//    Simulates the openraft "batch=4" scenario: each logical client sends
-//    a batch of 4 entries per call. Total entries per round = clients * batch.
-// ---------------------------------------------------------------------------
-
 fn bench_batch_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("raft_batch_write");
     group.sample_size(20);
@@ -446,16 +517,16 @@ fn bench_batch_write(c: &mut Criterion) {
 
     let rt = make_runtime(4);
 
-    // clients=4096, batch_size=4 → 16384 entries per round
     let total_entries: u64 = 4096 * 4;
     group.throughput(Throughput::Elements(total_entries));
     group.bench_function("empty/clients_4096_batch_4", |b| {
         b.to_async(&rt).iter_custom(move |iters| async move {
             let mut raft = make_leader();
-            let batch_payload = vec![Bytes::new(); total_entries as usize];
+            let empty = [];
+            let batch_payload: Vec<&[u8]> = vec![&empty; total_entries as usize];
             let start = Instant::now();
             for _ in 0..iters {
-                raft.propose_batch_once(batch_payload.clone()).await.unwrap();
+                raft.propose_batch_once(&batch_payload).await.unwrap();
             }
             start.elapsed()
         });
@@ -464,52 +535,42 @@ fn bench_batch_write(c: &mut Criterion) {
     group.finish();
 }
 
-// ---------------------------------------------------------------------------
-// 4. Concurrent writes — N real tokio tasks each calling ClientHandle::write()
-//
-//    This is the closest equivalent to OpenRaft's benchmark:
-//      - Raft event loop runs in a dedicated tokio task via raft.run()
-//      - N independent tasks call client_handle.write() concurrently
-//      - The leader naturally batches writes that arrive simultaneously
-//      - Each write blocks until its entry reaches quorum (real backpressure)
-//
-//    Throughput = N * iters / elapsed → reported as elem/s (1 elem = 1 write).
-// ---------------------------------------------------------------------------
-
 fn bench_concurrent_writes(c: &mut Criterion) {
     let mut group = c.benchmark_group("raft_concurrent_writes");
     group.sample_size(10);
     group.warm_up_time(Duration::from_secs(2));
     group.measurement_time(Duration::from_secs(8));
 
-    // More workers to handle N concurrent client tasks + 1 raft task.
     let rt = make_runtime(16);
 
     for &num_clients in &[1usize, 4, 16, 64, 256, 1024] {
         group.throughput(Throughput::Elements(num_clients as u64));
         group.bench_function(format!("empty/clients_{num_clients}"), |b| {
             b.to_async(&rt).iter_custom(move |iters| async move {
-                let mut raft  = make_leader();
-                let handle    = raft.client_handle();
+                let mut raft = make_leader();
+                let handle = raft.client_handle();
 
-                // Raft event loop in its own dedicated task.
-                let raft_task = tokio::spawn(async move { let _ = raft.run().await; });
+                let raft_task = tokio::spawn(async move {
+                    let _ = raft.run().await;
+                });
 
                 let start = Instant::now();
 
-                // N concurrent clients each submitting `iters` writes.
                 let client_tasks: Vec<_> = (0..num_clients)
                     .map(|_| {
                         let h = handle.clone();
                         tokio::spawn(async move {
+                            let empty = [];
                             for _ in 0..iters {
-                                h.write(Bytes::new()).await.unwrap();
+                                h.write(&empty).await.unwrap();
                             }
                         })
                     })
                     .collect();
 
-                for t in client_tasks { t.await.unwrap(); }
+                for t in client_tasks {
+                    t.await.unwrap();
+                }
 
                 let elapsed = start.elapsed();
                 raft_task.abort();
@@ -521,5 +582,11 @@ fn bench_concurrent_writes(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_latency, bench_batch_throughput, bench_batch_write, bench_concurrent_writes);
+criterion_group!(
+    benches,
+    bench_latency,
+    bench_batch_throughput,
+    bench_batch_write,
+    bench_concurrent_writes
+);
 criterion_main!(benches);

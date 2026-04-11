@@ -2,7 +2,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bytes::{BufMut, Bytes, BytesMut};
 use futures::executor::block_on;
 
 use arbitro_raft::{
@@ -22,14 +21,14 @@ struct SyncAck {
     saved_until: u64,
 }
 
-fn encode_sync_params(value: &SyncParams) -> Result<Bytes, RaftError> {
+fn encode_sync_params(value: &SyncParams) -> Result<Vec<u8>, RaftError> {
     if value.start > value.end {
         return Err(RaftError::Dispatch("sync range is inverted".into()));
     }
-    let mut out = BytesMut::with_capacity(16);
-    out.put_u64_le(value.start);
-    out.put_u64_le(value.end);
-    Ok(out.freeze())
+    let mut out = Vec::with_capacity(16);
+    out.extend_from_slice(&value.start.to_le_bytes());
+    out.extend_from_slice(&value.end.to_le_bytes());
+    Ok(out)
 }
 
 fn decode_sync_params(bytes: &[u8]) -> Result<SyncParams, RaftError> {
@@ -45,13 +44,13 @@ fn decode_sync_params(bytes: &[u8]) -> Result<SyncParams, RaftError> {
     })
 }
 
-fn encode_sync_ack(value: &SyncAck) -> Result<Bytes, RaftError> {
+fn encode_sync_ack(value: &SyncAck) -> Result<Vec<u8>, RaftError> {
     if value.saved_until == 0 {
         return Err(RaftError::Dispatch("saved_until must be non-zero".into()));
     }
-    let mut out = BytesMut::with_capacity(8);
-    out.put_u64_le(value.saved_until);
-    Ok(out.freeze())
+    let mut out = Vec::with_capacity(8);
+    out.extend_from_slice(&value.saved_until.to_le_bytes());
+    Ok(out)
 }
 
 fn decode_sync_ack(bytes: &[u8]) -> Result<SyncAck, RaftError> {
@@ -149,7 +148,7 @@ fn dispatch_registry_invokes_typed_handler_and_returns_typed_response() {
         .build()
         .unwrap();
 
-    let view = block_on(registry.invoke_bytes(envelope.into_bytes(), &responder)).unwrap();
+    let view = block_on(registry.invoke_bytes(envelope.bytes(), &responder)).unwrap();
     let responses = responder.take();
 
     assert_eq!(view.command(), spec.command());
@@ -178,12 +177,12 @@ fn dispatch_registry_reports_decode_failures_through_context() {
         .dispatch(SyncParams { start: 40, end: 50 })
         .build()
         .unwrap()
-        .into_bytes()
+        .bytes()
         .to_vec();
     corrupted.truncate(corrupted.len() - 8);
     corrupted[24..28].copy_from_slice(&(8u32).to_le_bytes());
 
-    let err = match block_on(registry.invoke_bytes(Bytes::from(corrupted), &responder)) {
+    let err = match block_on(registry.invoke_bytes(&corrupted, &responder)) {
         Ok(_) => panic!("decode failure should propagate an error"),
         Err(err) => err,
     };
@@ -271,8 +270,7 @@ fn dispatch_tx_respects_no_failures_policy() {
     let (handle, tx) = envelope.begin([PeerId(2), PeerId(3)], decode_sync_ack);
 
     tx.accept(PeerId(2), SyncAck { saved_until: 50 }).unwrap();
-    tx.reject(PeerId(3), Bytes::from_static(b"disk full"))
-        .unwrap();
+    tx.reject(PeerId(3), b"disk full".to_vec()).unwrap();
 
     let err = block_on(handle.wait()).unwrap_err();
     assert!(matches!(err, RaftError::Dispatch(_)));
@@ -347,14 +345,13 @@ fn dispatch_registry_enforces_scope_for_routes() {
         })
         .unwrap();
 
-    let frame = spec
+    let envelope = spec
         .dispatch(SyncParams { start: 40, end: 50 })
         .build()
-        .unwrap()
-        .into_bytes();
+        .unwrap();
 
     let err = match block_on(registry.invoke_bytes_scoped(
-        frame.clone(),
+        envelope.bytes(),
         &responder,
         DispatchRoute::leader(false),
     )) {
@@ -364,7 +361,7 @@ fn dispatch_registry_enforces_scope_for_routes() {
     assert!(matches!(err, RaftError::Dispatch(_)));
 
     let view = block_on(registry.invoke_bytes_scoped(
-        frame,
+        envelope.bytes(),
         &responder,
         DispatchRoute::follower(false),
     ))
@@ -382,7 +379,10 @@ fn dispatch_tx_respects_percent_ack_policy() {
         .dispatch(SyncParams { start: 1, end: 3 })
         .build()
         .unwrap();
-    let (handle, tx) = envelope.begin([PeerId(2), PeerId(3), PeerId(4), PeerId(5)], decode_sync_ack);
+    let (handle, tx) = envelope.begin(
+        [PeerId(2), PeerId(3), PeerId(4), PeerId(5)],
+        decode_sync_ack,
+    );
 
     tx.accept(PeerId(2), SyncAck { saved_until: 3 }).unwrap();
     tx.accept(PeerId(3), SyncAck { saved_until: 3 }).unwrap();
@@ -406,8 +406,8 @@ fn dispatch_tx_respects_max_failures_policy() {
         .unwrap();
     let (handle, tx) = envelope.begin([PeerId(2), PeerId(3), PeerId(4)], decode_sync_ack);
 
-    tx.reject(PeerId(2), Bytes::from_static(b"first")).unwrap();
-    tx.reject(PeerId(3), Bytes::from_static(b"second")).unwrap();
+    tx.reject(PeerId(2), b"first".to_vec()).unwrap();
+    tx.reject(PeerId(3), b"second".to_vec()).unwrap();
 
     let err = block_on(handle.wait()).unwrap_err();
     assert!(matches!(err, RaftError::Dispatch(_)));
@@ -423,10 +423,13 @@ fn dispatch_tx_respects_max_failure_percent_policy() {
         .dispatch(SyncParams { start: 1, end: 2 })
         .build()
         .unwrap();
-    let (handle, tx) = envelope.begin([PeerId(2), PeerId(3), PeerId(4), PeerId(5)], decode_sync_ack);
+    let (handle, tx) = envelope.begin(
+        [PeerId(2), PeerId(3), PeerId(4), PeerId(5)],
+        decode_sync_ack,
+    );
 
-    tx.reject(PeerId(2), Bytes::from_static(b"one")).unwrap();
-    tx.reject(PeerId(3), Bytes::from_static(b"two")).unwrap();
+    tx.reject(PeerId(2), b"one".to_vec()).unwrap();
+    tx.reject(PeerId(3), b"two".to_vec()).unwrap();
 
     let err = block_on(handle.wait()).unwrap_err();
     assert!(matches!(err, RaftError::Dispatch(_)));
@@ -443,7 +446,7 @@ fn dispatch_tx_fail_fast_trips_immediately() {
         .unwrap();
     let (handle, tx) = envelope.begin([PeerId(2), PeerId(3)], decode_sync_ack);
 
-    tx.fail(PeerId(2), Bytes::from_static(b"boom")).unwrap();
+    tx.fail(PeerId(2), b"boom".to_vec()).unwrap();
 
     let err = block_on(handle.wait()).unwrap_err();
     assert!(matches!(err, RaftError::Dispatch(_)));

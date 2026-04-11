@@ -1,20 +1,13 @@
-mod codec;
-mod message;
-mod view;
-
-pub(crate) use codec::encode_append_entries_frame;
+pub mod codec;
+pub mod message;
 
 pub use codec::{
-    decode_message, decode_message_view, encode_message, encode_message_into, KIND_CUSTOM, KIND_CUSTOM_RESPONSE, RAFT_FRAME_HEADER_SIZE,
-    RAFT_MAGIC, RAFT_VERSION,
+    decode_message, encode_append_entries_vectored, encode_message_vectored,
+    AppendEntries, AppendEntriesResp, EntryHeader, InstallSnapshot, InstallSnapshotResp,
+    RequestVote, RequestVoteResp,
+    KIND_APPEND_ENTRIES, KIND_APPEND_ENTRIES_RESP, KIND_CUSTOM, KIND_CUSTOM_RESPONSE,
+    KIND_INSTALL_SNAPSHOT, KIND_INSTALL_SNAPSHOT_RESP, KIND_REQUEST_VOTE, KIND_REQUEST_VOTE_RESP,
+    RAFT_FRAME_HEADER_SIZE, RAFT_MAGIC, RAFT_VERSION,
 };
-pub use message::{
-    AppendEntries, AppendEntriesResp, InboundRaftMessage, InstallSnapshot, InstallSnapshotResp,
-    RaftCustomMessage, RaftCustomResponse, RaftMessage, RequestVote, RequestVoteResp,
-    SnapshotChunk,
-};
-pub use view::{
-    AppendEntriesRespView, AppendEntriesView, EntryView, InboundRaftMessageView,
-    InstallSnapshotRespView, InstallSnapshotView, RaftCustomMessageView,
-    RaftCustomResponseView, RaftMessageView, RequestVoteRespView, RequestVoteView,
-};
+
+pub use message::{AppendEntriesEntryIter, InboundRaftMessage, RaftMessage};

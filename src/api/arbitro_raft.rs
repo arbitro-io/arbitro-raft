@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use futures::channel::mpsc;
 use futures::task::AtomicWaker;
 use futures::{FutureExt, StreamExt};
@@ -98,13 +97,13 @@ impl Future for WriteFuture {
 // ---------------------------------------------------------------------------
 
 struct ClientProposal {
-    payload: Bytes,
-    slot:    Arc<Slot>,
+    payload: Vec<u8>,
+    slot: Arc<Slot>,
 }
 
 struct CommitWaiter {
     index: LogIndex,
-    slot:  Arc<Slot>,
+    slot: Arc<Slot>,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,10 +125,13 @@ pub struct ClientHandle {
 impl ClientHandle {
     /// Submit `payload` and wait until it is committed by a quorum.
     /// Returns the [`LogIndex`] assigned to the entry.
-    pub async fn write(&self, payload: Bytes) -> Result<LogIndex, RaftError> {
+    pub async fn write(&self, payload: &[u8]) -> Result<LogIndex, RaftError> {
         let slot = Slot::new();
         self.tx
-            .unbounded_send(ClientProposal { payload, slot: slot.clone() })
+            .unbounded_send(ClientProposal {
+                payload: payload.to_vec(),
+                slot: slot.clone(),
+            })
             .map_err(|_| RaftError::Transport("raft node stopped".into()))?;
         WriteFuture { slot }.await
     }
@@ -140,19 +142,21 @@ impl ClientHandle {
 // ---------------------------------------------------------------------------
 
 pub struct ArbitroRaft<S, T> {
-    node:              RaftNode<S, T>,
-    stopped:           bool,
-    next_election_at:  Instant,
+    node: RaftNode<S, T>,
+    stopped: bool,
+    next_election_at: Instant,
     next_heartbeat_at: Instant,
-    election_state:    u64,
-    client_tx:         mpsc::UnboundedSender<ClientProposal>,
-    client_rx:         mpsc::UnboundedReceiver<ClientProposal>,
+    election_state: u64,
+    client_tx: mpsc::UnboundedSender<ClientProposal>,
+    client_rx: mpsc::UnboundedReceiver<ClientProposal>,
     /// Scratch — payloads drained from client_rx this tick, cleared before each use.
-    pending_batch:     Vec<Bytes>,
+    pending_batch: Vec<Vec<u8>>,
     /// Scratch — slots parallel to pending_batch, drained together.
-    pending_slots:     Vec<Arc<Slot>>,
+    pending_slots: Vec<Arc<Slot>>,
     /// Entries replicated but not yet committed; resolved as commit_index advances.
-    commit_waiters:    Vec<CommitWaiter>,
+    commit_waiters: Vec<CommitWaiter>,
+    /// Long-lived inbound buffer to avoid per-frame allocations.
+    inbound_buf: Box<[u8]>,
 }
 
 // --- Public API --------------------------------------------------------------
@@ -165,38 +169,59 @@ where
     pub fn new(node: RaftNode<S, T>) -> Self {
         let (client_tx, client_rx) = mpsc::unbounded();
         let mut raft = Self {
-            election_state:    seed(node.node_id()),
+            election_state: seed(node.node_id()),
             node,
-            stopped:           false,
-            next_election_at:  Instant::now(),
+            stopped: false,
+            next_election_at: Instant::now(),
             next_heartbeat_at: Instant::now(),
             client_tx,
             client_rx,
-            pending_batch:     Vec::with_capacity(4096),
-            pending_slots:     Vec::with_capacity(4096),
-            commit_waiters:    Vec::with_capacity(4096),
+            pending_batch: Vec::with_capacity(4096),
+            pending_slots: Vec::with_capacity(4096),
+            commit_waiters: Vec::with_capacity(4096),
+            inbound_buf: vec![0u8; 64 * 1024].into_boxed_slice(),
         };
         raft.reset_election_deadline();
         raft.reset_heartbeat_deadline();
         raft
     }
 
-    #[inline] pub fn node(&self) -> &RaftNode<S, T> { &self.node }
-    #[inline] pub fn node_mut(&mut self) -> &mut RaftNode<S, T> { &mut self.node }
-    #[inline] pub fn role(&self) -> Role { self.node.role() }
-    #[inline] pub fn commit_index(&self) -> LogIndex { self.node.commit_index() }
-    #[inline] pub fn node_id(&self) -> PeerId { self.node.node_id() }
-    #[inline] pub fn stop(&mut self) { self.stopped = true; }
+    #[inline]
+    pub fn node(&self) -> &RaftNode<S, T> {
+        &self.node
+    }
+    #[inline]
+    pub fn node_mut(&mut self) -> &mut RaftNode<S, T> {
+        &mut self.node
+    }
+    #[inline]
+    pub fn role(&self) -> Role {
+        self.node.role()
+    }
+    #[inline]
+    pub fn commit_index(&self) -> LogIndex {
+        self.node.commit_index()
+    }
+    #[inline]
+    pub fn node_id(&self) -> PeerId {
+        self.node.node_id()
+    }
+    #[inline]
+    pub fn stop(&mut self) {
+        self.stopped = true;
+    }
 
     /// Returns a clonable [`ClientHandle`] for concurrent writes from multiple tasks.
     #[inline]
     pub fn client_handle(&self) -> ClientHandle {
-        ClientHandle { tx: self.client_tx.clone() }
+        ClientHandle {
+            tx: self.client_tx.clone(),
+        }
     }
 
     /// Direct single-entry propose — caller holds `&mut self` (e.g. benchmarks, tests).
     #[inline]
-    pub async fn propose_once(&mut self, payload: Bytes) -> Result<LogIndex, RaftError> {
+    pub async fn propose_once(&mut self, payload: &[u8]) -> Result<LogIndex, RaftError> {
         self.node.propose_once(payload).await
     }
 
@@ -204,16 +229,18 @@ where
     #[inline]
     pub async fn propose_batch_once(
         &mut self,
-        payloads: Vec<Bytes>,
+        payloads: &[&[u8]],
     ) -> Result<Vec<LogIndex>, RaftError> {
         self.node.propose_batch_once(payloads).await
     }
 
     #[inline]
     pub async fn campaign_once(&mut self) -> Result<bool, RaftError> {
-        let elected = self.node.campaign_once().await?;
+        let elected = self.node.campaign_once(&mut self.inbound_buf).await?;
         self.reset_election_deadline();
-        if elected { self.reset_heartbeat_deadline(); }
+        if elected {
+            self.reset_heartbeat_deadline();
+        }
         Ok(elected)
     }
 
@@ -232,7 +259,8 @@ where
         F: for<'a> Fn(
                 P,
                 DispatchContextView<'a>,
-            ) -> Pin<Box<dyn Future<Output = Result<(), RaftError>> + Send + 'a>>
+            )
+                -> Pin<Box<dyn Future<Output = Result<(), RaftError>> + Send + 'a>>
             + Send
             + Sync
             + 'static,
@@ -254,7 +282,9 @@ where
     }
 
     pub async fn run_once(&mut self) -> Result<bool, RaftError> {
-        if self.stopped { return Ok(false); }
+        if self.stopped {
+            return Ok(false);
+        }
         if self.node.is_leader() {
             self.run_leader_once().await?;
         } else {
@@ -283,7 +313,10 @@ where
         let limit = self.node.config.limits.append_batch_entries;
         while self.pending_batch.len() < limit {
             match self.client_rx.try_recv() {
-                Ok(p) => { self.pending_batch.push(p.payload); self.pending_slots.push(p.slot); }
+                Ok(p) => {
+                    self.pending_batch.push(p.payload);
+                    self.pending_slots.push(p.slot);
+                }
                 Err(_) => break,
             }
         }
@@ -294,17 +327,26 @@ where
 
         // 2. Burst-drain available inbound frames.
         let mut processed = 0;
-        while let Some(raw) = self.node.transport().recv_frame_timeout(Duration::ZERO).await? {
-            let inbound = crate::decode_message_view(raw)?;
+        while let Some(n) = self
+            .node
+            .transport()
+            .recv_frame_timeout(Duration::ZERO, &mut self.inbound_buf)
+            .await?
+        {
+            let inbound = crate::decode_message(&self.inbound_buf[..n])?;
             self.node.handle_inbound(inbound).await?;
             processed += 1;
-            if processed >= 128 { break; }
+            if processed >= 128 {
+                break;
+            }
         }
 
         if processed > 0 {
             self.node.try_advance_commit_index()?;
             self.drain_commit_waiters();
-            if !self.node.is_leader() { self.fail_commit_waiters(); }
+            if !self.node.is_leader() {
+                self.fail_commit_waiters();
+            }
             return Ok(());
         }
 
@@ -318,9 +360,9 @@ where
 
         let timeout = self.next_heartbeat_at.saturating_duration_since(now);
         futures::select! {
-            frame_result = self.node.transport().recv_frame_timeout(timeout).fuse() => {
-                if let Some(raw) = frame_result? {
-                    let inbound = crate::decode_message_view(raw)?;
+            frame_result = self.node.transport().recv_frame_timeout(timeout, &mut self.inbound_buf).fuse() => {
+                if let Some(n) = frame_result? {
+                    let inbound = crate::decode_message(&self.inbound_buf[..n])?;
                     self.node.handle_inbound(inbound).await?;
                     self.node.try_advance_commit_index()?;
                     self.drain_commit_waiters();
@@ -356,7 +398,13 @@ where
 
     /// Replicate `pending_batch`, pair results with `pending_slots` → `commit_waiters`.
     async fn replicate_pending(&mut self) -> Result<(), RaftError> {
-        match self.node.replicate_batch_async(&self.pending_batch).await {
+        // Form a slice of slices for the scratchpad
+        let mut payloads = Vec::with_capacity(self.pending_batch.len());
+        for p in &self.pending_batch {
+            payloads.push(p.as_slice());
+        }
+
+        match self.node.replicate_batch_async(&payloads).await {
             Ok((first_index, _)) => {
                 for (i, slot) in self.pending_slots.drain(..).enumerate() {
                     self.commit_waiters.push(CommitWaiter {
@@ -379,11 +427,18 @@ where
 
     async fn run_follower_once(&mut self) -> Result<(), RaftError> {
         let mut processed = 0;
-        while let Some(raw) = self.node.transport().recv_frame_timeout(Duration::ZERO).await? {
-            let inbound = crate::decode_message_view(raw)?;
+        while let Some(n) = self
+            .node
+            .transport()
+            .recv_frame_timeout(Duration::ZERO, &mut self.inbound_buf)
+            .await?
+        {
+            let inbound = crate::decode_message(&self.inbound_buf[..n])?;
             self.node.handle_inbound(inbound).await?;
             processed += 1;
-            if processed >= 128 { break; }
+            if processed >= 128 {
+                break;
+            }
         }
 
         if processed > 0 {
@@ -393,14 +448,21 @@ where
 
         let now = Instant::now();
         let timeout = self.next_election_at.saturating_duration_since(now);
-        match self.node.transport().recv_frame_timeout(timeout).await? {
-            Some(raw) => {
-                let inbound = crate::decode_message_view(raw)?;
+        match self
+            .node
+            .transport()
+            .recv_frame_timeout(timeout, &mut self.inbound_buf)
+            .await?
+        {
+            Some(n) => {
+                let inbound = crate::decode_message(&self.inbound_buf[..n])?;
                 self.node.handle_inbound(inbound).await?;
                 self.reset_election_deadline();
-                if self.node.is_leader() { self.reset_heartbeat_deadline(); }
+                if self.node.is_leader() {
+                    self.reset_heartbeat_deadline();
+                }
             }
-            None => match self.node.campaign_once().await {
+            None => match self.node.campaign_once(&mut self.inbound_buf).await {
                 Ok(elected) => {
                     self.reset_election_deadline();
                     if elected {
@@ -409,7 +471,9 @@ where
                         self.reset_heartbeat_deadline();
                     }
                 }
-                Err(RaftError::NoQuorum) => { self.reset_election_deadline(); }
+                Err(RaftError::NoQuorum) => {
+                    self.reset_election_deadline();
+                }
                 Err(err) => return Err(err),
             },
         }
@@ -423,10 +487,16 @@ where
     /// in insertion order via a single pass with no swap_remove overhead.
     fn drain_commit_waiters(&mut self) {
         let commit_index = self.node.commit_index();
-        if self.commit_waiters.is_empty() { return; }
+        if self.commit_waiters.is_empty() {
+            return;
+        }
 
         // Fast path — full batch committed (common in bench + low-contention).
-        if self.commit_waiters.last().map_or(false, |w| w.index <= commit_index) {
+        if self
+            .commit_waiters
+            .last()
+            .map_or(false, |w| w.index <= commit_index)
+        {
             for w in self.commit_waiters.drain(..) {
                 w.slot.notify_committed(w.index);
             }
@@ -468,9 +538,11 @@ where
         let timing = self.node.timing();
         let min_ms = timing.election_min_ms.max(1);
         let max_ms = timing.election_max_ms.max(min_ms);
-        if max_ms == min_ms { return Duration::from_millis(min_ms); }
+        if max_ms == min_ms {
+            return Duration::from_millis(min_ms);
+        }
         self.election_state = mix64(self.election_state);
-        let span   = max_ms - min_ms + 1;
+        let span = max_ms - min_ms + 1;
         let jitter = self.election_state % span;
         Duration::from_millis(min_ms + jitter)
     }

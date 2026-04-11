@@ -1,54 +1,54 @@
 use std::time::Duration;
 
-use bytes::Bytes;
 use super::super::RaftNode;
-use crate::{LogIndex, PeerId, RaftError, Term};
+use crate::{LogIndex, PeerId, RaftError, RaftMessage, Term};
 
 impl<S, T> RaftNode<S, T>
 where
     S: crate::RaftStorage,
     T: crate::RaftTransport,
 {
-    /// Build a ready-to-send AppendEntries frame for `peer` in **one allocation**.
-    ///
-    /// Returns `(frame, last_sent_index)` where `last_sent_index` is the highest
-    /// log index included in the frame (or `prev_log_index` when entries is empty).
-    /// `self.scratch_entries` is populated with the entries that were sent.
+    /// Prepare entry metadata and read payloads from storage.
     pub(crate) fn build_append_for_peer(
         &mut self,
         peer: PeerId,
-    ) -> Result<(Bytes, LogIndex), RaftError> {
+    ) -> Result<(LogIndex, Term, LogIndex), RaftError> {
         let progress = self
             .peer_progress
             .get(&peer)
             .copied()
             .ok_or(RaftError::PeerUnknown(peer))?;
         let prev_log_index = LogIndex(progress.next_index.0.saturating_sub(1));
-        let prev_log_term  = self.term_at(prev_log_index)?;
+        let prev_log_term = self.term_at(prev_log_index)?;
         self.scratch_entries.clear();
+
+        // Pass a dummy buffer or reuse scratch_outbound if storage needs it for temporary read
+
+        // Safety: scratch_entries in the struct is Vec<LogEntry<'static>>.
+        // We transmute it to Vec<LogEntry<'_>> for the duration of the storage call.
+        let scratch_ref = unsafe {
+            std::mem::transmute::<&mut Vec<crate::LogEntry<'static>>, &mut Vec<crate::LogEntry<'_>>>(
+                &mut self.scratch_entries,
+            )
+        };
+
         self.storage.read_entries(
             progress.next_index,
             LogIndex(u64::MAX),
-            &mut self.scratch_entries,
+            scratch_ref,
+            &mut self.scratch_payload,
         )?;
+
         self.scratch_entries
             .truncate(self.config.limits.append_batch_entries.max(1));
 
-        let last_idx = self.scratch_entries.last()
+        let last_idx = self
+            .scratch_entries
+            .last()
             .map(|e| e.index)
             .unwrap_or(prev_log_index);
 
-        let frame = crate::protocol::encode_append_entries_frame(
-            self.config.node_id,
-            self.hard_state.current_term,
-            self.config.node_id,
-            prev_log_index,
-            prev_log_term,
-            self.soft_state.commit_index,
-            &self.scratch_entries,
-        )?;
-
-        Ok((frame, last_idx))
+        Ok((prev_log_index, prev_log_term, last_idx))
     }
 
     pub(crate) async fn send_append_attempt(
@@ -56,8 +56,28 @@ where
         peer: PeerId,
         _attempt: u64,
     ) -> Result<Option<LogIndex>, RaftError> {
-        let (frame, last_idx) = self.build_append_for_peer(peer)?;
-        if self.send_best_effort(peer, frame).await {
+        let (prev_idx, prev_term, last_idx) = self.build_append_for_peer(peer)?;
+
+        // Create AppendEntries metadata on stack
+        let req = crate::protocol::AppendEntries {
+            term: self.hard_state.current_term.0.into(),
+            leader_id: self.config.node_id.0.into(),
+            prev_log_index: prev_idx.0.into(),
+            prev_log_term: prev_term.0.into(),
+            leader_commit: self.soft_state.commit_index.0.into(),
+            entry_count: (self.scratch_entries.len() as u32).into(),
+            _pad: 0.into(),
+        };
+
+        // SAFETY: transmute from 'static storage to ephemeral for transport
+        let entries_ref = unsafe {
+            std::mem::transmute::<&[crate::LogEntry<'static>], &[crate::LogEntry<'_>]>(
+                &self.scratch_entries,
+            )
+        };
+
+        let msg = RaftMessage::AppendEntriesVectored(&req, entries_ref);
+        if self.send_message(peer, &msg).await {
             Ok(Some(last_idx))
         } else {
             Ok(None)
@@ -77,7 +97,7 @@ where
             self.peer_progress.insert(
                 peer,
                 super::super::progress::PeerProgress {
-                    next_index:  LogIndex(last_index.0 + 1),
+                    next_index: LogIndex(last_index.0 + 1),
                     match_index: LogIndex(0),
                 },
             );
@@ -92,21 +112,18 @@ where
         Ok(())
     }
 
-    pub(crate) fn term_at(&self, index: LogIndex) -> Result<Term, RaftError> {
+    pub(crate) fn term_at(&mut self, index: LogIndex) -> Result<Term, RaftError> {
         if index.0 == 0 {
             return Ok(Term(0));
         }
         self.storage
-            .entry_at(index)?
+            .entry_at(index, &mut self.scratch_payload)?
             .map(|e| e.term)
             .ok_or_else(|| RaftError::CorruptLog(format!("missing term at index {}", index.0)))
     }
 
     /// Check whether a quorum of peers has replicated the latest entries and, if so,
     /// advance `commit_index` to the highest index confirmed by a quorum.
-    ///
-    /// Per Raft §5.4.2, only entries from `current_term` may be committed this way.
-    /// `commit_index` is volatile — no `save_hard_state` needed.
     pub(crate) fn try_advance_commit_index(&mut self) -> Result<(), RaftError> {
         if self.peer_progress.is_empty() {
             return Ok(());
@@ -131,11 +148,11 @@ where
             return Ok(());
         }
         // Safety rule: only commit if the quorum entry belongs to current_term.
-        // Fast path: if quorum_index == cached last, term is already known.
         let quorum_term = if quorum_index == self.cached_last_log.0 {
             self.cached_last_log.1
         } else {
-            self.storage.entry_at(quorum_index)?
+            self.storage
+                .entry_at(quorum_index, &mut self.scratch_payload)?
                 .map(|e| e.term)
                 .unwrap_or(crate::Term(0))
         };
@@ -146,10 +163,15 @@ where
     }
 
     pub(crate) async fn drain_inbound_ready(&mut self) -> Result<(), RaftError> {
+        let mut drain_buf = vec![0; 64 * 1024]; // Scratch for drained packets
         loop {
-            match self.transport.recv_frame_timeout(Duration::ZERO).await? {
-                Some(raw) => {
-                    let inbound = crate::decode_message_view(raw)?;
+            match self
+                .transport
+                .recv_frame_timeout(Duration::ZERO, &mut drain_buf)
+                .await?
+            {
+                Some(n) => {
+                    let inbound = crate::decode_message(&drain_buf[..n])?;
                     self.handle_inbound(inbound).await?;
                 }
                 None => break,

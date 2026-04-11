@@ -1,12 +1,11 @@
 use crate::{LogIndex, Term};
-use bytes::Bytes;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EntryPayload(pub Bytes);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryPayload<'a>(pub &'a [u8]);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LogEntry {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogEntry<'a> {
     pub term: Term,
     pub index: LogIndex,
-    pub payload: EntryPayload,
+    pub payload: EntryPayload<'a>,
 }

@@ -1,280 +1,133 @@
-use bytes::{Bytes, BytesMut};
-use zerocopy::IntoBytes;
-
+use super::codec::wire::{
+    AppendEntries, AppendEntriesResp, EntryHeader, InstallSnapshot, InstallSnapshotResp,
+    RequestVote, RequestVoteResp,
+};
 use crate::{EntryPayload, LogEntry, LogIndex, PeerId, RaftError, SnapshotMeta, Term};
+use zerocopy::{FromBytes, Ref};
 
-use super::codec::{validate_append_entries_body, AppendEntriesBody, EntryHeader, EntryHeaderView};
-
-// Protocol message types are internal wire intermediaries.
-// Their serialization format is defined in codec.rs (zerocopy).
-// No serde derives here — users who need to log or persist
-// these types have access to the raw Bytes from encode_message.
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestVote {
-    pub term: Term,
-    pub candidate_id: PeerId,
-    pub last_log_index: LogIndex,
-    pub last_log_term: Term,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaftMessage<'a> {
+    RequestVote(&'a RequestVote),
+    RequestVoteResp(&'a RequestVoteResp),
+    AppendEntries(&'a AppendEntries, &'a [u8]), // Body + Raw payload (for inbound)
+    AppendEntriesVectored(&'a AppendEntries, &'a [LogEntry<'a>]), // Body + Parsed entries (for outbound)
+    AppendEntriesResp(&'a AppendEntriesResp),
+    InstallSnapshot(&'a InstallSnapshot, &'a [u8]),
+    InstallSnapshotResp(&'a InstallSnapshotResp),
+    Custom(&'a [u8]),
+    CustomResponse(&'a [u8]),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestVoteResp {
-    pub term: Term,
-    pub vote_granted: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InboundRaftMessage<'a> {
+    pub from: PeerId,
+    pub message: RaftMessage<'a>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppendEntries {
-    bytes: Bytes,
-}
-
-impl AppendEntries {
-    /// Build an `AppendEntries` message from components.
-    ///
-    /// Validates the resulting byte layout. Use the public API when constructing
-    /// messages outside the node (e.g. in tests).
-    pub fn new(
-        term: Term,
-        leader_id: PeerId,
-        prev_log_index: LogIndex,
-        prev_log_term: Term,
-        leader_commit: LogIndex,
-        entries: &[LogEntry],
-    ) -> Result<Self, RaftError> {
-        let bytes = Self::build_bytes(term, leader_id, prev_log_index, prev_log_term, leader_commit, entries)?;
-        validate_append_entries_body(bytes.as_ref())?;
-        Ok(Self { bytes })
-    }
-
-    fn build_bytes(
-        term: Term,
-        leader_id: PeerId,
-        prev_log_index: LogIndex,
-        prev_log_term: Term,
-        leader_commit: LogIndex,
-        entries: &[LogEntry],
-    ) -> Result<Bytes, RaftError> {
-        let mut body_len = std::mem::size_of::<AppendEntriesBody>();
-        for entry in entries {
-            body_len = body_len
-                .checked_add(std::mem::size_of::<EntryHeader>())
-                .and_then(|value| value.checked_add(entry.payload.0.len()))
-                .ok_or_else(|| RaftError::Protocol("append entries body overflow".into()))?;
+impl<'a> InboundRaftMessage<'a> {
+    pub fn as_append_entries(&self) -> Option<super::codec::AppendEntriesView<'a>> {
+        if let RaftMessage::AppendEntries(msg, payload) = self.message {
+            Some(super::codec::AppendEntriesView::new(msg, payload))
+        } else {
+            None
         }
+    }
 
-        let mut bytes = BytesMut::with_capacity(body_len);
-        let body = AppendEntriesBody {
-            term: term.0.into(),
-            leader_id: leader_id.0.into(),
-            prev_log_index: prev_log_index.0.into(),
-            prev_log_term: prev_log_term.0.into(),
-            leader_commit: leader_commit.0.into(),
-            entry_count: (entries.len() as u32).into(),
-            _pad: 0.into(),
-        };
-        bytes.extend_from_slice(body.as_bytes());
-
-        for entry in entries {
-            let header = EntryHeader {
-                term: entry.term.0.into(),
-                index: entry.index.0.into(),
-                payload_len: (entry.payload.0.len() as u32).into(),
-                _pad: 0.into(),
-            };
-            bytes.extend_from_slice(header.as_bytes());
-            // Bytes::extend_from_slice writes the payload once — no extra copy here.
-            bytes.extend_from_slice(entry.payload.0.as_ref());
+    pub fn as_request_vote(&self) -> Option<&'a RequestVote> {
+        if let RaftMessage::RequestVote(msg) = self.message {
+            Some(msg)
+        } else {
+            None
         }
-
-        Ok(bytes.freeze())
     }
 
-    pub(crate) fn from_validated_bytes(bytes: Bytes) -> Self {
-        Self { bytes }
+    pub fn as_request_vote_resp(&self) -> Option<&'a RequestVoteResp> {
+        if let RaftMessage::RequestVoteResp(msg) = self.message {
+            Some(msg)
+        } else {
+            None
+        }
     }
 
-    #[inline]
-    pub fn bytes(&self) -> &Bytes {
-        &self.bytes
+    pub fn as_append_entries_resp(&self) -> Option<&'a AppendEntriesResp> {
+        if let RaftMessage::AppendEntriesResp(msg) = self.message {
+            Some(msg)
+        } else {
+            None
+        }
     }
 
-    #[inline]
-    pub fn term(&self) -> Term {
-        Term(self.body_u64(0))
+    pub fn as_install_snapshot(&self) -> Option<(&'a InstallSnapshot, &'a [u8])> {
+        if let RaftMessage::InstallSnapshot(msg, payload) = self.message {
+            Some((msg, payload))
+        } else {
+            None
+        }
     }
 
-    #[inline]
-    pub fn leader_id(&self) -> PeerId {
-        PeerId(self.body_u64(8))
+    pub fn as_install_snapshot_resp(&self) -> Option<&'a InstallSnapshotResp> {
+        if let RaftMessage::InstallSnapshotResp(msg) = self.message {
+            Some(msg)
+        } else {
+            None
+        }
     }
 
-    #[inline]
-    pub fn prev_log_index(&self) -> LogIndex {
-        LogIndex(self.body_u64(16))
+    pub fn as_custom(&self) -> Option<&'a [u8]> {
+        if let RaftMessage::Custom(payload) = self.message {
+            Some(payload)
+        } else {
+            None
+        }
     }
 
-    #[inline]
-    pub fn prev_log_term(&self) -> Term {
-        Term(self.body_u64(24))
-    }
-
-    #[inline]
-    pub fn leader_commit(&self) -> LogIndex {
-        LogIndex(self.body_u64(32))
-    }
-
-    #[inline]
-    pub fn entry_count(&self) -> usize {
-        self.body_u32(40) as usize
-    }
-
-    pub fn entries(&self) -> Result<AppendEntriesEntryIter<'_>, RaftError> {
-        AppendEntriesEntryIter::new(&self.bytes)
-    }
-
-    #[inline]
-    fn body_u64(&self, offset: usize) -> u64 {
-        let end = offset + 8;
-        u64::from_le_bytes(self.bytes[offset..end].try_into().unwrap())
-    }
-
-    #[inline]
-    fn body_u32(&self, offset: usize) -> u32 {
-        let end = offset + 4;
-        u32::from_le_bytes(self.bytes[offset..end].try_into().unwrap())
+    pub fn as_custom_response(&self) -> Option<&'a [u8]> {
+        if let RaftMessage::CustomResponse(payload) = self.message {
+            Some(payload)
+        } else {
+            None
+        }
     }
 }
 
 pub struct AppendEntriesEntryIter<'a> {
-    body: &'a Bytes,
+    payload: &'a [u8],
     remaining: usize,
-    offset: usize,
 }
 
 impl<'a> AppendEntriesEntryIter<'a> {
-    fn new(body: &'a Bytes) -> Result<Self, RaftError> {
-        validate_append_entries_body(body.as_ref())?;
-        Ok(Self {
-            body,
-            remaining: u32::from_le_bytes(body[40..44].try_into().unwrap()) as usize,
-            offset: std::mem::size_of::<AppendEntriesBody>(),
-        })
+    pub fn new(payload: &'a [u8], count: usize) -> Self {
+        Self {
+            payload,
+            remaining: count,
+        }
     }
 }
 
 impl<'a> Iterator for AppendEntriesEntryIter<'a> {
-    type Item = AppendEntriesEntryView<'a>;
+    type Item = LogEntry<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.remaining == 0 {
             return None;
         }
 
-        let view = EntryHeaderView::parse(self.body.as_ref(), self.offset).ok()?;
-        self.offset = view.payload_end();
+        let (header_ref, rest) = Ref::<&'a [u8], EntryHeader>::from_prefix(self.payload).ok()?;
+        let header = Ref::into_ref(header_ref);
+        let len = header.payload_len.get() as usize;
+
+        if rest.len() < len {
+            return None;
+        }
+
+        let (data, next_payload) = rest.split_at(len);
+        self.payload = next_payload;
         self.remaining -= 1;
-        Some(AppendEntriesEntryView {
-            body: self.body,
-            header_offset: view.header_offset(),
+
+        Some(LogEntry {
+            term: Term(header.term.get()),
+            index: LogIndex(header.index.get()),
+            payload: EntryPayload(data),
         })
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct AppendEntriesEntryView<'a> {
-    body: &'a Bytes,
-    header_offset: usize,
-}
-
-impl<'a> AppendEntriesEntryView<'a> {
-    #[inline]
-    fn header_view(&self) -> EntryHeaderView<'_> {
-        EntryHeaderView::parse(self.body.as_ref(), self.header_offset).unwrap()
-    }
-
-    #[inline]
-    pub fn term(&self) -> Term {
-        Term(self.header_view().term())
-    }
-
-    #[inline]
-    pub fn index(&self) -> LogIndex {
-        LogIndex(self.header_view().index())
-    }
-
-    #[inline]
-    pub fn payload(&self) -> Bytes {
-        let header = self.header_view();
-        self.body.slice(header.payload_start()..header.payload_end())
-    }
-
-    /// Convert to an owned `LogEntry`.
-    ///
-    /// `payload()` is a `Bytes::slice` — an Arc reference bump, not a data copy.
-    #[inline]
-    pub fn to_owned(&self) -> LogEntry {
-        LogEntry {
-            term: self.term(),
-            index: self.index(),
-            payload: EntryPayload(self.payload()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppendEntriesResp {
-    pub term: Term,
-    pub success: bool,
-    pub match_index: LogIndex,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SnapshotChunk {
-    pub offset: u64,
-    pub bytes: Bytes,
-    pub done: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstallSnapshot {
-    pub term: Term,
-    pub leader_id: PeerId,
-    pub meta: SnapshotMeta,
-    pub chunk: SnapshotChunk,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstallSnapshotResp {
-    pub term: Term,
-    pub accepted: bool,
-    pub next_offset: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RaftCustomMessage {
-    pub bytes: Bytes,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RaftCustomResponse {
-    pub bytes: Bytes,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RaftMessage {
-    RequestVote(RequestVote),
-    RequestVoteResp(RequestVoteResp),
-    AppendEntries(AppendEntries),
-    AppendEntriesResp(AppendEntriesResp),
-    InstallSnapshot(InstallSnapshot),
-    InstallSnapshotResp(InstallSnapshotResp),
-    Custom(RaftCustomMessage),
-    CustomResponse(RaftCustomResponse),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InboundRaftMessage {
-    pub from: PeerId,
-    pub message: RaftMessage,
 }

@@ -19,17 +19,23 @@ use std::time::Duration;
 
 use arbitro_raft::{
     BootstrapPeer, ClusterId, DispatchAckPolicy, DispatchPeerState, DispatchScope, DispatchSpec,
-    HardState, LogEntry, LogIndex, NodeConfig, PeerId, RaftError, RaftNode, RaftStorage,
-    RaftTransport, SnapshotMeta, Term,
+    EntryPayload, HardState, LogEntry, LogIndex, NodeConfig, PeerId, RaftError, RaftMessage,
+    RaftNode, RaftStorage, RaftTransport, SnapshotMeta, Term,
 };
 use async_trait::async_trait;
-use bytes::Bytes;
 
-// ── Minimal storage / transport (identical to basic_raft.rs) ─────────────────
+// ── Minimal storage / transport ── (Simplistic for example)
+
+#[derive(Clone, Default)]
+struct StoredEntry {
+    term: Term,
+    index: LogIndex,
+    payload: Vec<u8>,
+}
 
 #[derive(Clone, Default)]
 struct MemStorage {
-    entries: Arc<Mutex<Vec<LogEntry>>>,
+    entries: Arc<Mutex<Vec<StoredEntry>>>,
     hard_state: Arc<Mutex<HardState>>,
 }
 
@@ -42,24 +48,46 @@ impl RaftStorage for MemStorage {
         Ok(())
     }
     fn append_entries(&self, new: &[LogEntry]) -> Result<(), RaftError> {
-        self.entries.lock().unwrap().extend_from_slice(new);
+        let mut entries = self.entries.lock().unwrap();
+        for e in new {
+            entries.push(StoredEntry {
+                term: e.term,
+                index: e.index,
+                payload: e.payload.0.to_vec(),
+            });
+        }
         Ok(())
     }
-    fn read_entries(
+    fn read_entries<'a>(
         &self,
         from: LogIndex,
         to: LogIndex,
-        out: &mut Vec<LogEntry>,
-    ) -> Result<(), RaftError> {
-        out.extend(
-            self.entries
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|e| e.index >= from && e.index < to)
-                .cloned(),
-        );
-        Ok(())
+        out: &mut Vec<LogEntry<'a>>,
+        payload_buf: &'a mut [u8],
+    ) -> Result<usize, RaftError> {
+        let entries = self.entries.lock().unwrap();
+        let mut offset = 0;
+        let mut rest = payload_buf;
+
+        for e in entries.iter().filter(|e| e.index >= from && e.index < to) {
+            let len = e.payload.len();
+            if len > rest.len() {
+                break;
+            }
+
+            let (target, next_rest) = rest.split_at_mut(len);
+            target.copy_from_slice(&e.payload);
+
+            out.push(LogEntry {
+                term: e.term,
+                index: e.index,
+                payload: EntryPayload(target),
+            });
+
+            offset += len;
+            rest = next_rest;
+        }
+        Ok(offset)
     }
     fn truncate_suffix(&self, from: LogIndex) -> Result<(), RaftError> {
         self.entries.lock().unwrap().retain(|e| e.index < from);
@@ -80,14 +108,26 @@ impl RaftStorage for MemStorage {
             .map(|e| (e.index, e.term))
             .unwrap_or((LogIndex(0), Term(0))))
     }
-    fn entry_at(&self, index: LogIndex) -> Result<Option<LogEntry>, RaftError> {
-        Ok(self
-            .entries
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|e| e.index == index)
-            .cloned())
+    fn entry_at<'a>(
+        &self,
+        index: LogIndex,
+        payload_buf: &'a mut [u8],
+    ) -> Result<Option<LogEntry<'a>>, RaftError> {
+        let entries = self.entries.lock().unwrap();
+        if let Some(e) = entries.iter().find(|e| e.index == index) {
+            let len = e.payload.len();
+            if len > payload_buf.len() {
+                return Err(RaftError::Transport("buffer too small".into()));
+            }
+            payload_buf[..len].copy_from_slice(&e.payload);
+            Ok(Some(LogEntry {
+                term: e.term,
+                index: e.index,
+                payload: EntryPayload(&payload_buf[..len]),
+            }))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -95,38 +135,30 @@ struct NoopTransport;
 
 #[async_trait]
 impl RaftTransport for NoopTransport {
-    async fn send_frame(&self, _: PeerId, _: Bytes) -> Result<(), RaftError> {
+    async fn send_vectored(&self, _: PeerId, _: &[&[u8]]) -> Result<(), RaftError> {
         Ok(())
     }
-    async fn recv_frame(&self) -> Result<Bytes, RaftError> {
+    async fn recv_frame(&self, _: &mut [u8]) -> Result<usize, RaftError> {
         futures::future::pending().await
     }
-    async fn recv_frame_timeout(&self, _: Duration) -> Result<Option<Bytes>, RaftError> {
+    async fn recv_frame_timeout(
+        &self,
+        _: Duration,
+        _: &mut [u8],
+    ) -> Result<Option<usize>, RaftError> {
         Ok(None)
     }
 }
 
-// ── Dispatch spec — "Ping" RPC: String → String ───────────────────────────────
-//
-// `DispatchSpec` is `Copy`, so you can freely pass or store it by value.
-// The five arguments are:
-//   1. command ID — a u8 that uniquely identifies this RPC in the cluster
-//   2. encode_params   — fn(&Params) → Bytes
-//   3. decode_params   — fn(&[u8])   → Params
-//   4. encode_response — fn(&Resp)   → Bytes
-//   5. decode_response — fn(&[u8])   → Resp
-
 fn ping() -> DispatchSpec<String, String> {
     DispatchSpec::new(
         0x01,
-        |s| Ok(Bytes::copy_from_slice(s.as_bytes())),
+        |s| Ok(s.as_bytes().to_vec()),
         |b| Ok(String::from_utf8_lossy(b).into_owned()),
-        |s| Ok(Bytes::copy_from_slice(s.as_bytes())),
+        |s| Ok(s.as_bytes().to_vec()),
         |b| Ok(String::from_utf8_lossy(b).into_owned()),
     )
 }
-
-// ── Main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() {
@@ -146,32 +178,23 @@ async fn main() {
     #[allow(deprecated)]
     node.become_leader_for_benchmark(Term(1));
 
-    // Build the spec once — `DispatchSpec` is `Copy` so reuse is free.
     let spec = ping()
         .with_scope(DispatchScope::LocalOnly)
         .with_ack_policy(DispatchAckPolicy::All);
 
-    // 1. Register the handler — runs on any node that should respond to PING.
-    //    The closure receives (decoded_params, DispatchContextView).
-    //    Call ctx.accept_bytes / ctx.reject / ctx.fail to send back a response.
     node.on_with(spec, |question: String, ctx| {
         Box::pin(async move {
             let answer = format!("pong: {question}");
-            ctx.accept_bytes(Bytes::copy_from_slice(answer.as_bytes()))
-                .await
+            ctx.accept_bytes(answer.as_bytes().to_vec()).await
         })
     })
     .unwrap();
 
-    // 2. Dispatch — fires the RPC, returns a handle immediately.
-    //    LocalOnly: handler is invoked in-process with no transport involved.
     let handle = node
         .dispatch(spec, "hello from leader".to_string())
         .await
         .unwrap();
 
-    // 3. Wait for the required acknowledgements (DispatchAckPolicy::All = every
-    //    targeted peer must respond).
     let result = handle.wait().await.unwrap();
 
     for peer_result in &result.peers {

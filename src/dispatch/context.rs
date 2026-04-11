@@ -1,6 +1,4 @@
 use async_trait::async_trait;
-use bytes::Bytes;
-
 use crate::dispatch::DispatchSpec;
 use crate::RaftError;
 
@@ -17,7 +15,7 @@ pub struct DispatchResponse {
     pub tx_id: u64,
     pub command: u8,
     pub kind: DispatchResponseKind,
-    pub payload: Bytes,
+    pub payload: Vec<u8>,
 }
 
 #[async_trait]
@@ -27,10 +25,9 @@ pub trait DispatchResponder: Send + Sync {
 
 #[async_trait]
 pub trait DispatchRequester: Send + Sync {
-    async fn request(&self, command: u8, payload: Bytes) -> Result<Bytes, RaftError>;
+    async fn request(&self, command: u8, payload: &[u8]) -> Result<Vec<u8>, RaftError>;
 }
 
-#[derive(Clone, Copy)]
 pub struct DispatchStreamView<'a> {
     requester: &'a dyn DispatchRequester,
 }
@@ -40,7 +37,7 @@ impl<'a> DispatchStreamView<'a> {
         Self { requester }
     }
 
-    pub async fn request_bytes(&self, command: u8, payload: Bytes) -> Result<Bytes, RaftError> {
+    pub async fn request_bytes(&self, command: u8, payload: &[u8]) -> Result<Vec<u8>, RaftError> {
         self.requester.request(command, payload).await
     }
 
@@ -49,11 +46,12 @@ impl<'a> DispatchStreamView<'a> {
         spec: &DispatchSpec<P, R>,
         params: &P,
     ) -> Result<R, RaftError> {
+        // Encoding params might still use a temporary Vec<u8> from DispatchSpec
         let response = self
             .requester
-            .request(spec.command(), spec.encode_params(params)?)
+            .request(spec.command(), &spec.encode_params(params)?)
             .await?;
-        spec.decode_response(response.as_ref())
+        spec.decode_response(&response)
     }
 }
 
@@ -100,7 +98,7 @@ impl<'a> DispatchContextView<'a> {
         self.requester.map(DispatchStreamView::new)
     }
 
-    pub async fn request_bytes(&self, command: u8, payload: Bytes) -> Result<Bytes, RaftError> {
+    pub async fn request_bytes(&self, command: u8, payload: &[u8]) -> Result<Vec<u8>, RaftError> {
         let Some(requester) = self.requester else {
             return Err(RaftError::Dispatch("dispatch stream unavailable".into()));
         };
@@ -113,12 +111,12 @@ impl<'a> DispatchContextView<'a> {
         params: &P,
     ) -> Result<R, RaftError> {
         let response = self
-            .request_bytes(spec.command(), spec.encode_params(params)?)
+            .request_bytes(spec.command(), &spec.encode_params(params)?)
             .await?;
-        spec.decode_response(response.as_ref())
+        spec.decode_response(&response)
     }
 
-    pub async fn accept_bytes(&self, payload: Bytes) -> Result<(), RaftError> {
+    pub async fn accept_bytes(&self, payload: Vec<u8>) -> Result<(), RaftError> {
         self.responder
             .send_response(DispatchResponse {
                 tx_id: self.tx_id,
@@ -134,7 +132,7 @@ impl<'a> DispatchContextView<'a> {
         spec: &DispatchSpec<P, R>,
         value: &R,
     ) -> Result<(), RaftError> {
-        self.accept_bytes(spec.encode_response(value)?).await
+        self.accept_bytes(spec.encode_response(value)?.to_vec()).await
     }
 
     pub async fn reject(&self, reason: impl Into<String>) -> Result<(), RaftError> {
@@ -143,12 +141,12 @@ impl<'a> DispatchContextView<'a> {
                 tx_id: self.tx_id,
                 command: self.command,
                 kind: DispatchResponseKind::Rejected,
-                payload: Bytes::from(reason.into()),
+                payload: reason.into().into_bytes(),
             })
             .await
     }
 
-    pub async fn progress_bytes(&self, payload: Bytes) -> Result<(), RaftError> {
+    pub async fn progress_bytes(&self, payload: Vec<u8>) -> Result<(), RaftError> {
         self.responder
             .send_response(DispatchResponse {
                 tx_id: self.tx_id,
@@ -165,7 +163,7 @@ impl<'a> DispatchContextView<'a> {
                 tx_id: self.tx_id,
                 command: self.command,
                 kind: DispatchResponseKind::Failed,
-                payload: Bytes::from(error.into()),
+                payload: error.into().into_bytes(),
             })
             .await
     }

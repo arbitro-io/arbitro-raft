@@ -1,19 +1,22 @@
-mod decode;
-mod encode;
-pub(crate) mod wire;
+pub mod decode;
+pub mod encode;
+pub mod wire;
+pub mod view;
 
 pub(crate) use decode::validate_append_entries_body;
 pub use decode::{
-    decode_message, decode_message_view, parse_append_entries_resp_view, parse_append_entries_view,
-    parse_custom_message_view, parse_custom_response_view, parse_install_snapshot_resp_view,
-    parse_install_snapshot_view, parse_raft_frame_view, parse_request_vote_resp_view,
-    parse_request_vote_view,
+    decode_message,
 };
-pub use encode::{encode_message, encode_message_into};
-pub(crate) use encode::encode_append_entries_frame;
-pub(crate) use wire::{AppendEntriesBody, EntryHeader};
+pub use view::AppendEntriesView;
+
+pub use encode::{
+    encode_append_entries_vectored, encode_message_vectored,
+};
+
 pub use wire::{
-    EntryHeaderView, KIND_APPEND_ENTRIES, KIND_APPEND_ENTRIES_RESP, KIND_CUSTOM,
+    AppendEntries, AppendEntriesResp, EntryHeader, InstallSnapshot, InstallSnapshotResp,
+    RequestVote, RequestVoteResp,
+    KIND_APPEND_ENTRIES, KIND_APPEND_ENTRIES_RESP, KIND_CUSTOM,
     KIND_CUSTOM_RESPONSE, KIND_INSTALL_SNAPSHOT, KIND_INSTALL_SNAPSHOT_RESP, KIND_REQUEST_VOTE,
     KIND_REQUEST_VOTE_RESP, RAFT_FRAME_HEADER_SIZE, RAFT_MAGIC, RAFT_VERSION,
 };
