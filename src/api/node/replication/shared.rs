@@ -56,6 +56,60 @@ where
         peer: PeerId,
         _attempt: u64,
     ) -> Result<Option<LogIndex>, RaftError> {
+        let progress = self
+            .peer_progress
+            .get(&peer)
+            .copied()
+            .ok_or(RaftError::PeerUnknown(peer))?;
+        let next_index = progress.next_index;
+
+        // ── 1. Attempt MAGIC ZEROCOPY Path ─────────────────────────────────────
+        if let Ok(Some(headers)) = self.storage.read_entry_headers(next_index, LogIndex(u64::MAX)) {
+            let limit = self.config.limits.append_batch_entries.max(1);
+            let headers = if headers.len() > limit { &headers[..limit] } else { headers };
+            
+            if !headers.is_empty() {
+                let last_idx = LogIndex(headers.last().unwrap().index.get());
+                
+                // Collect payloads using scratchpad (Zero-Alloc)
+                self.scratch_payload_refs.clear();
+                let to_idx = LogIndex(next_index.0 + headers.len() as u64 - 1);
+                
+                let scratch_ptr = &mut self.scratch_payload_refs;
+                self.storage.for_each_payload(next_index, to_idx, &mut |p| {
+                     // SAFETY: Pointers are ephemeral and cleared after send_message
+                     scratch_ptr.push(unsafe { std::mem::transmute::<&[u8], &'static [u8]>(p) });
+                })?;
+
+                let prev_idx = LogIndex(next_index.0.saturating_sub(1));
+                let prev_term = self.term_at(prev_idx)?;
+
+                let req = crate::protocol::AppendEntries {
+                    term: self.hard_state.current_term.0.into(),
+                    leader_id: self.config.node_id.0.into(),
+                    prev_log_index: prev_idx.0.into(),
+                    prev_log_term: prev_term.0.into(),
+                    leader_commit: self.soft_state.commit_index.0.into(),
+                    entry_count: (headers.len() as u32).into(),
+                    _pad: 0.into(),
+                };
+
+                let msg = RaftMessage::AppendEntriesSeeded {
+                    ae: &req,
+                    headers: headers.as_bytes(),
+                    payloads: &self.scratch_payload_refs,
+                };
+                
+                if self.send_message(peer, &msg).await {
+                    self.scratch_payload_refs.clear();
+                    return Ok(Some(last_idx));
+                }
+                self.scratch_payload_refs.clear();
+                return Ok(None);
+            }
+        }
+
+        // ── 2. Fallback to ERGONOMIC Path ──────────────────────────────────────
         let (prev_idx, prev_term, last_idx) = self.build_append_for_peer(peer)?;
 
         // Create AppendEntries metadata on stack

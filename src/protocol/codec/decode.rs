@@ -101,6 +101,23 @@ pub fn decode_message<'a>(frame: &'a [u8]) -> Result<InboundRaftMessage<'a>, Raf
             }
             RaftMessage::AppendEntriesResp(wire)
         }
+        KIND_APPEND_ENTRIES_SEEDED => {
+            let (ae, body_rest) =
+                parse_prefix::<AppendEntries>(body, "append entries seeded body")?;
+            let count = ae.entry_count.get() as usize;
+            let headers_len = count * std::mem::size_of::<EntryHeader>();
+
+            if body_rest.len() < headers_len {
+                return Err(RaftError::Protocol("short seeded headers block".into()));
+            }
+
+            let (headers, payloads) = body_rest.split_at(headers_len);
+            RaftMessage::AppendEntriesSeeded {
+                ae,
+                headers,
+                payloads,
+            }
+        }
         KIND_INSTALL_SNAPSHOT => {
             let (wire, body_rest) = parse_prefix::<InstallSnapshot>(body, "install snapshot body")?;
             let chunk_len = wire.chunk_len.get() as usize;

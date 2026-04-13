@@ -1,6 +1,8 @@
 use super::super::progress::{AppendAdvance, AppendAttemptState};
 use super::super::RaftNode;
-use crate::protocol::{AppendEntries, AppendEntriesEntryIter, AppendEntriesResp};
+use crate::protocol::{AppendEntries, AppendEntriesEntryIter, AppendEntriesResp, AppendEntriesRawIter};
+use crate::protocol::codec::wire::EntryHeader;
+use zerocopy::{IntoBytes, Ref};
 use crate::{LogIndex, PeerId, RaftError, RaftMessage, Role};
 
 impl<S, T> RaftNode<S, T>
@@ -60,6 +62,52 @@ where
         Ok(())
     }
 
+    fn apply_append_entries_seeded(
+        &mut self,
+        msg: &AppendEntries,
+        headers_bytes: &[u8],
+        payloads: &[&[u8]],
+    ) -> Result<(), RaftError> {
+        let entry_count = msg.entry_count.get() as usize;
+        let mut append_from = entry_count;
+
+        let iter = AppendEntriesRawIter::new(headers_bytes, payloads);
+        for (idx, (incoming_header, _)) in iter.enumerate() {
+            let mut dummy = [0u8; 8];
+            let incoming_index = LogIndex(incoming_header.index.get());
+            let incoming_term = crate::Term(incoming_header.term.get());
+
+            match self.storage.entry_at(incoming_index, &mut dummy)? {
+                Some(local) if local.term == incoming_term => {}
+                Some(_) => {
+                    self.storage_truncate(incoming_index)?;
+                    append_from = idx;
+                    break;
+                }
+                None => {
+                    append_from = idx;
+                    break;
+                }
+            }
+        }
+
+        if append_from < entry_count {
+            let headers_ref = Ref::<&[u8], [EntryHeader]>::from_bytes(headers_bytes)
+                .map_err(|_| RaftError::Protocol("header alignment in seeded batch".into()))?;
+            let headers = Ref::into_ref(headers_ref);
+            
+            let final_headers = &headers[append_from..];
+            let final_payloads = &payloads[append_from..];
+
+            self.storage.append_entries_seeded(final_headers, final_payloads)?;
+
+            if let Some(last) = final_headers.last() {
+                self.cached_last_log = (LogIndex(last.index.get()), crate::Term(last.term.get()));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn handle_append_entries(
         &mut self,
         from: PeerId,
@@ -113,6 +161,77 @@ where
         }
 
         self.apply_append_entries(msg, payload)?;
+
+        let last_log_index = self.cached_last_log.0;
+        if leader_commit > self.soft_state.commit_index {
+            self.soft_state.commit_index = LogIndex(leader_commit.0.min(last_log_index.0));
+        }
+
+        let resp = AppendEntriesResp {
+            term: self.hard_state.current_term.0.into(),
+            success: 1,
+            match_index: last_log_index.0.into(),
+            _pad: [0; 7],
+        };
+        self.send_message(from, &RaftMessage::AppendEntriesResp(&resp))
+            .await;
+        Ok(())
+    }
+
+    pub(crate) async fn handle_append_entries_seeded(
+        &mut self,
+        from: PeerId,
+        msg: &AppendEntries,
+        headers_bytes: &[u8],
+        payloads: &[&[u8]],
+    ) -> Result<(), RaftError> {
+        let term = crate::Term(msg.term.get());
+        let leader_id = PeerId(msg.leader_id.get());
+        let prev_log_idx = LogIndex(msg.prev_log_index.get());
+        let prev_log_term = crate::Term(msg.prev_log_term.get());
+        let leader_commit = LogIndex(msg.leader_commit.get());
+
+        if term.0 < self.hard_state.current_term.0 {
+            let resp = AppendEntriesResp {
+                term: self.hard_state.current_term.0.into(),
+                success: 0,
+                match_index: self.cached_last_log.0 .0.into(),
+                _pad: [0; 7],
+            };
+            self.send_message(from, &RaftMessage::AppendEntriesResp(&resp))
+                .await;
+            return Ok(());
+        }
+        if term.0 > self.hard_state.current_term.0 {
+            self.step_down(term)?;
+        }
+        self.soft_state.role = Role::Follower;
+        self.soft_state.is_leader = false;
+        self.soft_state.leader_id = Some(leader_id);
+
+        let prev_ok = if prev_log_idx.0 == 0 {
+            true
+        } else {
+            let mut dummy = [0; 8];
+            self.storage
+                .entry_at(prev_log_idx, &mut dummy)?
+                .map(|e| e.term == prev_log_term)
+                .unwrap_or(false)
+        };
+
+        if !prev_ok {
+            let resp = AppendEntriesResp {
+                term: self.hard_state.current_term.0.into(),
+                success: 0,
+                match_index: self.cached_last_log.0 .0.into(),
+                _pad: [0; 7],
+            };
+            self.send_message(from, &RaftMessage::AppendEntriesResp(&resp))
+                .await;
+            return Ok(());
+        }
+
+        self.apply_append_entries_seeded(msg, headers_bytes, payloads)?;
 
         let last_log_index = self.cached_last_log.0;
         if leader_commit > self.soft_state.commit_index {

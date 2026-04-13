@@ -1,8 +1,9 @@
 use super::wire::{
     AppendEntries, AppendEntriesResp, EntryHeader, InstallSnapshot, InstallSnapshotResp,
     RaftFrameHeader, RequestVote, RequestVoteResp, KIND_APPEND_ENTRIES, KIND_APPEND_ENTRIES_RESP,
-    KIND_CUSTOM, KIND_CUSTOM_RESPONSE, KIND_INSTALL_SNAPSHOT, KIND_INSTALL_SNAPSHOT_RESP,
-    KIND_REQUEST_VOTE, KIND_REQUEST_VOTE_RESP, RAFT_FRAME_HEADER_SIZE, RAFT_MAGIC, RAFT_VERSION,
+    KIND_APPEND_ENTRIES_SEEDED, KIND_CUSTOM, KIND_CUSTOM_RESPONSE, KIND_INSTALL_SNAPSHOT,
+    KIND_INSTALL_SNAPSHOT_RESP, KIND_REQUEST_VOTE, KIND_REQUEST_VOTE_RESP, RAFT_FRAME_HEADER_SIZE,
+    RAFT_MAGIC, RAFT_VERSION,
 };
 use crate::{LogEntry, LogIndex, PeerId, RaftError, RaftMessage, Term};
 use zerocopy::{IntoBytes, Ref};
@@ -75,6 +76,18 @@ pub fn encode_message_vectored<'a>(
         RaftMessage::AppendEntriesResp(m) => {
             out_vectored.push(&header_buf[..RAFT_FRAME_HEADER_SIZE]);
             out_vectored.push(m.as_bytes());
+        }
+        RaftMessage::AppendEntriesSeeded { ae, headers, payloads } => {
+            out_vectored.push(&header_buf[..RAFT_FRAME_HEADER_SIZE]);
+            out_vectored.push(ae.as_bytes());
+            if !headers.is_empty() {
+                out_vectored.push(headers);
+            }
+            for p in *payloads {
+                if !p.is_empty() {
+                    out_vectored.push(p);
+                }
+            }
         }
         RaftMessage::InstallSnapshot(m, p) => {
             out_vectored.push(&header_buf[..RAFT_FRAME_HEADER_SIZE]);
@@ -201,6 +214,7 @@ fn kind_of(msg: &RaftMessage) -> u8 {
         RaftMessage::AppendEntries(_, _) => KIND_APPEND_ENTRIES,
         RaftMessage::AppendEntriesVectored(_, _) => KIND_APPEND_ENTRIES,
         RaftMessage::AppendEntriesResp(_) => KIND_APPEND_ENTRIES_RESP,
+        RaftMessage::AppendEntriesSeeded { .. } => KIND_APPEND_ENTRIES_SEEDED,
         RaftMessage::InstallSnapshot(_, _) => KIND_INSTALL_SNAPSHOT,
         RaftMessage::InstallSnapshotResp(_) => KIND_INSTALL_SNAPSHOT_RESP,
         RaftMessage::Custom(_) => KIND_CUSTOM,
@@ -221,6 +235,13 @@ fn body_total_len(msg: &RaftMessage) -> usize {
             len
         }
         RaftMessage::AppendEntriesResp(m) => m.as_bytes().len(),
+        RaftMessage::AppendEntriesSeeded { ae, headers, payloads } => {
+            let mut len = ae.as_bytes().len() + headers.len();
+            for p in *payloads {
+                len += p.len();
+            }
+            len
+        }
         RaftMessage::InstallSnapshot(m, p) => m.as_bytes().len() + p.len(),
         RaftMessage::InstallSnapshotResp(m) => m.as_bytes().len(),
         RaftMessage::Custom(p) => p.len(),

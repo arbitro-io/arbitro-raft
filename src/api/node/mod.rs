@@ -45,6 +45,7 @@ pub struct RaftNode<S, T> {
     pub(crate) scratch_started: HashMap<PeerId, std::time::Instant>,
     pub(crate) scratch_outbound: Vec<u8>,
     pub(crate) scratch_payload: Vec<u8>,
+    pub(crate) scratch_payload_refs: Vec<&'static [u8]>,
 
     /// Cached last-log position — kept in sync with every append/truncate so
     /// `try_advance_commit_index` and leader-progress init avoid a storage read.
@@ -101,6 +102,7 @@ where
             scratch_started: HashMap::new(),
             scratch_outbound: vec![0; 1024 * 1024], // 1MB pre-allocated scratch for outbound encoding
             scratch_payload: vec![0; 16 * 1024 * 1024], // 16MB pre-allocated scratch for storage reads
+            scratch_payload_refs: Vec::with_capacity(1024),
             cached_last_log,
         })
     }
@@ -185,6 +187,9 @@ where
             RaftMessage::RequestVoteResp(msg) => self.handle_request_vote_response(from, msg).await,
             RaftMessage::AppendEntries(msg, payload) => {
                 self.handle_append_entries(from, msg, payload).await
+            }
+            RaftMessage::AppendEntriesSeeded { ae, headers, payloads } => {
+                self.handle_append_entries_seeded(from, ae, headers, payloads).await
             }
             RaftMessage::AppendEntriesResp(msg) => {
                 self.handle_append_entries_response(from, msg).await
