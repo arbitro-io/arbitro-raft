@@ -12,29 +12,26 @@
 > **Total Zero-Copy / Zero-Allocation Architecture**
 > All hot paths operate without heap allocations or data copies. Metadata is handled via zero-copy views and internal futures are stack-allocated using native AFIT (Async Functions in Traits).
 
-### In-Memory Transport (No-Op Storage)
+### In-Memory Transport (No-Op Storage, WSL2)
 
 | Scenario | Mode | Latency (P50) | Throughput (Peak) |
 | :--- | :--- | :--- | :--- |
-| **Direct Proposal** | Single client | **1.49 µs** | 670 K ops/s |
-| **Pipelined Batch** | 128-entry batch | 49.62 µs | **20.63 M ops/s** |
-| **High Concurrency** | 1024 clients | 232.38 µs | **4.40 M ops/s** |
+| **Direct Proposal** | Single client (empty) | **1.43 µs** | 699 K ops/s |
+| **Direct Proposal** | Single client (1KB) | **1.72 µs** | 580 K ops/s |
+| **Pipelined Batch** | 256-entry batch | 9.72 µs | **26.33 M ops/s** |
+| **Extreme Batch** | 4096-entry batch | 129.25 µs | **31.69 M ops/s** |
 
-### TCP Transport (Loopback, Real Sockets)
+### Verified Scalability Profile
 
-| Scenario | Clients | Latency (P50) | Throughput |
+| Batch Size | Latency | Time per Message | Throughput |
 | :--- | :--- | :--- | :--- |
-| `propose_once` / empty | 1 | **40.50 µs** | 24.7 K ops/s |
-| `propose_once` / 1 KB payload | 1 | **42.82 µs** | 23.4 K ops/s |
-| Concurrent writes | 1 | 32.01 µs | 31.2 K ops/s |
-| Concurrent writes | 4 | 35.19 µs | 113.7 K ops/s |
-| Concurrent writes | 16 | 42.24 µs | 378.8 K ops/s |
-| Concurrent writes | 64 | 73.17 µs | **874.7 K ops/s** |
-| Batch throughput | 64 | 1.34 ms | 47.6 K ops/s |
-| Batch throughput | 1024 | 29.20 ms | 35.1 K ops/s |
+| 64 | 3.46 µs | 54 ns | 18.45 M ops/s |
+| 256 | 9.72 µs | 38 ns | 26.33 M ops/s |
+| 1024 | 33.58 µs | 32 ns | 30.49 M ops/s |
+| 4096 | 129.25 µs | **31 ns** | **31.69 M ops/s** |
 
-*Benchmarks executed on WSL2 (Ubuntu 22.04), tmpfs, CPU: High-frequency x86_64.*
-*TCP transport uses `TCP_NODELAY` and real loopback sockets (127.0.0.1).*
+*Benchmarks executed on WSL2 (Ubuntu 22.04), pinned high-frequency x86_64.*
+*Zero-copy validation: 1KB payload adds only ~290ns overhead vs empty payload.*
 
 ---
 
