@@ -2,8 +2,8 @@ use super::codec::wire::{
     AppendEntries, AppendEntriesResp, EntryHeader, InstallSnapshot, InstallSnapshotResp,
     RequestVote, RequestVoteResp,
 };
-use crate::{EntryPayload, LogEntry, LogIndex, PeerId, RaftError, SnapshotMeta, Term};
-use zerocopy::{FromBytes, Ref};
+use crate::{EntryPayload, LogEntry, LogIndex, PeerId, Term};
+use zerocopy::Ref;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RaftMessage<'a> {
@@ -38,7 +38,12 @@ pub struct InboundRaftMessage<'a> {
 
 impl<'a> InboundRaftMessage<'a> {
     pub fn as_append_entries_seeded(&self) -> Option<(&'a AppendEntries, &'a [u8], &'a [u8])> {
-        if let RaftMessage::AppendEntriesSeeded { ae, headers, payloads } = self.message {
+        if let RaftMessage::AppendEntriesSeeded {
+            ae,
+            headers,
+            payloads,
+        } = self.message
+        {
             Some((ae, headers, payloads))
         } else {
             None

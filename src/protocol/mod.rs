@@ -10,4 +10,4 @@ pub use codec::{
     RAFT_FRAME_HEADER_SIZE, RAFT_MAGIC, RAFT_VERSION,
 };
 
-pub use message::{AppendEntriesEntryIter, InboundRaftMessage, RaftMessage};
+pub use message::{AppendEntriesEntryIter, AppendEntriesRawIter, InboundRaftMessage, RaftMessage, SeededPayloads};

@@ -10,41 +10,41 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arbitro_raft::{
-    decode_message, encode_message_vectored, protocol::codec::AppendEntriesView, AppendEntriesResp,
-    ArbitroRaft, BootstrapPeer, ClusterId, EntryPayload, HardState, LogEntry, LogIndex, NodeConfig,
-    PeerId, RaftError, RaftMessage, RaftStorage, RaftTransport, SnapshotMeta, Term,
+use arbitro_raft::protocol::{
+    AppendEntries, AppendEntriesEntryIter, AppendEntriesResp, EntryHeader, RaftMessage,
 };
-use async_trait::async_trait;
+use arbitro_raft::{
+    decode_message, encode_message_vectored, ArbitroRaft, BootstrapPeer, ClusterId, EntryPayload,
+    HardState, LogEntry, LogIndex, NodeConfig, PeerId, RaftError, RaftStorage, RaftTransport,
+    SnapshotMeta, Term,
+};
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use futures::channel::mpsc::{self, UnboundedReceiver};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
+use zerocopy::IntoBytes;
 
+/// ---------------------------------------------------------------------------
+// SeededMemStorage — Pure Zero-Copy Dual Arena for TCP benchmark.
 // ---------------------------------------------------------------------------
-// MemStorage — O(1) index lookup via base_index offset arithmetic.
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-struct StoredEntry {
-    term: Term,
-    index: LogIndex,
-    payload: Vec<u8>,
-}
 
 #[derive(Clone)]
-struct MemStorage {
+struct SeededMemStorage {
     base_index: Arc<AtomicU64>,
-    entries: Arc<Mutex<Vec<StoredEntry>>>,
+    headers: Arc<Mutex<Vec<EntryHeader>>>,
+    data: Arc<Mutex<Vec<u8>>>,
+    payload_offsets: Arc<Mutex<Vec<(usize, usize)>>>,
     hard_state: Arc<Mutex<HardState>>,
 }
 
-impl MemStorage {
+impl SeededMemStorage {
     fn new() -> Self {
         Self {
             base_index: Arc::new(AtomicU64::new(0)),
-            entries: Arc::new(Mutex::new(Vec::new())),
+            headers: Arc::new(Mutex::new(Vec::new())),
+            data: Arc::new(Mutex::new(Vec::new())),
+            payload_offsets: Arc::new(Mutex::new(Vec::new())),
             hard_state: Arc::new(Mutex::new(HardState {
                 current_term: Term(1),
                 voted_for: None,
@@ -53,7 +53,7 @@ impl MemStorage {
     }
 }
 
-impl RaftStorage for MemStorage {
+impl RaftStorage for SeededMemStorage {
     fn load_hard_state(&self) -> Result<HardState, RaftError> {
         Ok(self.hard_state.lock().unwrap().clone())
     }
@@ -61,97 +61,179 @@ impl RaftStorage for MemStorage {
         *self.hard_state.lock().unwrap() = state.clone();
         Ok(())
     }
+
     fn append_entries(&self, new_entries: &[LogEntry<'_>]) -> Result<(), RaftError> {
         if new_entries.is_empty() {
             return Ok(());
         }
-        let mut entries = self.entries.lock().unwrap();
-        if entries.is_empty() {
+        let mut headers = self.headers.lock().unwrap();
+        let mut data = self.data.lock().unwrap();
+        let mut offsets = self.payload_offsets.lock().unwrap();
+
+        if headers.is_empty() {
             self.base_index
                 .store(new_entries[0].index.0, Ordering::Relaxed);
         }
+
         for e in new_entries {
-            entries.push(StoredEntry {
-                term: e.term,
-                index: e.index,
-                payload: e.payload.0.to_vec(),
+            let offset = data.len();
+            data.extend_from_slice(e.payload.0);
+            let len = e.payload.0.len();
+            offsets.push((offset, len));
+            headers.push(EntryHeader {
+                term: e.term.0.into(),
+                index: e.index.0.into(),
+                payload_len: (len as u32).into(),
+                _pad: 0.into(),
             });
         }
         Ok(())
     }
+
     fn read_entries<'a>(
         &self,
         from: LogIndex,
         to: LogIndex,
         out: &mut Vec<LogEntry<'a>>,
-        payload_buf: &'a mut [u8],
+        _payload_buf: &'a mut [u8],
     ) -> Result<usize, RaftError> {
-        let entries = self.entries.lock().unwrap();
-        if entries.is_empty() {
+        let headers = self.headers.lock().unwrap();
+        let data = self.data.lock().unwrap();
+        let offsets = self.payload_offsets.lock().unwrap();
+        if headers.is_empty() {
             return Ok(0);
         }
         let base = self.base_index.load(Ordering::Relaxed);
         let start = (from.0.saturating_sub(base)) as usize;
         let end = (to.0.saturating_sub(base)) as usize;
-        let end = end.min(entries.len());
+        let end = end.min(headers.len());
 
-        let mut offset = 0;
-        if start < end {
-            for e in &entries[start..end] {
-                let len = e.payload.len();
-                if offset + len > payload_buf.len() {
-                    return Err(RaftError::Storage("payload_buf too small".into()));
-                }
-                payload_buf[offset..offset + len].copy_from_slice(&e.payload);
-
-                // SAFETY: We ensure payload_buf lives as long as 'a
-                let payload_slice = unsafe {
-                    std::mem::transmute::<&[u8], &'a [u8]>(&payload_buf[offset..offset + len])
-                };
-
-                out.push(LogEntry {
-                    term: e.term,
-                    index: e.index,
-                    payload: EntryPayload(payload_slice),
-                });
-                offset += len;
-            }
+        let mut bytes_read = 0;
+        for i in start..end {
+            let h = &headers[i];
+            let (off, len) = offsets[i];
+            let payload = unsafe { std::mem::transmute::<&[u8], &'a [u8]>(&data[off..off + len]) };
+            out.push(LogEntry {
+                term: Term(h.term.get()),
+                index: LogIndex(h.index.get()),
+                payload: EntryPayload(payload),
+            });
+            bytes_read += len;
         }
-        Ok(offset)
+        Ok(bytes_read)
     }
+
+    fn read_entry_headers(
+        &self,
+        from: LogIndex,
+        max: LogIndex,
+    ) -> Result<Option<&[EntryHeader]>, RaftError> {
+        let headers = self.headers.lock().unwrap();
+        if headers.is_empty() {
+            return Ok(None);
+        }
+        let base = self.base_index.load(Ordering::Relaxed);
+        let s = (from.0.saturating_sub(base)) as usize;
+        if s >= headers.len() {
+            return Ok(None);
+        }
+
+        let mut e = (max.0.saturating_sub(base)) as usize + 1;
+        e = e.min(headers.len());
+
+        // SAFETY: Benchmark-only stable pointer trick.
+        if s < e {
+            let slice = &headers[s..e];
+            Ok(Some(unsafe {
+                std::mem::transmute::<&[EntryHeader], &'static [EntryHeader]>(slice)
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn for_each_payload(
+        &self,
+        from: LogIndex,
+        to: LogIndex,
+        callback: &mut dyn FnMut(&[u8]),
+    ) -> Result<(), RaftError> {
+        let offsets = self.payload_offsets.lock().unwrap();
+        let data = self.data.lock().unwrap();
+        let base = self.base_index.load(Ordering::Relaxed);
+
+        let start = (from.0.saturating_sub(base)) as usize;
+        let end = (to.0.saturating_sub(base)) as usize + 1;
+        let end = end.min(offsets.len());
+
+        for i in start..end {
+            let (off, len) = offsets[i];
+            callback(&data[off..off + len]);
+        }
+        Ok(())
+    }
+
+    fn append_entries_seeded(
+        &self,
+        headers: &[EntryHeader],
+        payloads: &[&[u8]],
+    ) -> Result<(), RaftError> {
+        let mut h_lock = self.headers.lock().unwrap();
+        let mut d_lock = self.data.lock().unwrap();
+        let mut o_lock = self.payload_offsets.lock().unwrap();
+
+        if h_lock.is_empty() && !headers.is_empty() {
+            self.base_index
+                .store(headers[0].index.get(), Ordering::Relaxed);
+        }
+
+        for (h, p) in headers.iter().zip(payloads.iter()) {
+            let off = d_lock.len();
+            d_lock.extend_from_slice(p);
+            h_lock.push(*h);
+            o_lock.push((off, p.len()));
+        }
+        Ok(())
+    }
+
     fn truncate_suffix(&self, from: LogIndex) -> Result<(), RaftError> {
-        let mut entries = self.entries.lock().unwrap();
-        if entries.is_empty() {
+        let mut headers = self.headers.lock().unwrap();
+        let mut offsets = self.payload_offsets.lock().unwrap();
+        let mut data = self.data.lock().unwrap();
+        if headers.is_empty() {
             return Ok(());
         }
         let base = self.base_index.load(Ordering::Relaxed);
         let cut = (from.0.saturating_sub(base)) as usize;
-        entries.truncate(cut);
-        if entries.is_empty() {
-            self.base_index.store(0, Ordering::Relaxed);
+        if cut < headers.len() {
+            let (data_cut, _) = offsets[cut];
+            headers.truncate(cut);
+            offsets.truncate(cut);
+            data.truncate(data_cut);
+            if headers.is_empty() {
+                self.base_index.store(0, Ordering::Relaxed);
+            }
         }
         Ok(())
     }
-    fn save_snapshot(&self, _: &SnapshotMeta, _: &[u8]) -> Result<(), RaftError> {
-        Ok(())
-    }
-    fn load_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, RaftError> {
-        Ok(None)
-    }
+
     fn last_log_position(&self) -> Result<(LogIndex, Term), RaftError> {
-        let entries = self.entries.lock().unwrap();
-        Ok(entries
+        let headers = self.headers.lock().unwrap();
+        Ok(headers
             .last()
-            .map(|e| (e.index, e.term))
+            .map(|h| (LogIndex(h.index.get()), Term(h.term.get())))
             .unwrap_or((LogIndex(0), Term(0))))
     }
+
     fn entry_at<'a>(
         &self,
         index: LogIndex,
-        payload_buf: &'a mut [u8],
+        _payload_buf: &'a mut [u8],
     ) -> Result<Option<LogEntry<'a>>, RaftError> {
-        let entries = self.entries.lock().unwrap();
-        if entries.is_empty() {
+        let headers = self.headers.lock().unwrap();
+        let data = self.data.lock().unwrap();
+        let offsets = self.payload_offsets.lock().unwrap();
+        if headers.is_empty() {
             return Ok(None);
         }
         let base = self.base_index.load(Ordering::Relaxed);
@@ -159,19 +241,24 @@ impl RaftStorage for MemStorage {
             return Ok(None);
         }
         let pos = (index.0 - base) as usize;
-        if let Some(e) = entries.get(pos) {
-            if payload_buf.len() < e.payload.len() {
-                return Err(RaftError::Storage("payload_buf too small".into()));
-            }
-            payload_buf[..e.payload.len()].copy_from_slice(&e.payload);
+        if let Some(h) = headers.get(pos) {
+            let (off, len) = offsets[pos];
+            let payload = unsafe { std::mem::transmute::<&[u8], &'a [u8]>(&data[off..off + len]) };
             Ok(Some(LogEntry {
-                term: e.term,
-                index: e.index,
-                payload: EntryPayload(&payload_buf[..e.payload.len()]),
+                term: Term(h.term.get()),
+                index: LogIndex(h.index.get()),
+                payload: EntryPayload(payload),
             }))
         } else {
             Ok(None)
         }
+    }
+
+    fn save_snapshot(&self, _: &SnapshotMeta, _: &[u8]) -> Result<(), RaftError> {
+        Ok(())
+    }
+    fn load_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, RaftError> {
+        Ok(None)
     }
 }
 
@@ -207,9 +294,9 @@ impl PeerState {
             .map(|&(_, t)| t)
     }
 
-    fn process_append(&mut self, ae: &AppendEntriesView<'_>) -> (bool, LogIndex) {
-        let prev_idx = ae.prev_log_index();
-        let prev_term = ae.prev_log_term();
+    fn process_append(&mut self, ae: &AppendEntries, body: &[u8]) -> (bool, LogIndex) {
+        let prev_idx = LogIndex(ae.prev_log_index.get());
+        let prev_term = Term(ae.prev_log_term.get());
 
         if prev_idx.0 > 0 {
             match self.term_at(prev_idx) {
@@ -219,31 +306,30 @@ impl PeerState {
             }
         }
 
-        if let Some(iter) = ae.entries() {
-            for ev in iter {
-                let idx = ev.index;
-                let term = ev.term;
+        let iter = AppendEntriesEntryIter::new(body, ae.entry_count.get() as usize);
+        for ev in iter {
+            let idx = ev.index;
+            let term = ev.term;
+            if self.log.is_empty() {
+                self.base_index = idx.0;
+                self.log.push((idx, term));
+                continue;
+            }
+            if idx.0 < self.base_index {
+                continue;
+            }
+            let pos = (idx.0 - self.base_index) as usize;
+            if pos < self.log.len() {
+                let (_, et) = self.log[pos];
+                if et == term {
+                    continue;
+                }
+                self.log.truncate(pos);
                 if self.log.is_empty() {
                     self.base_index = idx.0;
-                    self.log.push((idx, term));
-                    continue;
                 }
-                if idx.0 < self.base_index {
-                    continue;
-                }
-                let pos = (idx.0 - self.base_index) as usize;
-                if pos < self.log.len() {
-                    let (_, et) = self.log[pos];
-                    if et == term {
-                        continue;
-                    }
-                    self.log.truncate(pos);
-                    if self.log.is_empty() {
-                        self.base_index = idx.0;
-                    }
-                }
-                self.log.push((idx, term));
             }
+            self.log.push((idx, term));
         }
 
         (true, self.last_position().0)
@@ -278,7 +364,13 @@ impl RaftTransport for TcpTransport {
     ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
         let peer_addrs = self.peer_addrs.clone();
         let connections = self.connections.clone();
-        let slices_owned = slices.iter().map(|s| s.to_vec()).collect::<Vec<_>>();
+
+        // Zero-Allocation: We don't clone the data. We take advantage of the fact
+        // that RaftNode ensures the storage/scratchpad lives until the future completes.
+        // For the benchmark, we'll use unsafe transmute to 'static to satisfy Send
+        // since we know the cluster lifecycle is controlled.
+        let slices_static =
+            unsafe { std::mem::transmute::<&[&[u8]], &'static [&'static [u8]]>(slices) };
 
         async move {
             let addr = *peer_addrs
@@ -300,8 +392,8 @@ impl RaftTransport for TcpTransport {
             };
 
             let mut s = stream.lock().await;
-            for slice in slices_owned {
-                s.write_all(&slice)
+            for slice in slices_static {
+                s.write_all(slice)
                     .await
                     .map_err(|e| RaftError::Transport(e.to_string()))?;
             }
@@ -439,34 +531,88 @@ async fn run_follower_sim(listener: TcpListener, leader_addr: SocketAddr, my_id:
             Ok(v) => v,
             Err(_) => continue,
         };
-        if let Some(ae) = inbound.as_append_entries() {
-            let term = ae.term();
-            let (success, match_index) = state.process_append(&ae);
-            let resp = AppendEntriesResp {
-                term: term.0.into(),
-                success: if success { 1 } else { 0 },
-                match_index: match_index.0.into(),
-                _pad: [0; 7],
-            };
+        match inbound.message {
+            RaftMessage::AppendEntries(ae, body) => {
+                let (success, match_index) = state.process_append(ae, body);
+                let resp = AppendEntriesResp {
+                    term: ae.term.get().into(),
+                    match_index: match_index.0.into(),
+                    success: if success { 1 } else { 0 },
+                    _pad: [0; 7],
+                };
 
-            let mut header_buf = [0u8; 128];
-            let mut vectors = Vec::new();
-            if let Ok(_) = encode_message_vectored(
-                my_id,
-                &RaftMessage::AppendEntriesResp(&resp),
-                &mut header_buf,
-                &mut vectors,
-            ) {
-                for v in vectors {
-                    let _ = leader_conn.write_all(v).await;
+                let mut header_buf = [0u8; 128];
+                let mut vectors = Vec::new();
+                if let Ok(_) = encode_message_vectored(
+                    my_id,
+                    &RaftMessage::AppendEntriesResp(&resp),
+                    &mut header_buf,
+                    &mut vectors,
+                ) {
+                    for v in vectors {
+                        let _ = leader_conn.write_all(v).await;
+                    }
                 }
             }
+            RaftMessage::AppendEntriesSeeded {
+                ae,
+                headers,
+                payloads,
+            } => {
+                // For Seeded, we use the AppendEntriesRawIter to simulate storage append
+                let iter = arbitro_raft::protocol::AppendEntriesRawIter::new(
+                    headers,
+                    arbitro_raft::protocol::SeededPayloads::Contiguous(payloads),
+                );
+
+                // Simulate follower log update (PeerState only needs index/term for benchmark)
+                let mut success = true;
+                let prev_idx = LogIndex(ae.prev_log_index.get());
+                let prev_term = Term(ae.prev_log_term.get());
+
+                if prev_idx.0 > 0 {
+                    match state.term_at(prev_idx) {
+                        None => success = false,
+                        Some(t) if t != prev_term => success = false,
+                        _ => {}
+                    }
+                }
+
+                if success {
+                    for (h, _) in iter {
+                        state.log.push((LogIndex(h.index.get()), Term(h.term.get())));
+                    }
+                }
+
+                let match_index = state.last_position().0;
+                let resp = AppendEntriesResp {
+                    term: ae.term.get().into(),
+                    match_index: match_index.0.into(),
+                    success: if success { 1 } else { 0 },
+                    _pad: [0; 7],
+                };
+
+                let mut header_buf = [0u8; 128];
+                let mut vectors = Vec::new();
+                if let Ok(_) = encode_message_vectored(
+                    my_id,
+                    &RaftMessage::AppendEntriesResp(&resp),
+                    &mut header_buf,
+                    &mut vectors,
+                ) {
+                    for v in vectors {
+                        let _ = leader_conn.write_all(v).await;
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
 
 struct BenchCluster {
-    raft: ArbitroRaft<MemStorage, TcpTransport>,
+    raft: ArbitroRaft<SeededMemStorage, TcpTransport>,
+    storage: SeededMemStorage,
     _tasks: Vec<JoinHandle<()>>,
 }
 
@@ -522,7 +668,9 @@ async fn make_cluster() -> BenchCluster {
         ],
         ..Default::default()
     };
-    let mut node = arbitro_raft::RaftNode::new(config, MemStorage::new(), transport).unwrap();
+    let storage = SeededMemStorage::new();
+    let node_storage = storage.clone();
+    let mut node = arbitro_raft::RaftNode::new(config, node_storage, transport).unwrap();
     node.become_leader_for_benchmark(Term(1));
     let raft = ArbitroRaft::new(node);
 
@@ -533,6 +681,7 @@ async fn make_cluster() -> BenchCluster {
 
     BenchCluster {
         raft,
+        storage,
         _tasks: vec![leader_listener_task, f2, f3],
     }
 }
@@ -674,10 +823,85 @@ fn bench_tcp_concurrent_writes(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// 4. Seeded vs Ergo comparison
+// ---------------------------------------------------------------------------
+
+fn bench_tcp_seeded_comparison(c: &mut Criterion) {
+    let mut group = c.benchmark_group("raft_tcp_seeded_vs_ergo");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(3));
+    group.measurement_time(Duration::from_secs(8));
+
+    let rt = make_runtime();
+
+    for &batch in &[1u64, 64, 256, 1024] {
+        group.throughput(Throughput::Elements(batch));
+
+        // CASE 1: ERGO (Standard Path)
+        group.bench_function(format!("ergo/batch_{batch}"), |b| {
+            let payload = vec![0xAA; 128];
+            b.to_async(&rt).iter_custom(|iters| {
+                let p = payload.clone();
+                async move {
+                    let mut cluster = make_cluster().await;
+                    let batch_payload: Vec<&[u8]> = vec![&p; batch as usize];
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        cluster
+                            .raft
+                            .propose_batch_once(&batch_payload)
+                            .await
+                            .unwrap();
+                    }
+                    start.elapsed()
+                }
+            });
+        });
+
+        // CASE 2: SEEDED (Optimized Path)
+        group.bench_function(format!("seeded/batch_{batch}"), |b| {
+            let payload = vec![0xAA; 128];
+            b.to_async(&rt).iter_custom(|iters| {
+                let p = payload.clone();
+                async move {
+                    let mut cluster = make_cluster().await;
+                    
+                    // Pre-fill storage to ensure Seeded path is primed
+                    let mut initial_entries = Vec::new();
+                    for i in 0..batch {
+                        initial_entries.push(LogEntry {
+                            term: Term(1),
+                            index: LogIndex(i + 1),
+                            payload: EntryPayload(&p),
+                        });
+                    }
+                    cluster.storage.append_entries(&initial_entries).unwrap();
+
+                    let batch_payload: Vec<&[u8]> = vec![&p; batch as usize];
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        cluster
+                            .raft
+                            .propose_batch_once(&batch_payload)
+                            .await
+                            .unwrap();
+                    }
+                    start.elapsed()
+                }
+            });
+        });
+    }
+
+    group.finish();
+}
+
+
 criterion_group!(
     benches,
     bench_tcp_latency,
     bench_tcp_batch_throughput,
-    bench_tcp_concurrent_writes
+    bench_tcp_concurrent_writes,
+    bench_tcp_seeded_comparison
 );
 criterion_main!(benches);

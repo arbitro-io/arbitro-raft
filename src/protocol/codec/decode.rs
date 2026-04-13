@@ -5,8 +5,8 @@ use crate::{InboundRaftMessage, PeerId, RaftError, RaftMessage};
 use super::wire::{
     AppendEntries, AppendEntriesResp, EntryHeader, InstallSnapshot, InstallSnapshotResp,
     RaftFrameHeader, RequestVote, RequestVoteResp, KIND_APPEND_ENTRIES, KIND_APPEND_ENTRIES_RESP,
-    KIND_CUSTOM, KIND_CUSTOM_RESPONSE, KIND_INSTALL_SNAPSHOT, KIND_INSTALL_SNAPSHOT_RESP,
-    KIND_REQUEST_VOTE, KIND_REQUEST_VOTE_RESP, RAFT_MAGIC, RAFT_VERSION,
+    KIND_APPEND_ENTRIES_SEEDED, KIND_CUSTOM, KIND_CUSTOM_RESPONSE, KIND_INSTALL_SNAPSHOT,
+    KIND_INSTALL_SNAPSHOT_RESP, KIND_REQUEST_VOTE, KIND_REQUEST_VOTE_RESP, RAFT_MAGIC, RAFT_VERSION,
 };
 
 // ── Shared parse helper ───────────────────────────────────────────────────────

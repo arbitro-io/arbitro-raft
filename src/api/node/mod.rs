@@ -188,8 +188,13 @@ where
             RaftMessage::AppendEntries(msg, payload) => {
                 self.handle_append_entries(from, msg, payload).await
             }
-            RaftMessage::AppendEntriesSeeded { ae, headers, payloads } => {
-                self.handle_append_entries_seeded(from, ae, headers, payloads).await
+            RaftMessage::AppendEntriesSeeded {
+                ae,
+                headers,
+                payloads,
+            } => {
+                self.handle_append_entries_seeded(from, ae, headers, payloads)
+                    .await
             }
             RaftMessage::AppendEntriesResp(msg) => {
                 self.handle_append_entries_response(from, msg).await
@@ -204,7 +209,8 @@ where
             RaftMessage::CustomResponse(payload) => {
                 self.handle_custom_response(from, payload).await
             }
-            RaftMessage::AppendEntriesVectored(_, _) => {
+            RaftMessage::AppendEntriesVectored(_, _)
+            | RaftMessage::AppendEntriesSeededVectored { .. } => {
                 // Inbound vectored messages are not expected in v0.1.
                 // Protocol only uses vectored for OUTBOUND.
                 Err(RaftError::Protocol("unexpected vectored inbound".into()))

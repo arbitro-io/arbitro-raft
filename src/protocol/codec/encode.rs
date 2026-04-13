@@ -77,7 +77,25 @@ pub fn encode_message_vectored<'a>(
             out_vectored.push(&header_buf[..RAFT_FRAME_HEADER_SIZE]);
             out_vectored.push(m.as_bytes());
         }
-        RaftMessage::AppendEntriesSeeded { ae, headers, payloads } => {
+        RaftMessage::AppendEntriesSeeded {
+            ae,
+            headers,
+            payloads,
+        } => {
+            out_vectored.push(&header_buf[..RAFT_FRAME_HEADER_SIZE]);
+            out_vectored.push(ae.as_bytes());
+            if !headers.is_empty() {
+                out_vectored.push(headers);
+            }
+            if !payloads.is_empty() {
+                out_vectored.push(payloads);
+            }
+        }
+        RaftMessage::AppendEntriesSeededVectored {
+            ae,
+            headers,
+            payloads,
+        } => {
             out_vectored.push(&header_buf[..RAFT_FRAME_HEADER_SIZE]);
             out_vectored.push(ae.as_bytes());
             if !headers.is_empty() {
@@ -214,7 +232,8 @@ fn kind_of(msg: &RaftMessage) -> u8 {
         RaftMessage::AppendEntries(_, _) => KIND_APPEND_ENTRIES,
         RaftMessage::AppendEntriesVectored(_, _) => KIND_APPEND_ENTRIES,
         RaftMessage::AppendEntriesResp(_) => KIND_APPEND_ENTRIES_RESP,
-        RaftMessage::AppendEntriesSeeded { .. } => KIND_APPEND_ENTRIES_SEEDED,
+        RaftMessage::AppendEntriesSeeded { .. }
+        | RaftMessage::AppendEntriesSeededVectored { .. } => KIND_APPEND_ENTRIES_SEEDED,
         RaftMessage::InstallSnapshot(_, _) => KIND_INSTALL_SNAPSHOT,
         RaftMessage::InstallSnapshotResp(_) => KIND_INSTALL_SNAPSHOT_RESP,
         RaftMessage::Custom(_) => KIND_CUSTOM,
@@ -235,7 +254,16 @@ fn body_total_len(msg: &RaftMessage) -> usize {
             len
         }
         RaftMessage::AppendEntriesResp(m) => m.as_bytes().len(),
-        RaftMessage::AppendEntriesSeeded { ae, headers, payloads } => {
+        RaftMessage::AppendEntriesSeeded {
+            ae,
+            headers,
+            payloads,
+        } => ae.as_bytes().len() + headers.len() + payloads.len(),
+        RaftMessage::AppendEntriesSeededVectored {
+            ae,
+            headers,
+            payloads,
+        } => {
             let mut len = ae.as_bytes().len() + headers.len();
             for p in *payloads {
                 len += p.len();
@@ -262,7 +290,7 @@ pub fn encode_message_to_bytes(from: PeerId, msg: &RaftMessage) -> Result<bytes:
     // We can reuse the vectored encoder by passing the target buffer as header_buf
     // and a scratchpad for the slices, then we don't need to copy payloads manually.
     // However, since we want a contiguous Bytes, we'll just write directly.
-    
+
     // 1. Frame Header
     {
         let (h_bytes, _) = buf.split_at_mut(RAFT_FRAME_HEADER_SIZE);
@@ -280,7 +308,7 @@ pub fn encode_message_to_bytes(from: PeerId, msg: &RaftMessage) -> Result<bytes:
     match msg {
         RaftMessage::AppendEntriesVectored(m, entries) => {
             let mut offset = RAFT_FRAME_HEADER_SIZE;
-            
+
             // Body Header
             let ae_len = std::mem::size_of::<AppendEntries>();
             buf[offset..offset + ae_len].copy_from_slice(m.as_bytes());
@@ -333,6 +361,41 @@ pub fn encode_message_to_bytes(from: PeerId, msg: &RaftMessage) -> Result<bytes:
         }
         RaftMessage::InstallSnapshotResp(m) => {
             buf[RAFT_FRAME_HEADER_SIZE..].copy_from_slice(m.as_bytes());
+        }
+        RaftMessage::AppendEntriesSeeded {
+            ae,
+            headers,
+            payloads,
+        } => {
+            let mut offset = RAFT_FRAME_HEADER_SIZE;
+            buf[offset..offset + ae.as_bytes().len()].copy_from_slice(ae.as_bytes());
+            offset += ae.as_bytes().len();
+            if !headers.is_empty() {
+                buf[offset..offset + headers.len()].copy_from_slice(headers);
+                offset += headers.len();
+            }
+            if !payloads.is_empty() {
+                buf[offset..offset + payloads.len()].copy_from_slice(payloads);
+            }
+        }
+        RaftMessage::AppendEntriesSeededVectored {
+            ae,
+            headers,
+            payloads,
+        } => {
+            let mut offset = RAFT_FRAME_HEADER_SIZE;
+            buf[offset..offset + ae.as_bytes().len()].copy_from_slice(ae.as_bytes());
+            offset += ae.as_bytes().len();
+            if !headers.is_empty() {
+                buf[offset..offset + headers.len()].copy_from_slice(headers);
+                offset += headers.len();
+            }
+            for p in *payloads {
+                if !p.is_empty() {
+                    buf[offset..offset + p.len()].copy_from_slice(p);
+                    offset += p.len();
+                }
+            }
         }
         RaftMessage::Custom(p) | RaftMessage::CustomResponse(p) => {
             if !p.is_empty() {

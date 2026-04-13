@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use super::super::RaftNode;
 use crate::{LogIndex, PeerId, RaftError, RaftMessage, Term};
+use zerocopy::IntoBytes;
 
 impl<S, T> RaftNode<S, T>
 where
@@ -64,25 +65,33 @@ where
         let next_index = progress.next_index;
 
         // ── 1. Attempt MAGIC ZEROCOPY Path ─────────────────────────────────────
-        if let Ok(Some(headers)) = self.storage.read_entry_headers(next_index, LogIndex(u64::MAX)) {
+        let prev_idx = LogIndex(next_index.0.saturating_sub(1));
+        let prev_term = self.term_at(prev_idx)?;
+
+        if let Ok(Some(headers)) = self
+            .storage
+            .read_entry_headers(next_index, LogIndex(u64::MAX))
+        {
             let limit = self.config.limits.append_batch_entries.max(1);
-            let headers = if headers.len() > limit { &headers[..limit] } else { headers };
-            
+            let headers = if headers.len() > limit {
+                &headers[..limit]
+            } else {
+                headers
+            };
+
             if !headers.is_empty() {
                 let last_idx = LogIndex(headers.last().unwrap().index.get());
-                
+
                 // Collect payloads using scratchpad (Zero-Alloc)
                 self.scratch_payload_refs.clear();
                 let to_idx = LogIndex(next_index.0 + headers.len() as u64 - 1);
-                
-                let scratch_ptr = &mut self.scratch_payload_refs;
-                self.storage.for_each_payload(next_index, to_idx, &mut |p| {
-                     // SAFETY: Pointers are ephemeral and cleared after send_message
-                     scratch_ptr.push(unsafe { std::mem::transmute::<&[u8], &'static [u8]>(p) });
-                })?;
 
-                let prev_idx = LogIndex(next_index.0.saturating_sub(1));
-                let prev_term = self.term_at(prev_idx)?;
+                let scratch_ptr = &mut self.scratch_payload_refs;
+                self.storage
+                    .for_each_payload(next_index, to_idx, &mut |p| {
+                        // SAFETY: Pointers are ephemeral and cleared after send_message
+                        scratch_ptr.push(unsafe { std::mem::transmute::<&[u8], &'static [u8]>(p) });
+                    })?;
 
                 let req = crate::protocol::AppendEntries {
                     term: self.hard_state.current_term.0.into(),
@@ -94,12 +103,24 @@ where
                     _pad: 0.into(),
                 };
 
-                let msg = RaftMessage::AppendEntriesSeeded {
-                    ae: &req,
-                    headers: headers.as_bytes(),
-                    payloads: &self.scratch_payload_refs,
+                // SAFETY: We transmute the lifetimes of the slices to allow send_message(&mut self).
+                // This is safe because we .await the send_message call before potentially reusing
+                // the scratchpads or dropping the storage refs.
+                let (headers_bytes, payloads_ref) = unsafe {
+                    (
+                        std::mem::transmute::<&[u8], &'static [u8]>(headers.as_bytes()),
+                        std::mem::transmute::<&[&[u8]], &'static [&'static [u8]]>(
+                            &self.scratch_payload_refs,
+                        ),
+                    )
                 };
-                
+
+                let msg = RaftMessage::AppendEntriesSeededVectored {
+                    ae: &req,
+                    headers: headers_bytes,
+                    payloads: payloads_ref,
+                };
+
                 if self.send_message(peer, &msg).await {
                     self.scratch_payload_refs.clear();
                     return Ok(Some(last_idx));

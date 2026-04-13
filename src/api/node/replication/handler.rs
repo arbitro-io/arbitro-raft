@@ -1,9 +1,11 @@
 use super::super::progress::{AppendAdvance, AppendAttemptState};
 use super::super::RaftNode;
-use crate::protocol::{AppendEntries, AppendEntriesEntryIter, AppendEntriesResp, AppendEntriesRawIter};
 use crate::protocol::codec::wire::EntryHeader;
-use zerocopy::{IntoBytes, Ref};
+use crate::protocol::{
+    AppendEntries, AppendEntriesEntryIter, AppendEntriesRawIter, AppendEntriesResp, SeededPayloads,
+};
 use crate::{LogIndex, PeerId, RaftError, RaftMessage, Role};
+use zerocopy::{IntoBytes, Ref};
 
 impl<S, T> RaftNode<S, T>
 where
@@ -66,12 +68,12 @@ where
         &mut self,
         msg: &AppendEntries,
         headers_bytes: &[u8],
-        payloads: &[&[u8]],
+        payloads: &[u8],
     ) -> Result<(), RaftError> {
         let entry_count = msg.entry_count.get() as usize;
         let mut append_from = entry_count;
 
-        let iter = AppendEntriesRawIter::new(headers_bytes, payloads);
+        let iter = AppendEntriesRawIter::new(headers_bytes, SeededPayloads::Contiguous(payloads));
         for (idx, (incoming_header, _)) in iter.enumerate() {
             let mut dummy = [0u8; 8];
             let incoming_index = LogIndex(incoming_header.index.get());
@@ -95,11 +97,24 @@ where
             let headers_ref = Ref::<&[u8], [EntryHeader]>::from_bytes(headers_bytes)
                 .map_err(|_| RaftError::Protocol("header alignment in seeded batch".into()))?;
             let headers = Ref::into_ref(headers_ref);
-            
-            let final_headers = &headers[append_from..];
-            let final_payloads = &payloads[append_from..];
 
-            self.storage.append_entries_seeded(final_headers, final_payloads)?;
+            let final_headers = &headers[append_from..];
+
+            // Transform contiguous block to list of refs using scratchpad
+            self.scratch_payload_refs.clear();
+            let p_iter =
+                AppendEntriesRawIter::new(headers_bytes, SeededPayloads::Contiguous(payloads));
+            for (idx, (_, payload)) in p_iter.enumerate() {
+                if idx >= append_from {
+                    // SAFETY: ephemeral pointers cleared after storage call
+                    self.scratch_payload_refs
+                        .push(unsafe { std::mem::transmute::<&[u8], &'static [u8]>(payload) });
+                }
+            }
+
+            self.storage
+                .append_entries_seeded(final_headers, &self.scratch_payload_refs)?;
+            self.scratch_payload_refs.clear();
 
             if let Some(last) = final_headers.last() {
                 self.cached_last_log = (LogIndex(last.index.get()), crate::Term(last.term.get()));
@@ -183,7 +198,7 @@ where
         from: PeerId,
         msg: &AppendEntries,
         headers_bytes: &[u8],
-        payloads: &[&[u8]],
+        payloads: &[u8],
     ) -> Result<(), RaftError> {
         let term = crate::Term(msg.term.get());
         let leader_id = PeerId(msg.leader_id.get());
