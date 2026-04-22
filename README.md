@@ -23,16 +23,18 @@
 | **Extreme Batch** | 4096-entry batch | 129.25 µs | **31.69 M ops/s** |
 
 #### Tier 2: TCP Transport (Network Reality)
-*Loopback TCP sockets, TCP_NODELAY, real-world serialization.*
+*Loopback TCP sockets, TCP_NODELAY, real-world serialization, hybrid vectored I/O.*
 
 | Scenario | Mode | Latency (P50) | Throughput (Peak) |
 | :--- | :--- | :--- | :--- |
-| **Direct Proposal** | Single client (empty) | **37.02 µs** | 27.0 K ops/s |
-| **Direct Proposal** | Single client (1KB) | **36.05 µs** | 27.7 K ops/s |
-| **Extreme Batch** | 1024 clients | 71.74 µs | **14.27 M ops/s** |
+| **Direct Proposal** | Single client (empty) | **39.5 µs** | 25.3 K ops/s |
+| **Direct Proposal** | Single client (1KB) | **37.5 µs** | 26.7 K ops/s |
+| **Extreme Batch** | 1024 clients (no-op transport) | 90.0 µs | **11.4 M ops/s** |
+| **Replicated Batch** | 1024-entry batch w/ follower | 2.65 ms | **387 K ops/s** |
 
 *Benchmarks executed on WSL2 (Ubuntu 22.04), CPU: High-frequency x86_64.*
 *Zero-copy validation: 1KB network latency is identical to 0B, confirming zero-copy processing.*
+*Replicated-batch throughput improved **+21%** after introducing the hybrid vectored I/O path.*
 
 ---
 
@@ -42,7 +44,7 @@
 - **Zero-Copy Protocol**: Direct pointer-mapping of wire frames to Raft views via `zerocopy`.
 - **Lock-Free Slot Arena**: 65k pre-allocated commit-notification slots — no `Arc<Mutex>` per proposal.
 - **AFIT Native**: Leverages native async trait implementation for maximum compiler optimization.
-- **Vectored I/O**: `encode_message_vectored` assembles frames from pre-allocated scratchpads, never copying.
+- **Hybrid Vectored I/O**: `encode_message_vectored` assembles frames from pre-allocated scratchpads without copying; an auto-threshold picks between contiguous and `writev(2)` per batch, tunable at runtime via env vars (see [Tuning](#-tuning)).
 - **Dispatch Engine**: Transparent custom RPC layer with quorum-based acknowledgement policies.
 - **False-Sharing Prevention**: `#[repr(C, align(64))]` on all hot concurrent data structures.
 
@@ -106,6 +108,22 @@ traits/         → RaftStorage, RaftTransport (AFIT)
 
 ---
 
+## 🎛️ Tuning
+
+The hybrid vectored I/O path ships with conservative defaults chosen empirically via A/B benchmarks. Thresholds can be overridden at process start without rebuilding:
+
+| Env var | Default | Purpose |
+| :--- | :--- | :--- |
+| `ARBITRO_RAFT_VEC_IOV_MAX` | `4096` | Max iovecs before falling back to contiguous encoding |
+| `ARBITRO_RAFT_VEC_MIN_ENTRY` | `4096` | Min per-entry payload size (1 page) to qualify for vectored |
+| `ARBITRO_RAFT_VEC_MIN_TOTAL` | `65536` | Min aggregate batch size to qualify for vectored |
+| `ARBITRO_RAFT_FORCE_CONTIGUOUS` | — | Force legacy contig path (A/B testing) |
+| `ARBITRO_RAFT_FORCE_VECTORED` | — | Force vectored path (A/B testing) |
+
+The auto-mode decision is cached in a `OnceLock` on first use — zero overhead on the hot path.
+
+---
+
 ## 🗺️ Roadmap
 
 ### Phase 1: Core Hardening ✅
@@ -119,6 +137,7 @@ traits/         → RaftStorage, RaftTransport (AFIT)
 - [x] **Lock-Free Leasing**: Atomic cursor with `compare_exchange` — no `Mutex`
 - [x] **Module Split**: `arbitro_raft` split by responsibility (slot / client / run / timers)
 - [x] **TCP_NODELAY**: Enabled on all transport connections — -28% latency on loopback
+- [x] **Hybrid Vectored I/O**: Auto-threshold contig vs `writev(2)` — +21% throughput on large replicated batches
 - [ ] **Generational Metadata**: Recyclable log index buffers
 - [ ] **Zero-Copy Snapshots**: DMA-friendly state transfer
 

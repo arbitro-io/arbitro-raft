@@ -5,6 +5,7 @@
 // running as independent tokio tasks connected via real TCP sockets.
 
 use std::collections::HashMap;
+use std::io::IoSlice;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -392,10 +393,27 @@ impl RaftTransport for TcpTransport {
             };
 
             let mut s = stream.lock().await;
-            for slice in slices_static {
-                s.write_all(slice)
+
+            // True vectored write: one writev syscall covers all iovecs
+            // (header + payloads). Previous impl did N×write_all which
+            // destroyed the point of vectored fan-out.
+            //
+            // Partial writes are rare on loopback for these sizes but handled
+            // correctly via IoSlice::advance_slices.
+            let mut io_bufs: Vec<IoSlice<'_>> =
+                slices_static.iter().map(|s| IoSlice::new(s)).collect();
+            let mut bufs: &mut [IoSlice<'_>] = &mut io_bufs;
+            while !bufs.is_empty() {
+                let n = s
+                    .write_vectored(bufs)
                     .await
                     .map_err(|e| RaftError::Transport(e.to_string()))?;
+                if n == 0 {
+                    return Err(RaftError::Transport(
+                        "write_vectored returned 0 — peer closed".into(),
+                    ));
+                }
+                IoSlice::advance_slices(&mut bufs, n);
             }
             Ok(())
         }
@@ -840,7 +858,7 @@ fn bench_tcp_seeded_comparison(c: &mut Criterion) {
 
         // CASE 1: ERGO (Standard Path)
         group.bench_function(format!("ergo/batch_{batch}"), |b| {
-            let payload = vec![0xAA; 128];
+            let payload = vec![0xAA; 4096];
             b.to_async(&rt).iter_custom(|iters| {
                 let p = payload.clone();
                 async move {
@@ -861,7 +879,7 @@ fn bench_tcp_seeded_comparison(c: &mut Criterion) {
 
         // CASE 2: SEEDED (Optimized Path)
         group.bench_function(format!("seeded/batch_{batch}"), |b| {
-            let payload = vec![0xAA; 128];
+            let payload = vec![0xAA; 4096];
             b.to_async(&rt).iter_custom(|iters| {
                 let p = payload.clone();
                 async move {

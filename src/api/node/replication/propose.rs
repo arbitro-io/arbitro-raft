@@ -3,9 +3,95 @@ use std::time::Duration;
 use super::super::progress::{AppendAdvance, AppendAttemptState};
 use super::super::RaftNode;
 use crate::{
-    protocol::codec::encode_message_to_bytes, AppendEntries, AppendEntriesResp, EntryPayload,
-    InboundRaftMessage, LogEntry, LogIndex, PeerId, RaftError, RaftMessage,
+    protocol::codec::{encode_message_to_bytes, encode_message_vectored},
+    AppendEntries, AppendEntriesResp, EntryPayload, InboundRaftMessage, LogEntry, LogIndex, PeerId,
+    RaftError, RaftMessage,
 };
+
+/// Decide whether the fan-out should use `writev` (vectored) or a single
+/// contiguous `Bytes` frame.
+///
+/// Thresholds derived from `encode_tcp_bench`:
+/// - Vectored wins once each entry is ≥ 1 memory page (4 KiB) — the kernel's
+///   `copy_from_iter` has page-aligned fast paths and the userspace memcpy
+///   that contiguous pays starts thrashing cache.
+/// - Below 64 KiB total the iovec-overhead of writev eats the win.
+/// - `IOV_MAX` on Linux is 1024 — we stay well below that to leave margin
+///   for kernels that cap lower under pressure.
+///
+/// Contiguous still wins for small-entry batches (commands, heartbeats):
+/// one memcpy + O(1) `Bytes::clone()` per peer beats many small iovecs.
+/// Tunable knobs for the encoding path decision. Resolved once from env
+/// on first access and cached — zero overhead on the hot path after that.
+///
+/// | Variable                          | Default       | Role                                                  |
+/// |-----------------------------------|---------------|-------------------------------------------------------|
+/// | `ARBITRO_RAFT_FORCE_CONTIGUOUS`   | unset         | If set (any value), always pick contiguous encode.    |
+/// | `ARBITRO_RAFT_FORCE_VECTORED`     | unset         | If set (any value), always pick vectored encode.      |
+/// | `ARBITRO_RAFT_VEC_IOV_MAX`        | 4096          | Upper cap on iovec count before falling back to cont. |
+/// | `ARBITRO_RAFT_VEC_MIN_ENTRY`     | 4096  (1 pg)   | Minimum per-entry payload size for vectored to win.   |
+/// | `ARBITRO_RAFT_VEC_MIN_TOTAL`      | 65536 (64 KiB)| Minimum total payload bytes to amortize writev cost.  |
+///
+/// `FORCE_*` takes precedence over the size heuristic. Setting both force
+/// vars simultaneously is undefined — contiguous wins (first check).
+struct VecTuning {
+    force: Option<bool>,
+    iov_max: usize,
+    min_entry: usize,
+    min_total: usize,
+}
+
+fn parse_usize(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn vec_tuning() -> &'static VecTuning {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<VecTuning> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let force = if std::env::var_os("ARBITRO_RAFT_FORCE_CONTIGUOUS").is_some() {
+            Some(false)
+        } else if std::env::var_os("ARBITRO_RAFT_FORCE_VECTORED").is_some() {
+            Some(true)
+        } else {
+            None
+        };
+        VecTuning {
+            force,
+            iov_max:   parse_usize("ARBITRO_RAFT_VEC_IOV_MAX",   4096),
+            min_entry: parse_usize("ARBITRO_RAFT_VEC_MIN_ENTRY", 4096),
+            min_total: parse_usize("ARBITRO_RAFT_VEC_MIN_TOTAL", 64 * 1024),
+        }
+    })
+}
+
+#[inline]
+fn should_use_vectored(entries: &[LogEntry<'_>]) -> bool {
+    let t = vec_tuning();
+    if let Some(forced) = t.force {
+        return forced;
+    }
+
+    // Per-entry: entry header + payload = 2 iovecs. Plus frame header + AE body + slack.
+    let n_iovs = entries.len() * 2 + 4;
+    if n_iovs > t.iov_max {
+        return false;
+    }
+    let mut total = 0usize;
+    for e in entries {
+        let len = e.payload.0.len();
+        if len < t.min_entry {
+            // Any sub-threshold entry flips us back to contiguous — the iovec overhead
+            // of that single small slice is enough to erase the win on the others.
+            return false;
+        }
+        total += len;
+    }
+    total >= t.min_total
+}
 
 impl<S, T> RaftNode<S, T>
 where
@@ -89,32 +175,76 @@ where
         };
         let msg = RaftMessage::AppendEntriesVectored(&req, entries_ref);
 
-        // 2. Encode to Bytes once (Sharing ownership across parallel sends)
-        let frame = encode_message_to_bytes(self.config.node_id, &msg)?;
-
-        // 3. Dispatch parallel sends (Fan-out)
-        let mut sends = Vec::with_capacity(self.scratch_peers.len());
-        let transport = &self.transport; // Shared reference for parallel access
-        for i in 0..self.scratch_peers.len() {
-            let peer = self.scratch_peers[i];
-            let f = frame.clone(); // O(1) clone
-            sends.push(async move { (peer, transport.send_frame_owned(peer, f).await) });
-        }
-
-        self.scratch_pending.clear();
-        let results = futures::future::join_all(sends).await;
-
-        // 4. Record successes
         let sent_last_index = last_log_index;
-        for (peer, res) in results {
-            if res.is_ok() {
-                self.scratch_pending.insert(
-                    peer,
-                    AppendAttemptState {
-                        attempts: 1,
-                        sent_last_index,
-                    },
-                );
+        self.scratch_pending.clear();
+
+        // Hybrid encoding strategy. See `should_use_vectored` — sub-page entries
+        // or small total bytes take the contiguous path (1 memcpy + O(1) Bytes
+        // clones to N peers). Large page-aligned batches take the vectored path
+        // (zero-copy payload slices, one writev per peer).
+        if should_use_vectored(entries_ref) {
+            // --- Vectored fan-out ---
+            self.scratch_vectored.clear();
+            // SAFETY: scratch_vectored is stored as Vec<(*const u8, usize)> but
+            // the encoder and transport treat it as Vec<&[u8]>. Same pattern as
+            // `send_message`. Cleared before we return, so no borrow escapes.
+            let iovs: &mut Vec<&[u8]> = unsafe {
+                std::mem::transmute::<&mut Vec<(*const u8, usize)>, &mut Vec<&[u8]>>(
+                    &mut self.scratch_vectored,
+                )
+            };
+            encode_message_vectored(
+                self.config.node_id,
+                &msg,
+                &mut self.scratch_outbound,
+                iovs,
+            )?;
+
+            // Shared slice view — all peers send the exact same bytes.
+            let slices: &[&[u8]] = iovs.as_slice();
+            let transport = &self.transport;
+            let mut sends = Vec::with_capacity(self.scratch_peers.len());
+            for &peer in &self.scratch_peers {
+                sends.push(async move { (peer, transport.send_vectored(peer, slices).await) });
+            }
+
+            let results = futures::future::join_all(sends).await;
+            for (peer, res) in results {
+                if res.is_ok() {
+                    self.scratch_pending.insert(
+                        peer,
+                        AppendAttemptState {
+                            attempts: 1,
+                            sent_last_index,
+                        },
+                    );
+                }
+            }
+
+            // Release the 'static transmute borrow before we return.
+            self.scratch_vectored.clear();
+        } else {
+            // --- Contiguous fan-out ---
+            let frame = encode_message_to_bytes(self.config.node_id, &msg)?;
+            let transport = &self.transport;
+            let mut sends = Vec::with_capacity(self.scratch_peers.len());
+            for i in 0..self.scratch_peers.len() {
+                let peer = self.scratch_peers[i];
+                let f = frame.clone(); // O(1) refcount clone
+                sends.push(async move { (peer, transport.send_frame_owned(peer, f).await) });
+            }
+
+            let results = futures::future::join_all(sends).await;
+            for (peer, res) in results {
+                if res.is_ok() {
+                    self.scratch_pending.insert(
+                        peer,
+                        AppendAttemptState {
+                            attempts: 1,
+                            sent_last_index,
+                        },
+                    );
+                }
             }
         }
 
@@ -338,10 +468,9 @@ where
             _pad: 0.into(),
         };
         let msg = RaftMessage::AppendEntriesVectored(&req, entries_ref);
-        let frame = encode_message_to_bytes(self.config.node_id, &msg)?;
 
-        let mut sends = Vec::new();
-        let transport = &self.transport;
+        // Collect peers once so the hot branches below don't repeat the filter.
+        self.scratch_peers.clear();
         for peer in self
             .config
             .peers
@@ -349,15 +478,56 @@ where
             .copied()
             .filter(|p| *p != self.config.node_id)
         {
-            let f = frame.clone();
-            sends.push(async move { transport.send_frame_owned(peer, f).await });
+            self.scratch_peers.push(peer);
         }
 
-        // Wait for all sends to complete (at the syscall level)
-        let results = futures::future::join_all(sends).await;
-        for res in results {
-            if let Err(e) = res {
-                tracing::error!(error = %e, "parallel fan-out send failed");
+        if should_use_vectored(entries_ref) {
+            // --- Vectored fan-out (bulk replication path) ---
+            self.scratch_vectored.clear();
+            // SAFETY: see `send_initial_appends` — scratch_vectored is cleared
+            // before returning, no borrow escapes self.
+            let iovs: &mut Vec<&[u8]> = unsafe {
+                std::mem::transmute::<&mut Vec<(*const u8, usize)>, &mut Vec<&[u8]>>(
+                    &mut self.scratch_vectored,
+                )
+            };
+            encode_message_vectored(
+                self.config.node_id,
+                &msg,
+                &mut self.scratch_outbound,
+                iovs,
+            )?;
+
+            let slices: &[&[u8]] = iovs.as_slice();
+            let transport = &self.transport;
+            let mut sends = Vec::with_capacity(self.scratch_peers.len());
+            for &peer in &self.scratch_peers {
+                sends.push(async move { transport.send_vectored(peer, slices).await });
+            }
+
+            let results = futures::future::join_all(sends).await;
+            for res in results {
+                if let Err(e) = res {
+                    tracing::error!(error = %e, "parallel fan-out send failed");
+                }
+            }
+
+            self.scratch_vectored.clear();
+        } else {
+            // --- Contiguous fan-out (control-plane / small-entry path) ---
+            let frame = encode_message_to_bytes(self.config.node_id, &msg)?;
+            let transport = &self.transport;
+            let mut sends = Vec::with_capacity(self.scratch_peers.len());
+            for &peer in &self.scratch_peers {
+                let f = frame.clone();
+                sends.push(async move { transport.send_frame_owned(peer, f).await });
+            }
+
+            let results = futures::future::join_all(sends).await;
+            for res in results {
+                if let Err(e) = res {
+                    tracing::error!(error = %e, "parallel fan-out send failed");
+                }
             }
         }
 

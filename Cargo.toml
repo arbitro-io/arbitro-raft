@@ -9,10 +9,10 @@ async-trait = "0.1"
 tracing = "0.1"
 zerocopy = { version = "0.8", features = ["derive"] }
 futures = "0.3"
-
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 criterion = { version = "0.8.2", features = ["async_tokio"] }
+socket2 = "0.5"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tokio-uring = "0.5"
@@ -23,4 +23,8 @@ harness = false
 
 [[bench]]
 name = "tcp_raft_bench"
+harness = false
+
+[[bench]]
+name = "dispatch_bench"
 harness = false
