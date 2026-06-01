@@ -46,6 +46,7 @@ pub struct RaftNode<S, T> {
     pub(crate) scratch_outbound: Vec<u8>,
     pub(crate) scratch_payload: Vec<u8>,
     pub(crate) scratch_payload_refs: Vec<&'static [u8]>,
+    pub(crate) scratch_responders: Vec<PeerId>,
 
     /// Cached last-log position — kept in sync with every append/truncate so
     /// `try_advance_commit_index` and leader-progress init avoid a storage read.
@@ -103,6 +104,7 @@ where
             scratch_outbound: vec![0; 1024 * 1024], // 1MB pre-allocated scratch for outbound encoding
             scratch_payload: vec![0; 16 * 1024 * 1024], // 16MB pre-allocated scratch for storage reads
             scratch_payload_refs: Vec::with_capacity(1024),
+            scratch_responders: Vec::with_capacity(peer_count),
             cached_last_log,
         })
     }
