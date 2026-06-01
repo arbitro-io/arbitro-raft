@@ -30,7 +30,7 @@ where
         let chunk_size = self.config.limits.snapshot_chunk_bytes.max(1);
         let total_len = snapshot.len();
         let mut offset = 0usize;
-        let timeout = Duration::from_millis(self.config.timing.heartbeat_ms as u64 * 2);
+        let timeout = Duration::from_millis(self.config.timing.heartbeat_ms * 2);
 
         loop {
             let end = (offset + chunk_size).min(total_len);

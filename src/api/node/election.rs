@@ -12,7 +12,11 @@ where
     T: crate::RaftTransport,
 {
     pub async fn campaign_once(&mut self, inbound_buf: &mut [u8]) -> Result<bool, RaftError> {
-        let started = Instant::now();
+        let started = if super::trace_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         self.soft_state.role = Role::Candidate;
         self.soft_state.is_leader = false;
         self.soft_state.leader_id = None;
@@ -32,13 +36,15 @@ where
             term = term.0,
             "starting election"
         );
-        super::trace_log(
-            self.config.node_id,
-            format!(
-                "campaign_once start term={} votes_needed={}",
-                term.0, votes_needed
-            ),
-        );
+        if super::trace_enabled() {
+            super::trace_log(
+                self.config.node_id,
+                format!(
+                    "campaign_once start term={} votes_needed={}",
+                    term.0, votes_needed
+                ),
+            );
+        }
 
         let (last_log_index, last_log_term) = self.storage.last_log_position()?;
 
@@ -126,14 +132,17 @@ where
             term = term.0,
             "leader elected"
         );
-        super::trace_log(
-            self.config.node_id,
-            format!(
-                "campaign_once elected term={} total_us={}",
-                term.0,
-                started.elapsed().as_micros()
-            ),
-        );
+        if super::trace_enabled() {
+            let total_us = started.map(|s| s.elapsed().as_micros()).unwrap_or(0);
+            super::trace_log(
+                self.config.node_id,
+                format!(
+                    "campaign_once elected term={} total_us={}",
+                    term.0,
+                    total_us
+                ),
+            );
+        }
         Ok(true)
     }
 

@@ -1,7 +1,5 @@
 use zerocopy::byteorder::little_endian::{U16, U32, U64};
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Ref, Unaligned};
-
-use crate::{PeerId, RaftError};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 // ── Protocol constants ────────────────────────────────────────────────────────
 

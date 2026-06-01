@@ -5,7 +5,7 @@ use crate::protocol::{
     AppendEntries, AppendEntriesEntryIter, AppendEntriesRawIter, AppendEntriesResp, SeededPayloads,
 };
 use crate::{LogIndex, PeerId, RaftError, RaftMessage, Role};
-use zerocopy::{IntoBytes, Ref};
+use zerocopy::Ref;
 
 impl<S, T> RaftNode<S, T>
 where

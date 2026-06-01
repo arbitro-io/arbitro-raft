@@ -8,7 +8,7 @@ pub struct BootstrapPeer {
     pub addr: SocketAddr,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NodeConfig {
     pub cluster_id: ClusterId,
     pub node_id: PeerId,
@@ -19,16 +19,4 @@ pub struct NodeConfig {
     pub bootstrap_peers: Vec<BootstrapPeer>,
     pub timing: TimingConfig,
     pub limits: LimitsConfig,
-}
-impl Default for NodeConfig {
-    fn default() -> Self {
-        Self {
-            cluster_id: ClusterId::default(),
-            node_id: PeerId::default(),
-            peers: Vec::new(),
-            bootstrap_peers: Vec::new(),
-            timing: TimingConfig::default(),
-            limits: LimitsConfig::default(),
-        }
-    }
 }

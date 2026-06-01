@@ -238,19 +238,37 @@ where
     }
 
     pub(crate) async fn drain_inbound_ready(&mut self) -> Result<(), RaftError> {
-        let mut drain_buf = vec![0; 64 * 1024]; // Scratch for drained packets
-        loop {
-            match self
-                .transport
-                .recv_frame_timeout(Duration::ZERO, &mut drain_buf)
-                .await?
-            {
-                Some(n) => {
-                    let inbound = crate::decode_message(&drain_buf[..n])?;
-                    self.handle_inbound(inbound).await?;
-                }
-                None => break,
+        // Reuse preallocated scratch_quorum_buf to avoid 64KB allocation in hot propose path
+        self.scratch_quorum_buf.clear();
+        if self.scratch_quorum_buf.capacity() < 64 * 1024 {
+            self.scratch_quorum_buf.reserve(64 * 1024);
+        }
+        unsafe { self.scratch_quorum_buf.set_len(64 * 1024) };
+
+        // Take the buffer to satisfy the borrow checker during zero-copy decode & handle
+        struct BufferGuard<'a, S, T> {
+            node: &'a mut RaftNode<S, T>,
+            buf: Vec<u8>,
+        }
+        impl<S, T> Drop for BufferGuard<'_, S, T> {
+            fn drop(&mut self) {
+                self.node.scratch_quorum_buf = std::mem::take(&mut self.buf);
             }
+        }
+
+        let mut guard = BufferGuard {
+            buf: std::mem::take(&mut self.scratch_quorum_buf),
+            node: self,
+        };
+
+        while let Some(n) = guard
+            .node
+            .transport
+            .recv_frame_timeout(Duration::ZERO, &mut guard.buf)
+            .await?
+        {
+            let inbound = crate::decode_message(&guard.buf[..n])?;
+            guard.node.handle_inbound(inbound).await?;
         }
         Ok(())
     }

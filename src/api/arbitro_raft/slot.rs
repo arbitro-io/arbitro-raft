@@ -96,14 +96,13 @@ impl SlotRegistry {
             // A slot is free if its state is NOT SLOT_PENDING.
             // When we lease it, we atomically move it to SLOT_PENDING.
             let current = slot.state.load(Ordering::Acquire);
-            if current != SLOT_PENDING {
-                if slot
+            if current != SLOT_PENDING
+                && slot
                     .state
                     .compare_exchange(current, SLOT_PENDING, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
-                {
-                    return Some(SlotId(idx as u32));
-                }
+            {
+                return Some(SlotId(idx as u32));
             }
         }
         None

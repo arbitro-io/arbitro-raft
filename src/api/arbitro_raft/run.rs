@@ -119,12 +119,28 @@ where
     /// entries. This allocation happens once per batch, NOT per entry.
     pub(super) async fn replicate_pending(&mut self) -> Result<(), RaftError> {
         // Form a slice of slices — one indirect per already-owned Vec<u8> in pending_batch.
-        let mut payloads = Vec::with_capacity(self.pending_batch.len());
+        self.node.scratch_payload_refs.clear();
         for p in &self.pending_batch {
-            payloads.push(p.as_slice());
+            // Safety: We temporarily transmute the lifetime of the slice to &'static [u8].
+            // This is safe because we clear the scratchpad before returning, and replicate_batch_async
+            // only accesses it during its synchronous asynchronous block execution.
+            let slice_static = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(p.as_slice()) };
+            self.node.scratch_payload_refs.push(slice_static);
         }
 
-        match self.node.replicate_batch_async(&payloads).await {
+        // SAFETY: We temporarily erase the lifetime link between self.node and the slice passed
+        // as argument to replicate_batch_async, allowing &mut self.node to be called concurrently.
+        // This is safe because replicate_batch_async only reads the references synchronously
+        // during its execution, and we clear the scratchpad immediately afterwards.
+        let refs: &'static [&'static [u8]] = unsafe {
+            std::mem::transmute::<&[&[u8]], &'static [&'static [u8]]>(
+                self.node.scratch_payload_refs.as_slice(),
+            )
+        };
+        let res = self.node.replicate_batch_async(refs).await;
+        self.node.scratch_payload_refs.clear();
+
+        match res {
             Ok((first_index, _)) => {
                 for (i, slot_id) in self.pending_slots.drain(..).enumerate() {
                     self.commit_waiters.push(CommitWaiter {
@@ -215,7 +231,7 @@ where
         if self
             .commit_waiters
             .last()
-            .map_or(false, |w| w.index <= commit_index)
+            .is_some_and(|w| w.index <= commit_index)
         {
             for w in self.commit_waiters.drain(..) {
                 self.registry.get(w.slot_id).notify_committed(w.index);
