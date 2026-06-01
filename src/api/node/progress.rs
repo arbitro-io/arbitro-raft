@@ -14,7 +14,14 @@ pub(crate) struct PeerMap<V> {
 }
 
 impl<V> PeerMap<V> {
+    #[allow(dead_code)]
     pub(crate) fn new() -> Self { Self { entries: Vec::new() } }
+
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+        }
+    }
 
     #[inline] pub(crate) fn is_empty(&self) -> bool { self.entries.is_empty() }
     #[inline] pub(crate) fn clear(&mut self)          { self.entries.clear(); }

@@ -129,6 +129,7 @@ pub fn encode_message_vectored<'a>(
 
 /// Specialized vectored encoder for batches. Interleaves Entry headers (written to header_buf)
 /// and their respective payloads (from entries).
+#[allow(clippy::too_many_arguments)]
 pub fn encode_append_entries_vectored<'a>(
     from: PeerId,
     term: Term,

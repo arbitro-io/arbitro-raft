@@ -49,7 +49,7 @@ impl<'a> AppendEntriesView<'a> {
         self.payload
     }
 
-    pub fn wire(&self) -> &AppendEntries {
-        &self.wire
+    pub fn wire(&self) -> &'a AppendEntries {
+        self.wire
     }
 }

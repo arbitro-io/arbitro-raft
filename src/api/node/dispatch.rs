@@ -65,8 +65,11 @@ where
         R: Clone + Send + 'static,
     {
         let envelope = spec.dispatch(params).build()?;
-        let targets = self.dispatch_targets(envelope.options().scope);
-        let (handle, tx) = envelope.begin(targets.iter().copied(), spec.decode_response_fn());
+        self.populate_dispatch_targets(envelope.options().scope);
+        let (handle, tx) = envelope.begin(
+            self.scratch_peers.iter().copied(),
+            spec.decode_response_fn(),
+        );
 
         self.pending_custom.insert(
             envelope.tx_id(),
@@ -76,12 +79,8 @@ where
             }),
         );
 
-        // Prepare parallel fan-out
         let msg = RaftMessage::Custom(envelope.bytes());
         let frame = crate::protocol::encode_message_to_bytes(self.config.node_id, &msg)?;
-
-        // Note: we must keep the responder and route alive while the future is evaluated.
-        // They must be declared BEFORE local_invoke so they are dropped AFTER it.
         let route = self.route_for_peer(self.config.node_id);
         let responder = LocalDispatchResponder {
             local_peer: self.config.node_id,
@@ -90,37 +89,35 @@ where
             tx_id: envelope.tx_id(),
         };
 
-        let mut sends = Vec::with_capacity(targets.len());
+        let mut sends = Vec::with_capacity(self.scratch_peers.len());
         let mut local_invoke = None;
 
-        for peer in targets {
+        for i in 0..self.scratch_peers.len() {
+            let peer = self.scratch_peers[i];
             if peer == self.config.node_id {
                 local_invoke = Some(self.custom_registry.invoke_bytes_scoped(
                     envelope.bytes(),
                     &responder,
                     route,
                 ));
-                continue;
+            } else {
+                sends.push(self.transport.send_frame_owned(peer, frame.clone()));
             }
-            sends.push(self.transport.send_frame_owned(peer, frame.clone()));
         }
 
-        // Execute all concurrently
+        let net_results = futures::future::join_all(sends);
         if let Some(local) = local_invoke {
-            let (local_res, net_results) =
-                futures::future::join(local, futures::future::join_all(sends)).await;
-
-            local_res?; // Bubble up local registry errors
-            for res in net_results {
+            let (local_res, net) = futures::future::join(local, net_results).await;
+            local_res?;
+            for res in net {
                 if let Err(e) = res {
-                    tracing::error!(error = %e, "dispatch fan-out failed for peer");
+                    tracing::error!(error = %e, "dispatch fan-out failed");
                 }
             }
         } else {
-            let net_results = futures::future::join_all(sends).await;
-            for res in net_results {
+            for res in net_results.await {
                 if let Err(e) = res {
-                    tracing::error!(error = %e, "dispatch fan-out failed for peer");
+                    tracing::error!(error = %e, "dispatch fan-out failed");
                 }
             }
         }
@@ -202,18 +199,19 @@ where
         }
     }
 
-    fn dispatch_targets(&self, scope: DispatchScope) -> Vec<PeerId> {
-        self.config
-            .peers
-            .iter()
-            .copied()
-            .filter(|&peer| {
-                if peer == self.config.node_id && self.config.peers.len() > 1 && !self.is_leader() {
-                    return matches!(scope, DispatchScope::LocalOnly);
-                }
+    fn populate_dispatch_targets(&mut self, scope: DispatchScope) {
+        self.scratch_peers.clear();
+        for i in 0..self.config.peers.len() {
+            let peer = self.config.peers[i];
+            let matches = if peer == self.config.node_id && self.config.peers.len() > 1 && !self.is_leader() {
+                matches!(scope, DispatchScope::LocalOnly)
+            } else {
                 scope.allows(self.route_for_peer(peer))
-            })
-            .collect()
+            };
+            if matches {
+                self.scratch_peers.push(peer);
+            }
+        }
     }
 }
 
