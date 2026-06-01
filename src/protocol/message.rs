@@ -9,6 +9,8 @@ use zerocopy::Ref;
 pub enum RaftMessage<'a> {
     RequestVote(&'a RequestVote),
     RequestVoteResp(&'a RequestVoteResp),
+    PreVote(&'a RequestVote),
+    PreVoteResp(&'a RequestVoteResp),
     AppendEntries(&'a AppendEntries, &'a [u8]), // Body + Raw payload (for inbound)
     AppendEntriesVectored(&'a AppendEntries, &'a [LogEntry<'a>]), // Body + Parsed entries (for outbound)
     /// MAGIC ZEROCOPY: Inbound contiguous block

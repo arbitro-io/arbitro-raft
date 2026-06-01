@@ -197,4 +197,134 @@ where
     pub(crate) fn election_timeout(&self) -> Duration {
         Duration::from_millis(self.config.timing.election_max_ms.max(1))
     }
+
+    pub async fn campaign_pre_vote(&mut self, inbound_buf: &mut [u8]) -> Result<bool, RaftError> {
+        let pre_vote_term = Term(self.hard_state.current_term.0 + 1);
+        let votes_needed = super::quorum(self.config.peers.len());
+        
+        info!(
+            node_id = self.config.node_id.0,
+            term = pre_vote_term.0,
+            "starting pre-vote phase"
+        );
+
+        let (last_log_idx, last_log_term) = self.storage.last_log_position()?;
+        let req = RequestVote {
+            term: pre_vote_term.0.into(),
+            candidate_id: self.config.node_id.0.into(),
+            last_log_index: last_log_idx.0.into(),
+            last_log_term: last_log_term.0.into(),
+        };
+
+        self.scratch_peers.clear();
+        for peer in self.config.peers.iter().copied() {
+            if peer != self.config.node_id {
+                self.scratch_peers.push(peer);
+            }
+        }
+
+        let msg = RaftMessage::PreVote(&req);
+        let frame = crate::protocol::encode_message_to_bytes(self.config.node_id, &msg)?;
+        let mut sends = Vec::with_capacity(self.scratch_peers.len());
+        for i in 0..self.scratch_peers.len() {
+            let peer = self.scratch_peers[i];
+            sends.push(self.transport.send_frame_owned(peer, frame.clone()));
+        }
+
+        let mut possible_votes = 1usize;
+        for res in futures::future::join_all(sends).await {
+            if res.is_ok() {
+                possible_votes += 1;
+            }
+        }
+
+        if possible_votes < votes_needed {
+            return Ok(false);
+        }
+
+        let mut votes = 1usize;
+        self.scratch_responders.clear();
+        let timeout = self.election_timeout();
+
+        while votes < votes_needed && self.scratch_responders.len() < possible_votes {
+            let n = match self
+                .transport
+                .recv_frame_timeout(timeout, inbound_buf)
+                .await?
+            {
+                Some(n) => n,
+                None => return Ok(false),
+            };
+            let inbound = crate::decode_message(&inbound_buf[..n])?;
+            let from = inbound.from;
+
+            match inbound.message {
+                RaftMessage::PreVoteResp(resp) => {
+                    if self.scratch_responders.contains(&from) {
+                        continue;
+                    }
+                    self.scratch_responders.push(from);
+                    let resp_term = Term(resp.term.get());
+                    if resp_term.0 > self.hard_state.current_term.0 {
+                        self.step_down(resp_term)?;
+                        return Ok(false);
+                    }
+                    if resp_term == pre_vote_term && resp.vote_granted != 0 {
+                        votes += 1;
+                        debug!(
+                            node_id = self.config.node_id.0,
+                            voter = from.0,
+                            votes,
+                            needed = votes_needed,
+                            "pre-vote granted"
+                        );
+                    }
+                }
+                message => {
+                    self.handle_inbound(InboundRaftMessage { from, message })
+                        .await?;
+                }
+            }
+        }
+
+        Ok(votes >= votes_needed)
+    }
+
+    pub(crate) async fn handle_pre_vote(
+        &mut self,
+        from: crate::PeerId,
+        msg: &RequestVote,
+    ) -> Result<(), RaftError> {
+        let msg_term = Term(msg.term.get());
+        let msg_log_term = Term(msg.last_log_term.get());
+        let msg_log_idx = crate::LogIndex(msg.last_log_index.get());
+
+        let (last_log_index, last_log_term) = self.storage.last_log_position()?;
+        let candidate_up_to_date = msg_log_term.0 > last_log_term.0
+            || (msg_log_term == last_log_term && msg_log_idx >= last_log_index);
+
+        let can_grant = msg_term.0 >= self.hard_state.current_term.0
+            && candidate_up_to_date;
+
+        let resp_msg = RequestVoteResp {
+            term: self.hard_state.current_term.0.into(),
+            vote_granted: if can_grant { 1 } else { 0 },
+            _pad: [0; 7],
+        };
+        self.send_message(from, &RaftMessage::PreVoteResp(&resp_msg))
+            .await;
+        Ok(())
+    }
+
+    pub(crate) async fn handle_pre_vote_response(
+        &mut self,
+        _from: crate::PeerId,
+        resp: &RequestVoteResp,
+    ) -> Result<(), RaftError> {
+        let term = Term(resp.term.get());
+        if term.0 > self.hard_state.current_term.0 {
+            self.step_down(term)?;
+        }
+        Ok(())
+    }
 }

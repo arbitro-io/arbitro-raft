@@ -184,6 +184,9 @@ where
         inbound: InboundRaftMessage<'_>,
     ) -> Result<(), RaftError> {
         let from = inbound.from;
+        if self.is_leader() {
+            self.scratch_started.insert(from, std::time::Instant::now());
+        }
         match inbound.message {
             RaftMessage::AppendEntries(msg, payload) => {
                 self.handle_append_entries(from, msg, payload).await
@@ -205,6 +208,8 @@ where
             }
             RaftMessage::RequestVote(msg) => self.handle_request_vote(from, msg).await,
             RaftMessage::RequestVoteResp(msg) => self.handle_request_vote_response(from, msg).await,
+            RaftMessage::PreVote(msg) => self.handle_pre_vote(from, msg).await,
+            RaftMessage::PreVoteResp(msg) => self.handle_pre_vote_response(from, msg).await,
             RaftMessage::InstallSnapshot(msg, payload) => {
                 self.handle_install_snapshot(from, msg, payload).await
             }
@@ -286,5 +291,28 @@ pub(crate) fn trace_enabled() -> bool {
 pub(crate) fn trace_log(node_id: PeerId, msg: impl AsRef<str>) {
     if trace_enabled() {
         tracing::trace!(node = node_id.0, "{}", msg.as_ref());
+    }
+}
+
+impl<S, T> RaftNode<S, T>
+where
+    S: crate::RaftStorage,
+    T: crate::RaftTransport,
+{
+    pub(crate) fn check_quorum_active(&mut self) -> bool {
+        let timeout = self.election_timeout();
+        let now = std::time::Instant::now();
+        let mut active_count = 1usize; // self is always active
+
+        for &peer in &self.config.peers {
+            if peer != self.config.node_id {
+                if let Some(&last_contact) = self.scratch_started.get(&peer) {
+                    if now.saturating_duration_since(last_contact) < timeout {
+                        active_count += 1;
+                    }
+                }
+            }
+        }
+        active_count >= quorum(self.config.peers.len())
     }
 }

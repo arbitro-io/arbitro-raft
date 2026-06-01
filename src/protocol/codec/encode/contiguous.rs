@@ -73,6 +73,12 @@ pub fn encode_message_to_bytes(from: PeerId, msg: &RaftMessage) -> Result<bytes:
         RaftMessage::RequestVoteResp(m) => {
             buf[RAFT_FRAME_HEADER_SIZE..].copy_from_slice(m.as_bytes());
         }
+        RaftMessage::PreVote(m) => {
+            buf[RAFT_FRAME_HEADER_SIZE..].copy_from_slice(m.as_bytes());
+        }
+        RaftMessage::PreVoteResp(m) => {
+            buf[RAFT_FRAME_HEADER_SIZE..].copy_from_slice(m.as_bytes());
+        }
         RaftMessage::AppendEntriesResp(m) => {
             buf[RAFT_FRAME_HEADER_SIZE..].copy_from_slice(m.as_bytes());
         }

@@ -163,6 +163,7 @@ where
 
     pub(crate) fn initialize_leader_progress(&mut self) -> Result<(), RaftError> {
         self.peer_progress.clear();
+        self.scratch_started.clear();
         let last_index = self.cached_last_log.0;
         for peer in self
             .config
@@ -178,6 +179,7 @@ where
                     match_index: LogIndex(0),
                 },
             );
+            self.scratch_started.insert(peer, std::time::Instant::now());
         }
         Ok(())
     }

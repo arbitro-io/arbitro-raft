@@ -16,6 +16,8 @@ pub const KIND_INSTALL_SNAPSHOT_RESP: u8 = 6;
 pub const KIND_CUSTOM: u8 = 7;
 pub const KIND_CUSTOM_RESPONSE: u8 = 8;
 pub const KIND_APPEND_ENTRIES_SEEDED: u8 = 9;
+pub const KIND_PRE_VOTE: u8 = 10;
+pub const KIND_PRE_VOTE_RESP: u8 = 11;
 
 // ── Wire structs ──────────────────────────────────────────────────────────────
 

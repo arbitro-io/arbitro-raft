@@ -70,6 +70,14 @@ where
         // 3. Idle — wait until next heartbeat or next inbound frame.
         let now = Instant::now();
         if now >= self.next_heartbeat_at {
+            // Check-Quorum validation: leader must check if it still maintains a majority lease
+            if !self.node.check_quorum_active() {
+                tracing::info!(node_id = self.node.node_id().0, "lost quorum contact, abdicating leadership");
+                let term = self.node.current_term();
+                self.node.step_down(term)?;
+                self.fail_commit_waiters();
+                return Ok(());
+            }
             self.node.send_heartbeat_once().await?;
             self.reset_heartbeat_deadline();
             return Ok(());
@@ -198,20 +206,34 @@ where
                     self.reset_heartbeat_deadline();
                 }
             }
-            None => match self.node.campaign_once(&mut self.inbound_buf).await {
-                Ok(elected) => {
-                    self.reset_election_deadline();
-                    if elected {
-                        self.reset_heartbeat_deadline();
-                        self.node.send_heartbeat_once().await?;
-                        self.reset_heartbeat_deadline();
+            None => {
+                // Pre-Vote protocol: first check if the cluster would support our candidacy
+                let pre_vote_success = match self.node.campaign_pre_vote(&mut self.inbound_buf).await {
+                    Ok(success) => success,
+                    Err(RaftError::NoQuorum) => false,
+                    Err(err) => return Err(err),
+                };
+
+                if pre_vote_success {
+                    // Only start a real election if the pre-vote check succeeded
+                    match self.node.campaign_once(&mut self.inbound_buf).await {
+                        Ok(elected) => {
+                            self.reset_election_deadline();
+                            if elected {
+                                self.reset_heartbeat_deadline();
+                                self.node.send_heartbeat_once().await?;
+                                self.reset_heartbeat_deadline();
+                            }
+                        }
+                        Err(RaftError::NoQuorum) => {
+                            self.reset_election_deadline();
+                        }
+                        Err(err) => return Err(err),
                     }
-                }
-                Err(RaftError::NoQuorum) => {
+                } else {
                     self.reset_election_deadline();
                 }
-                Err(err) => return Err(err),
-            },
+            }
         }
 
         Ok(())

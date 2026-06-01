@@ -64,6 +64,14 @@ pub fn encode_message_vectored<'a>(
             out_vectored.push(&header_buf[..RAFT_FRAME_HEADER_SIZE]);
             out_vectored.push(m.as_bytes());
         }
+        RaftMessage::PreVote(m) => {
+            out_vectored.push(&header_buf[..RAFT_FRAME_HEADER_SIZE]);
+            out_vectored.push(m.as_bytes());
+        }
+        RaftMessage::PreVoteResp(m) => {
+            out_vectored.push(&header_buf[..RAFT_FRAME_HEADER_SIZE]);
+            out_vectored.push(m.as_bytes());
+        }
         RaftMessage::AppendEntries(m, p) => {
             out_vectored.push(&header_buf[..RAFT_FRAME_HEADER_SIZE]);
             out_vectored.push(m.as_bytes());
