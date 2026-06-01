@@ -42,6 +42,31 @@ pub(crate) fn validate_append_entries_body(
     Ok(())
 }
 
+fn validate_seeded_payloads(
+    headers: &[u8],
+    payloads: &[u8],
+    count: usize,
+) -> Result<(), RaftError> {
+    let header_size = std::mem::size_of::<EntryHeader>();
+    let mut expected_len = 0usize;
+    for i in 0..count {
+        let offset = i * header_size;
+        let header_bytes = &headers[offset..offset + header_size];
+        let header_ref = Ref::<&[u8], EntryHeader>::from_bytes(header_bytes)
+            .map_err(|_| RaftError::Protocol("unaligned seeded entry header".into()))?;
+        let header = Ref::into_ref(header_ref);
+        expected_len += header.payload_len.get() as usize;
+    }
+    if expected_len != payloads.len() {
+        return Err(RaftError::Protocol(format!(
+            "seeded payloads size mismatch: headers specify={} actual={}",
+            expected_len,
+            payloads.len()
+        )));
+    }
+    Ok(())
+}
+
 // ── Top-level decode ──────────────────────────────────────────────────────────
 
 pub fn decode_message<'a>(frame: &'a [u8]) -> Result<InboundRaftMessage<'a>, RaftError> {
@@ -112,6 +137,7 @@ pub fn decode_message<'a>(frame: &'a [u8]) -> Result<InboundRaftMessage<'a>, Raf
             }
 
             let (headers, payloads) = body_rest.split_at(headers_len);
+            validate_seeded_payloads(headers, payloads, count)?;
             RaftMessage::AppendEntriesSeeded {
                 ae,
                 headers,

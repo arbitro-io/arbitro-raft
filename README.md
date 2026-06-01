@@ -19,17 +19,18 @@
 
 | Scenario | Mode | Latency (P50) | Throughput (Peak) |
 | :--- | :--- | :--- | :--- |
-| **Direct Proposal** | Single client (empty) | **1.43 µs** | 699 K ops/s |
-| **Extreme Batch** | 4096-entry batch | 129.25 µs | **31.69 M ops/s** |
+| **Direct Proposal** | Single client (empty) | **548.84 ns** | **1.82 M ops/s** |
+| **Direct Proposal** | Single client (1KB) | **948.44 ns** | **1.05 M ops/s** |
+| **Extreme Batch** | 4096-entry batch | 132.54 µs | **30.90 M ops/s** |
 
 #### Tier 2: TCP Transport (Network Reality)
 *Loopback TCP sockets, TCP_NODELAY, real-world serialization, hybrid vectored I/O.*
 
 | Scenario | Mode | Latency (P50) | Throughput (Peak) |
 | :--- | :--- | :--- | :--- |
-| **Direct Proposal** | Single client (empty) | **43.76 µs** | 22.8 K ops/s |
-| **Direct Proposal** | Single client (1KB) | **48.96 µs** | 20.4 K ops/s |
-| **Extreme Batch** | 1024 clients (no-op transport) | 90.0 µs | **11.4 M ops/s** |
+| **Direct Proposal** | Single client (empty) | **38.13 µs** | **26.2 K ops/s** |
+| **Direct Proposal** | Single client (1KB) | **37.56 µs** | **26.6 K ops/s** |
+| **Extreme Batch** | 1024 clients (no-op transport) | 81.41 µs | **12.58 M ops/s** |
 | **Replicated Batch** | 1024-entry batch w/ follower | 2.65 ms | **387 K ops/s** |
 
 #### Tier 3: Parallel Dispatch & Orchestration Latency (`dispatch_bench`)

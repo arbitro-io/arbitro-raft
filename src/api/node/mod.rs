@@ -185,8 +185,6 @@ where
     ) -> Result<(), RaftError> {
         let from = inbound.from;
         match inbound.message {
-            RaftMessage::RequestVote(msg) => self.handle_request_vote(from, msg).await,
-            RaftMessage::RequestVoteResp(msg) => self.handle_request_vote_response(from, msg).await,
             RaftMessage::AppendEntries(msg, payload) => {
                 self.handle_append_entries(from, msg, payload).await
             }
@@ -201,15 +199,17 @@ where
             RaftMessage::AppendEntriesResp(msg) => {
                 self.handle_append_entries_response(from, msg).await
             }
+            RaftMessage::Custom(payload) => self.handle_custom_message(from, payload).await,
+            RaftMessage::CustomResponse(payload) => {
+                self.handle_custom_response(from, payload).await
+            }
+            RaftMessage::RequestVote(msg) => self.handle_request_vote(from, msg).await,
+            RaftMessage::RequestVoteResp(msg) => self.handle_request_vote_response(from, msg).await,
             RaftMessage::InstallSnapshot(msg, payload) => {
                 self.handle_install_snapshot(from, msg, payload).await
             }
             RaftMessage::InstallSnapshotResp(msg) => {
                 self.handle_install_snapshot_response(from, msg).await
-            }
-            RaftMessage::Custom(payload) => self.handle_custom_message(from, payload).await,
-            RaftMessage::CustomResponse(payload) => {
-                self.handle_custom_response(from, payload).await
             }
             RaftMessage::AppendEntriesVectored(_, _)
             | RaftMessage::AppendEntriesSeededVectored { .. } => {

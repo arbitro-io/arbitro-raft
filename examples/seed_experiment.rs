@@ -1,4 +1,4 @@
-use arbitro_raft::{AppendEntries, EntryHeader, EntryPayload, LogEntry, LogIndex, PeerId, Term};
+use arbitro_raft::{EntryHeader, EntryPayload, LogEntry, LogIndex, Term};
 use std::time::Instant;
 use zerocopy::IntoBytes;
 

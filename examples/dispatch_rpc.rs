@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use arbitro_raft::{
     BootstrapPeer, ClusterId, DispatchAckPolicy, DispatchPeerState, DispatchScope, DispatchSpec,
-    EntryPayload, HardState, LogEntry, LogIndex, NodeConfig, PeerId, RaftError, RaftMessage,
+    EntryPayload, HardState, LogEntry, LogIndex, NodeConfig, PeerId, RaftError,
     RaftNode, RaftStorage, RaftTransport, SnapshotMeta, Term,
 };
 

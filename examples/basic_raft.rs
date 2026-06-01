@@ -21,7 +21,7 @@ use arbitro_raft::{
     ArbitroRaft, BootstrapPeer, ClusterId, EntryPayload, HardState, LogEntry, LogIndex, NodeConfig,
     PeerId, RaftError, RaftNode, RaftStorage, RaftTransport, SnapshotMeta, Term,
 };
-use async_trait::async_trait;
+
 
 // ── Minimal in-memory storage ─────────────────────────────────────────────────
 

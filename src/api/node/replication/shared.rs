@@ -152,7 +152,9 @@ where
         };
 
         let msg = RaftMessage::AppendEntriesVectored(&req, entries_ref);
-        if self.send_message(peer, &msg).await {
+        let sent = self.send_message(peer, &msg).await;
+        self.scratch_entries.clear();
+        if sent {
             Ok(Some(last_idx))
         } else {
             Ok(None)

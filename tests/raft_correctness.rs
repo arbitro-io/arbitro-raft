@@ -7,14 +7,12 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use futures::StreamExt;
 
 use arbitro_raft::{
-    decode_message, encode_message_vectored, validate_node_config, AppendEntries,
-    AppendEntriesResp, ArbitroRaft, BootstrapPeer, ClusterId, EntryHeader, EntryPayload, HardState,
+    decode_message, validate_node_config, BootstrapPeer, ClusterId, EntryPayload, HardState,
     LimitsConfig, LogEntry, LogIndex, NodeConfig, PeerId, RaftError, RaftMessage, RaftStorage,
-    RaftTransport, Role, SnapshotMeta, Term, TimingConfig,
+    RaftTransport, SnapshotMeta, Term, TimingConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -37,16 +35,6 @@ impl TestTransport {
             },
             out_rx,
         )
-    }
-
-    fn new_with_inject() -> (Self, futures::channel::mpsc::UnboundedSender<Vec<u8>>) {
-        let (tx, _out_rx) = futures::channel::mpsc::unbounded::<Vec<u8>>();
-        let (itx, irx) = futures::channel::mpsc::unbounded::<Vec<u8>>();
-        let transport = Self {
-            tx,
-            rx: Arc::new(tokio::sync::Mutex::new(irx)),
-        };
-        (transport, itx)
     }
 }
 

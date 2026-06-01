@@ -42,7 +42,9 @@ where
         // the entries we are about to write.
         self.ensure_leader_progress_initialized()?;
         let last_index = self.append_propose_entries(payloads)?;
-        self.send_initial_appends().await?;
+        let res = self.send_initial_appends().await;
+        self.scratch_entries.clear();
+        res?;
 
         let needed = super::super::quorum(self.config.peers.len());
         let timeout = Duration::from_millis(self.config.timing.heartbeat_ms * 2);

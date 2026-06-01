@@ -64,9 +64,14 @@ impl Slot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotId(pub(super) u32);
 
+#[repr(align(64))]
+struct AlignedCursor {
+    value: AtomicU64,
+}
+
 pub(crate) struct SlotRegistry {
     arena: Box<[Slot]>,
-    cursor: AtomicU64,
+    cursor: AlignedCursor,
 }
 
 impl SlotRegistry {
@@ -80,14 +85,16 @@ impl SlotRegistry {
         }
         Arc::new(Self {
             arena: slots.into_boxed_slice(),
-            cursor: AtomicU64::new(0),
+            cursor: AlignedCursor {
+                value: AtomicU64::new(0),
+            },
         })
     }
 
     #[inline]
     pub fn lease(&self) -> Option<SlotId> {
         let cap = self.arena.len() as u64;
-        let start = self.cursor.fetch_add(1, Ordering::Relaxed);
+        let start = self.cursor.value.fetch_add(1, Ordering::Relaxed);
 
         for i in 0..cap {
             let idx = ((start + i) % cap) as usize;
