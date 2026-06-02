@@ -96,12 +96,16 @@ where
     ) -> Result<bool, RaftError> {
         let mut votes = 1usize;
         self.scratch_responders.clear();
-        let timeout = self.election_timeout();
+        let deadline = Instant::now() + self.election_timeout();
 
         while votes < votes_needed && self.scratch_responders.len() < possible_votes {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(RaftError::NoQuorum);
+            }
             let n = match self
                 .transport
-                .recv_frame_timeout(timeout, inbound_buf)
+                .recv_frame_timeout(remaining, inbound_buf)
                 .await?
             {
                 Some(n) => n,
@@ -244,12 +248,19 @@ where
 
         let mut votes = 1usize;
         self.scratch_responders.clear();
-        let timeout = self.election_timeout();
+        // Absolute deadline: processing non-response messages (concurrent
+        // PreVote requests) must not extend the collection window, otherwise
+        // split-vote persists indefinitely with 3+ simultaneous campaigns.
+        let deadline = Instant::now() + self.election_timeout();
 
         while votes < votes_needed && self.scratch_responders.len() < possible_votes {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
             let n = match self
                 .transport
-                .recv_frame_timeout(timeout, inbound_buf)
+                .recv_frame_timeout(remaining, inbound_buf)
                 .await?
             {
                 Some(n) => n,
