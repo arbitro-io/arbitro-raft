@@ -45,4 +45,17 @@ pub trait RaftTransport: Send + Sync {
         timeout: Duration,
         out: &mut [u8],
     ) -> impl std::future::Future<Output = Result<Option<usize>, RaftError>> + Send;
+
+    /// Send a file using DMA (Direct Memory Access / sendfile / io_uring).
+    ///
+    /// Falls back to returning a Transport error by default.
+    fn send_file_dma(
+        &self,
+        _peer: PeerId,
+        _file: std::fs::File,
+    ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
+        async move {
+            Err(RaftError::Transport("DMA not supported by this transport".into()))
+        }
+    }
 }

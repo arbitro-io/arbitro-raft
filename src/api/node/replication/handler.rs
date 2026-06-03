@@ -55,6 +55,9 @@ where
                 )
             };
             self.storage.append_entries(entries_ref)?;
+            for entry in entries_ref {
+                self.log_metadata.append(entry.index, entry.term);
+            }
 
             if let Some(last) = self.scratch_entries.last() {
                 self.cached_last_log = (last.index, last.term);
@@ -115,6 +118,9 @@ where
             self.storage
                 .append_entries_seeded(final_headers, &self.scratch_payload_refs)?;
             self.scratch_payload_refs.clear();
+            for h in final_headers {
+                self.log_metadata.append(LogIndex(h.index.get()), crate::Term(h.term.get()));
+            }
 
             if let Some(last) = final_headers.last() {
                 self.cached_last_log = (LogIndex(last.index.get()), crate::Term(last.term.get()));

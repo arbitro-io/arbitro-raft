@@ -195,10 +195,15 @@ where
         if index.0 == 0 {
             return Ok(Term(0));
         }
-        self.storage
+        if let Some(term) = self.log_metadata.get_term(index) {
+            return Ok(term);
+        }
+        let term = self.storage
             .entry_at(index, &mut self.scratch_payload)?
             .map(|e| e.term)
-            .ok_or_else(|| RaftError::CorruptLog(format!("missing term at index {}", index.0)))
+            .ok_or_else(|| RaftError::CorruptLog(format!("missing term at index {}", index.0)))?;
+        self.log_metadata.append(index, term);
+        Ok(term)
     }
 
     /// Check whether a quorum of peers has replicated the latest entries and, if so,
@@ -229,11 +234,17 @@ where
         // Safety rule: only commit if the quorum entry belongs to current_term.
         let quorum_term = if quorum_index == self.cached_last_log.0 {
             self.cached_last_log.1
+        } else if let Some(term) = self.log_metadata.get_term(quorum_index) {
+            term
         } else {
-            self.storage
+            let term = self.storage
                 .entry_at(quorum_index, &mut self.scratch_payload)?
                 .map(|e| e.term)
-                .unwrap_or(crate::Term(0))
+                .unwrap_or(crate::Term(0));
+            if term.0 > 0 {
+                self.log_metadata.append(quorum_index, term);
+            }
+            term
         };
         if quorum_term == self.hard_state.current_term {
             self.soft_state.commit_index = quorum_index;

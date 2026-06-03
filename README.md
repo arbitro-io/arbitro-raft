@@ -161,7 +161,7 @@ The auto-mode decision is cached in a `OnceLock` on first use — zero overhead 
 ### Phase 4: Distributed Resilience & Compactness
 - [x] **Log Compaction**: Install-snapshot RPC support
 - [ ] **Membership Changes**: Single-server configuration updates (§4.1)
-- [ ] **Pre-Vote / Check-Quorum**: Leadership stability improvements
+- [x] **Pre-Vote / Check-Quorum**: Leadership stability improvements
 - [ ] **Learner Nodes**: Non-voting members for catch-up replication
 - [ ] **Generational Metadata**: Recyclable log index buffers
 - [ ] **Zero-Copy Snapshots**: DMA-friendly state transfer

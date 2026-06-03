@@ -1,6 +1,5 @@
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
-
 use super::RaftNode;
 use crate::protocol::{RequestVote, RequestVoteResp};
 use crate::{InboundRaftMessage, RaftError, RaftMessage, Role, Term};
@@ -18,7 +17,6 @@ where
         self.hard_state.current_term = Term(self.hard_state.current_term.0 + 1);
         self.hard_state.voted_for = Some(self.config.node_id);
         self.storage.save_hard_state(&self.hard_state)?;
-
         let term = self.hard_state.current_term;
         let votes_needed = super::quorum(self.config.peers.len());
         info!(node_id = self.config.node_id.0, term = term.0, "starting election");
@@ -35,9 +33,7 @@ where
             candidate_id: self.config.node_id.0.into(),
             last_log_index: last_log_idx.0.into(),
             last_log_term: last_log_term.0.into(),
-        };
-
-        let possible_votes = self.broadcast_request_vote(&req).await?;
+        };        let possible_votes = self.broadcast_request_vote(&req).await?;
         if possible_votes < votes_needed {
             return Err(RaftError::NoQuorum);
         }
@@ -45,12 +41,10 @@ where
         if !self.collect_votes(term, votes_needed, possible_votes, inbound_buf).await? {
             return Ok(false);
         }
-
         self.soft_state.role = Role::Leader;
         self.soft_state.is_leader = true;
         self.soft_state.leader_id = Some(self.config.node_id);
         self.initialize_leader_progress()?;
-
         info!(node_id = self.config.node_id.0, term = term.0, "leader elected");
         if super::trace_enabled() {
             let total_us = started.map(|s| s.elapsed().as_micros()).unwrap_or(0);
@@ -61,7 +55,6 @@ where
         }
         Ok(true)
     }
-
     async fn broadcast_request_vote(&mut self, req: &RequestVote) -> Result<usize, RaftError> {
         self.scratch_peers.clear();
         for peer in self.config.peers.iter().copied() {
@@ -69,7 +62,6 @@ where
                 self.scratch_peers.push(peer);
             }
         }
-
         let msg = RaftMessage::RequestVote(req);
         let frame = crate::protocol::encode_message_to_bytes(self.config.node_id, &msg)?;
         let mut sends = Vec::with_capacity(self.scratch_peers.len());
@@ -77,7 +69,6 @@ where
             let peer = self.scratch_peers[i];
             sends.push(self.transport.send_frame_owned(peer, frame.clone()));
         }
-
         let mut possible_votes = 1usize;
         for res in futures::future::join_all(sends).await {
             if res.is_ok() {
@@ -86,7 +77,6 @@ where
         }
         Ok(possible_votes)
     }
-
     async fn collect_votes(
         &mut self,
         term: Term,
@@ -99,23 +89,20 @@ where
         let deadline = Instant::now() + self.election_timeout();
 
         while votes < votes_needed && self.scratch_responders.len() < possible_votes {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            let mut msg_slots = [None; 16];
+            let messages_count = self
+                .drain_inbound_frames(deadline, inbound_buf, &mut msg_slots)
+                .await?;
+
+            if messages_count == 0 {
                 return Err(RaftError::NoQuorum);
             }
-            let n = match self
-                .transport
-                .recv_frame_timeout(remaining, inbound_buf)
-                .await?
-            {
-                Some(n) => n,
-                None => return Err(RaftError::NoQuorum),
-            };
-            let inbound = crate::decode_message(&inbound_buf[..n])?;
-            let from = inbound.from;
 
-            match inbound.message {
-                RaftMessage::RequestVoteResp(resp) => {
+            // 1. Process responses first
+            for slot in msg_slots.iter().take(messages_count) {
+                let inbound = slot.unwrap();
+                let from = inbound.from;
+                if let RaftMessage::RequestVoteResp(resp) = inbound.message {
                     if self.scratch_responders.contains(&from) {
                         continue;
                     }
@@ -136,9 +123,17 @@ where
                         );
                     }
                 }
-                message => {
-                    self.handle_inbound(InboundRaftMessage { from, message })
-                        .await?;
+            }
+
+            if votes >= votes_needed {
+                return Ok(true);
+            }
+
+            // 2. Process requests second
+            for slot in msg_slots.iter().take(messages_count) {
+                let inbound = slot.unwrap();
+                if !matches!(inbound.message, RaftMessage::RequestVoteResp(_)) {
+                    self.handle_inbound(inbound).await?;
                 }
             }
         }
@@ -197,7 +192,13 @@ where
         }
         Ok(())
     }
+}
 
+impl<S, T> RaftNode<S, T>
+where
+    S: crate::RaftStorage,
+    T: crate::RaftTransport,
+{
     pub(crate) fn election_timeout(&self) -> Duration {
         Duration::from_millis(self.config.timing.election_max_ms.max(1))
     }
@@ -254,23 +255,20 @@ where
         let deadline = Instant::now() + self.election_timeout();
 
         while votes < votes_needed && self.scratch_responders.len() < possible_votes {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Ok(false);
-            }
-            let n = match self
-                .transport
-                .recv_frame_timeout(remaining, inbound_buf)
-                .await?
-            {
-                Some(n) => n,
-                None => return Ok(false),
-            };
-            let inbound = crate::decode_message(&inbound_buf[..n])?;
-            let from = inbound.from;
+            let mut msg_slots = [None; 16];
+            let messages_count = self
+                .drain_inbound_frames(deadline, inbound_buf, &mut msg_slots)
+                .await?;
 
-            match inbound.message {
-                RaftMessage::PreVoteResp(resp) => {
+            if messages_count == 0 {
+                return Ok(false); // Timeout or empty
+            }
+
+            // 1. Process responses first
+            for slot in msg_slots.iter().take(messages_count) {
+                let inbound = slot.unwrap();
+                let from = inbound.from;
+                if let RaftMessage::PreVoteResp(resp) = inbound.message {
                     if self.scratch_responders.contains(&from) {
                         continue;
                     }
@@ -280,7 +278,7 @@ where
                         self.step_down(resp_term)?;
                         return Ok(false);
                     }
-                    if resp_term == pre_vote_term && resp.vote_granted != 0 {
+                    if resp_term == self.hard_state.current_term && resp.vote_granted != 0 {
                         votes += 1;
                         debug!(
                             node_id = self.config.node_id.0,
@@ -291,9 +289,17 @@ where
                         );
                     }
                 }
-                message => {
-                    self.handle_inbound(InboundRaftMessage { from, message })
-                        .await?;
+            }
+
+            if votes >= votes_needed {
+                return Ok(true);
+            }
+
+            // 2. Process requests second
+            for slot in msg_slots.iter().take(messages_count) {
+                let inbound = slot.unwrap();
+                if !matches!(inbound.message, RaftMessage::PreVoteResp(_)) {
+                    self.handle_inbound(inbound).await?;
                 }
             }
         }
@@ -337,5 +343,54 @@ where
             self.step_down(term)?;
         }
         Ok(())
+    }
+
+    async fn drain_inbound_frames<'a>(
+        &self,
+        deadline: Instant,
+        inbound_buf: &'a mut [u8],
+        msg_slots: &mut [Option<InboundRaftMessage<'a>>; 16],
+    ) -> Result<usize, RaftError> {
+        let mut messages_count = 0;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(0);
+        }
+
+        let mut rest_buf = inbound_buf;
+
+        // 1. Wait for first frame
+        if let Some(n) = self
+            .transport
+            .recv_frame_timeout(remaining, rest_buf)
+            .await?
+        {
+            let (frame_buf, next_buf) = rest_buf.split_at_mut(n);
+            rest_buf = next_buf;
+            let inbound = crate::decode_message(frame_buf)?;
+            msg_slots[messages_count] = Some(inbound);
+            messages_count += 1;
+        } else {
+            return Ok(0);
+        }
+
+        // 2. Drain remaining available frames
+        while messages_count < 16 && !rest_buf.is_empty() {
+            if let Some(n) = self
+                .transport
+                .recv_frame_timeout(Duration::ZERO, rest_buf)
+                .await?
+            {
+                let (frame_buf, next_buf) = rest_buf.split_at_mut(n);
+                rest_buf = next_buf;
+                let inbound = crate::decode_message(frame_buf)?;
+                msg_slots[messages_count] = Some(inbound);
+                messages_count += 1;
+            } else {
+                break;
+            }
+        }
+
+        Ok(messages_count)
     }
 }

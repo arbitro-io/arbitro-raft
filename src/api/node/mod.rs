@@ -8,6 +8,7 @@ use crate::{
 
 mod dispatch;
 mod election;
+mod generational;
 mod progress;
 mod replication;
 mod snapshot;
@@ -29,6 +30,7 @@ pub struct RaftNode<S, T> {
     pub(crate) pending_custom: HashMap<u64, Box<dyn PendingCustomDispatch + Send + Sync>>,
     pub(crate) peer_progress: PeerMap<PeerProgress>,
     pub(crate) pending_snapshots: HashMap<PeerId, PendingSnapshot>,
+    pub(crate) log_metadata: generational::LogMetadataArena,
 
     // Scratchpads — pre-allocated buffers reused across calls on the hot path.
     // Always call .clear() before use; never assume they are empty.
@@ -106,6 +108,7 @@ where
             scratch_payload_refs: Vec::with_capacity(1024),
             scratch_responders: Vec::with_capacity(peer_count),
             cached_last_log,
+            log_metadata: generational::LogMetadataArena::new(8192),
         })
     }
 
@@ -242,6 +245,7 @@ where
     #[inline]
     pub(crate) fn storage_truncate(&mut self, from: LogIndex) -> Result<(), RaftError> {
         self.storage.truncate_suffix(from)?;
+        self.log_metadata.truncate_suffix(from);
         self.cached_last_log = self.storage.last_log_position()?;
         Ok(())
     }

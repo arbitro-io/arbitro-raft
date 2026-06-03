@@ -99,6 +99,9 @@ where
             std::mem::transmute::<&[LogEntry<'static>], &[LogEntry<'_>]>(&self.scratch_entries)
         };
         self.storage.append_entries(entries_ref)?;
+        for entry in entries_ref {
+            self.log_metadata.append(entry.index, entry.term);
+        }
 
         if let Some(last) = self.scratch_entries.last() {
             self.cached_last_log = (last.index, last.term);
