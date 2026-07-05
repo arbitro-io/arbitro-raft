@@ -29,7 +29,7 @@ impl<R: Clone> DispatchHandle<R> {
         let guard = self.shared.inner.lock().unwrap();
         guard.completion.as_ref().map(|c| match c {
             DispatchCompletion::Succeeded(r) => Ok(r.clone()),
-            DispatchCompletion::Failed(f)    => Err(RaftError::from(f.clone())),
+            DispatchCompletion::Failed(f) => Err(RaftError::from(f.clone())),
         })
     }
 
@@ -37,9 +37,7 @@ impl<R: Clone> DispatchHandle<R> {
         poll_fn(|cx| {
             let mut guard = self.shared.inner.lock().unwrap();
             match &guard.completion {
-                Some(DispatchCompletion::Succeeded(r)) => {
-                    std::task::Poll::Ready(Ok(r.clone()))
-                }
+                Some(DispatchCompletion::Succeeded(r)) => std::task::Poll::Ready(Ok(r.clone())),
                 Some(DispatchCompletion::Failed(f)) => {
                     std::task::Poll::Ready(Err(RaftError::from(f.clone())))
                 }
@@ -56,20 +54,23 @@ impl<R: Clone> DispatchHandle<R> {
 // ── DispatchTx ────────────────────────────────────────────────────────────────
 
 pub struct DispatchTx<R> {
-    pub(crate) shared:          DispatchShared<R>,
+    pub(crate) shared: DispatchShared<R>,
     pub(crate) decode_response: fn(&[u8]) -> Result<R, RaftError>,
 }
 
 impl<R> Clone for DispatchTx<R> {
     fn clone(&self) -> Self {
-        Self { shared: self.shared.clone(), decode_response: self.decode_response }
+        Self {
+            shared: self.shared.clone(),
+            decode_response: self.decode_response,
+        }
     }
 }
 
 impl<R: Clone> DispatchTx<R> {
     fn update_peer_state(
         &self,
-        peer:       PeerId,
+        peer: PeerId,
         next_state: impl FnOnce(&DispatchPeerState<R>) -> Result<DispatchPeerState<R>, RaftError>,
     ) -> Result<(), RaftError> {
         let mut guard = self.shared.inner.lock().unwrap();
@@ -127,12 +128,15 @@ impl<R: Clone> DispatchTx<R> {
 
 pub struct DispatchTxResponder<R> {
     peer: PeerId,
-    tx:   DispatchTx<R>,
+    tx: DispatchTx<R>,
 }
 
 impl<R> Clone for DispatchTxResponder<R> {
     fn clone(&self) -> Self {
-        Self { peer: self.peer, tx: self.tx.clone() }
+        Self {
+            peer: self.peer,
+            tx: self.tx.clone(),
+        }
     }
 }
 
@@ -153,7 +157,7 @@ impl<R: Clone + Send + Sync> crate::dispatch::DispatchResponder for DispatchTxRe
             DispatchResponseKind::Accepted => self.tx.accept_raw(self.peer, response.payload),
             DispatchResponseKind::Rejected => self.tx.reject(self.peer, response.payload),
             DispatchResponseKind::Progress => self.tx.progress(self.peer, response.payload),
-            DispatchResponseKind::Failed   => self.tx.fail(self.peer, response.payload),
+            DispatchResponseKind::Failed => self.tx.fail(self.peer, response.payload),
         }
     }
 }

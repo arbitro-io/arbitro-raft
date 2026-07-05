@@ -1,17 +1,17 @@
-use crate::RaftMessage;
 use super::wire::{
     AppendEntries, EntryHeader, KIND_APPEND_ENTRIES, KIND_APPEND_ENTRIES_RESP,
     KIND_APPEND_ENTRIES_SEEDED, KIND_CUSTOM, KIND_CUSTOM_RESPONSE, KIND_INSTALL_SNAPSHOT,
-    KIND_INSTALL_SNAPSHOT_RESP, KIND_REQUEST_VOTE, KIND_REQUEST_VOTE_RESP, KIND_PRE_VOTE,
-    KIND_PRE_VOTE_RESP,
+    KIND_INSTALL_SNAPSHOT_RESP, KIND_PRE_VOTE, KIND_PRE_VOTE_RESP, KIND_REQUEST_VOTE,
+    KIND_REQUEST_VOTE_RESP,
 };
+use crate::RaftMessage;
 use zerocopy::IntoBytes;
 
-mod vectored;
 mod contiguous;
+mod vectored;
 
-pub use vectored::{encode_message_vectored, encode_append_entries_vectored};
 pub use contiguous::encode_message_to_bytes;
+pub use vectored::{encode_append_entries_vectored, encode_message_vectored};
 
 pub(super) fn kind_of(msg: &RaftMessage) -> u8 {
     match msg {

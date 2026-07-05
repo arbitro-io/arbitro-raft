@@ -119,7 +119,8 @@ where
                 .append_entries_seeded(final_headers, &self.scratch_payload_refs)?;
             self.scratch_payload_refs.clear();
             for h in final_headers {
-                self.log_metadata.append(LogIndex(h.index.get()), crate::Term(h.term.get()));
+                self.log_metadata
+                    .append(LogIndex(h.index.get()), crate::Term(h.term.get()));
             }
 
             if let Some(last) = final_headers.last() {

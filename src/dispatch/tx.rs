@@ -16,10 +16,10 @@ use types::DispatchPeerState as PeerState;
 /// Create a new `(DispatchHandle, DispatchTx)` pair for `targets`.
 /// Called exclusively by `DispatchEnvelope::begin`.
 pub(crate) fn begin_transaction<R>(
-    tx_id:           u64,
-    command:         u8,
-    options:         DispatchOptions,
-    targets:         impl IntoIterator<Item = PeerId>,
+    tx_id: u64,
+    command: u8,
+    options: DispatchOptions,
+    targets: impl IntoIterator<Item = PeerId>,
     decode_response: fn(&[u8]) -> Result<R, RaftError>,
 ) -> (DispatchHandle<R>, DispatchTx<R>)
 where
@@ -32,15 +32,18 @@ where
             options,
             peers: targets
                 .into_iter()
-                .map(|peer| DispatchPeerSlot { peer, state: PeerState::Pending })
+                .map(|peer| DispatchPeerSlot {
+                    peer,
+                    state: PeerState::Pending,
+                })
                 .collect(),
             completion: None,
-            wakers:     Vec::new(),
+            wakers: Vec::new(),
         })),
     };
 
     if !options.timeout.is_zero() {
-        let weak    = Arc::downgrade(&shared.inner);
+        let weak = Arc::downgrade(&shared.inner);
         let timeout = options.timeout;
         std::thread::spawn(move || {
             std::thread::sleep(timeout);
@@ -55,8 +58,13 @@ where
         });
     }
 
-    let handle = DispatchHandle { shared: shared.clone() };
-    let tx     = DispatchTx { shared, decode_response };
+    let handle = DispatchHandle {
+        shared: shared.clone(),
+    };
+    let tx = DispatchTx {
+        shared,
+        decode_response,
+    };
 
     {
         let mut guard = handle.shared.inner.lock().unwrap();

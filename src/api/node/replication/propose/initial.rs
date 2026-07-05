@@ -1,9 +1,9 @@
+use crate::api::node::progress::AppendAttemptState;
+use crate::RaftNode;
 use crate::{
     protocol::codec::{encode_message_to_bytes, encode_message_vectored},
     EntryPayload, LogEntry, LogIndex, RaftError, RaftMessage,
 };
-use crate::api::node::progress::AppendAttemptState;
-use crate::RaftNode;
 
 struct VecTuning {
     force: Option<bool>,
@@ -32,7 +32,7 @@ fn vec_tuning() -> &'static VecTuning {
         };
         VecTuning {
             force,
-            iov_max:   parse_usize("ARBITRO_RAFT_VEC_IOV_MAX",   4096),
+            iov_max: parse_usize("ARBITRO_RAFT_VEC_IOV_MAX", 4096),
             min_entry: parse_usize("ARBITRO_RAFT_VEC_MIN_ENTRY", 4096),
             min_total: parse_usize("ARBITRO_RAFT_VEC_MIN_TOTAL", 64 * 1024),
         }
@@ -69,7 +69,10 @@ where
     S: crate::RaftStorage,
     T: crate::RaftTransport,
 {
-    pub(super) fn append_propose_entries(&mut self, payloads: &[&[u8]]) -> Result<LogIndex, RaftError> {
+    pub(super) fn append_propose_entries(
+        &mut self,
+        payloads: &[&[u8]],
+    ) -> Result<LogIndex, RaftError> {
         let last_log_index = self.cached_last_log.0;
         self.scratch_entries.clear();
         self.scratch_indexes.clear();
@@ -157,12 +160,7 @@ where
                     &mut self.scratch_vectored,
                 )
             };
-            encode_message_vectored(
-                self.config.node_id,
-                &msg,
-                &mut self.scratch_outbound,
-                iovs,
-            )?;
+            encode_message_vectored(self.config.node_id, &msg, &mut self.scratch_outbound, iovs)?;
 
             // Shared slice view — all peers send the exact same bytes.
             let slices: &[&[u8]] = iovs.as_slice();

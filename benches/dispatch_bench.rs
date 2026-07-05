@@ -3,15 +3,14 @@
 // Measures the orchestration overhead of the parallel Dispatch API.
 // Reuses the setup from tests/dispatch_real.rs for minimal overhead.
 
-use std::time::{Duration, Instant};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use arbitro_raft::{
-    DispatchAckPolicy, DispatchHandle, DispatchSpec, PeerId, RaftError,
-    RaftNode, NodeConfig, Term, RaftStorage, RaftTransport, HardState,
-    LogIndex, LogEntry, SnapshotMeta, EntryPayload, Role,
+    DispatchAckPolicy, DispatchHandle, DispatchSpec, EntryPayload, HardState, LogEntry, LogIndex,
+    NodeConfig, PeerId, RaftError, RaftNode, RaftStorage, RaftTransport, Role, SnapshotMeta, Term,
 };
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 
@@ -20,9 +19,14 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SyncParams { start: u64, end: u64 }
+struct SyncParams {
+    start: u64,
+    end: u64,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SyncAck { saved_until: u64 }
+struct SyncAck {
+    saved_until: u64,
+}
 
 fn encode_sync_params(value: &SyncParams) -> Result<Vec<u8>, RaftError> {
     let mut out = Vec::with_capacity(16);
@@ -48,7 +52,13 @@ fn decode_sync_ack(bytes: &[u8]) -> Result<SyncAck, RaftError> {
 }
 
 fn sync_spec() -> DispatchSpec<SyncParams, SyncAck> {
-    DispatchSpec::new(0x21, encode_sync_params, decode_sync_params, encode_sync_ack, decode_sync_ack)
+    DispatchSpec::new(
+        0x21,
+        encode_sync_params,
+        decode_sync_params,
+        encode_sync_ack,
+        decode_sync_ack,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -58,15 +68,43 @@ fn sync_spec() -> DispatchSpec<SyncParams, SyncAck> {
 #[derive(Clone)]
 struct NullStorage;
 impl RaftStorage for NullStorage {
-    fn load_hard_state(&self) -> Result<HardState, RaftError> { Ok(HardState::default()) }
-    fn save_hard_state(&self, _s: &HardState) -> Result<(), RaftError> { Ok(()) }
-    fn append_entries(&self, _e: &[LogEntry<'_>]) -> Result<(), RaftError> { Ok(()) }
-    fn read_entries<'a>(&self, _f: LogIndex, _t: LogIndex, _o: &mut Vec<LogEntry<'a>>, _p: &'a mut [u8]) -> Result<usize, RaftError> { Ok(0) }
-    fn truncate_suffix(&self, _f: LogIndex) -> Result<(), RaftError> { Ok(()) }
-    fn save_snapshot(&self, _m: &SnapshotMeta, _s: &[u8]) -> Result<(), RaftError> { Ok(()) }
-    fn load_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, RaftError> { Ok(None) }
-    fn last_log_position(&self) -> Result<(LogIndex, Term), RaftError> { Ok((LogIndex(0), Term(0))) }
-    fn entry_at<'a>(&self, _i: LogIndex, _p: &'a mut [u8]) -> Result<Option<LogEntry<'a>>, RaftError> { Ok(None) }
+    fn load_hard_state(&self) -> Result<HardState, RaftError> {
+        Ok(HardState::default())
+    }
+    fn save_hard_state(&self, _s: &HardState) -> Result<(), RaftError> {
+        Ok(())
+    }
+    fn append_entries(&self, _e: &[LogEntry<'_>]) -> Result<(), RaftError> {
+        Ok(())
+    }
+    fn read_entries<'a>(
+        &self,
+        _f: LogIndex,
+        _t: LogIndex,
+        _o: &mut Vec<LogEntry<'a>>,
+        _p: &'a mut [u8],
+    ) -> Result<usize, RaftError> {
+        Ok(0)
+    }
+    fn truncate_suffix(&self, _f: LogIndex) -> Result<(), RaftError> {
+        Ok(())
+    }
+    fn save_snapshot(&self, _m: &SnapshotMeta, _s: &[u8]) -> Result<(), RaftError> {
+        Ok(())
+    }
+    fn load_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, RaftError> {
+        Ok(None)
+    }
+    fn last_log_position(&self) -> Result<(LogIndex, Term), RaftError> {
+        Ok((LogIndex(0), Term(0)))
+    }
+    fn entry_at<'a>(
+        &self,
+        _i: LogIndex,
+        _p: &'a mut [u8],
+    ) -> Result<Option<LogEntry<'a>>, RaftError> {
+        Ok(None)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -75,16 +113,35 @@ impl RaftStorage for NullStorage {
 
 struct NullTransport;
 impl RaftTransport for NullTransport {
-    fn send_vectored(&self, _p: PeerId, _s: &[&[u8]]) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
+    fn send_vectored(
+        &self,
+        _p: PeerId,
+        _s: &[&[u8]],
+    ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
         async move { Ok(()) }
     }
-    fn send_frame_owned(&self, _p: PeerId, _f: bytes::Bytes) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
+    fn send_frame_owned(
+        &self,
+        _p: PeerId,
+        _f: bytes::Bytes,
+    ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
         async move { Ok(()) }
     }
-    fn recv_frame(&self, _o: &mut [u8]) -> impl std::future::Future<Output = Result<usize, RaftError>> + Send {
-        async move { loop { tokio::task::yield_now().await; } }
+    fn recv_frame(
+        &self,
+        _o: &mut [u8],
+    ) -> impl std::future::Future<Output = Result<usize, RaftError>> + Send {
+        async move {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        }
     }
-    fn recv_frame_timeout(&self, _t: Duration, _o: &mut [u8]) -> impl std::future::Future<Output = Result<Option<usize>, RaftError>> + Send {
+    fn recv_frame_timeout(
+        &self,
+        _t: Duration,
+        _o: &mut [u8],
+    ) -> impl std::future::Future<Output = Result<Option<usize>, RaftError>> + Send {
         async move { Ok(None) }
     }
 }
@@ -94,7 +151,10 @@ impl RaftTransport for NullTransport {
 // ---------------------------------------------------------------------------
 
 fn make_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
 }
 
 fn bench_dispatch_orchestration(c: &mut Criterion) {
@@ -118,14 +178,15 @@ fn bench_dispatch_orchestration(c: &mut Criterion) {
                         id: PeerId(1),
                         addr: "127.0.0.1:8001".parse().unwrap(),
                     }];
-                    
+
                     let mut node = RaftNode::new(config, NullStorage, NullTransport).unwrap();
                     node.become_leader_for_benchmark(Term(1));
-                    
+
                     // Register local handler because we are in the target list (PeerId 1)
                     node.on_with(spec.clone(), |_params, _ctx| {
                         Box::pin(async move { Ok(()) })
-                    }).unwrap();
+                    })
+                    .unwrap();
 
                     let params = SyncParams { start: 10, end: 20 };
                     let start = Instant::now();

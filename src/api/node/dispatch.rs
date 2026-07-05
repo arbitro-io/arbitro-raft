@@ -203,7 +203,10 @@ where
         self.scratch_peers.clear();
         for i in 0..self.config.peers.len() {
             let peer = self.config.peers[i];
-            let matches = if peer == self.config.node_id && self.config.peers.len() > 1 && !self.is_leader() {
+            let matches = if peer == self.config.node_id
+                && self.config.peers.len() > 1
+                && !self.is_leader()
+            {
                 matches!(scope, DispatchScope::LocalOnly)
             } else {
                 scope.allows(self.route_for_peer(peer))

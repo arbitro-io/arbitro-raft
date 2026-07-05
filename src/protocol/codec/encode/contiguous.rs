@@ -1,9 +1,8 @@
-use crate::{PeerId, RaftError, RaftMessage};
+use super::{body_total_len, kind_of};
 use crate::protocol::codec::wire::{
-    AppendEntries, EntryHeader, RaftFrameHeader, RAFT_FRAME_HEADER_SIZE,
-    RAFT_MAGIC, RAFT_VERSION,
+    AppendEntries, EntryHeader, RaftFrameHeader, RAFT_FRAME_HEADER_SIZE, RAFT_MAGIC, RAFT_VERSION,
 };
-use super::{kind_of, body_total_len};
+use crate::{PeerId, RaftError, RaftMessage};
 use zerocopy::{IntoBytes, Ref};
 
 /// Encodes a message into a single contiguous `Bytes` object.

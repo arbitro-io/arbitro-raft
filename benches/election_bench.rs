@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arbitro_raft::{
-    ArbitroRaft, BootstrapPeer, ClusterId, HardState, LogEntry, LogIndex,
-    NodeConfig, PeerId, RaftError, RaftStorage, RaftTransport, SnapshotMeta,
-    Term, TimingConfig, LimitsConfig, Role, ClientHandle, EntryPayload,
+    ArbitroRaft, BootstrapPeer, ClientHandle, ClusterId, EntryPayload, HardState, LimitsConfig,
+    LogEntry, LogIndex, NodeConfig, PeerId, RaftError, RaftStorage, RaftTransport, Role,
+    SnapshotMeta, Term, TimingConfig,
 };
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -34,14 +34,26 @@ impl RaftStorage for MemStorage {
     }
     fn append_entries(&self, new_entries: &[LogEntry<'_>]) -> Result<(), RaftError> {
         let mut log = self.log.lock().unwrap();
-        for e in new_entries { log.push((e.index, e.term)); }
+        for e in new_entries {
+            log.push((e.index, e.term));
+        }
         Ok(())
     }
-    fn read_entries<'a>(&self, from: LogIndex, to: LogIndex, out: &mut Vec<LogEntry<'a>>, _p: &'a mut [u8]) -> Result<usize, RaftError> {
+    fn read_entries<'a>(
+        &self,
+        from: LogIndex,
+        to: LogIndex,
+        out: &mut Vec<LogEntry<'a>>,
+        _p: &'a mut [u8],
+    ) -> Result<usize, RaftError> {
         let log = self.log.lock().unwrap();
         for &(idx, term) in log.iter() {
             if idx >= from && idx < to {
-                out.push(LogEntry { term, index: idx, payload: EntryPayload(&[]) });
+                out.push(LogEntry {
+                    term,
+                    index: idx,
+                    payload: EntryPayload(&[]),
+                });
             }
         }
         Ok(0)
@@ -50,15 +62,33 @@ impl RaftStorage for MemStorage {
         self.log.lock().unwrap().retain(|&(idx, _)| idx < from);
         Ok(())
     }
-    fn save_snapshot(&self, _m: &SnapshotMeta, _s: &[u8]) -> Result<(), RaftError> { Ok(()) }
-    fn load_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, RaftError> { Ok(None) }
-    fn last_log_position(&self) -> Result<(LogIndex, Term), RaftError> {
-        Ok(self.log.lock().unwrap().last().copied().unwrap_or((LogIndex(0), Term(0))))
+    fn save_snapshot(&self, _m: &SnapshotMeta, _s: &[u8]) -> Result<(), RaftError> {
+        Ok(())
     }
-    fn entry_at<'a>(&self, index: LogIndex, _p: &'a mut [u8]) -> Result<Option<LogEntry<'a>>, RaftError> {
+    fn load_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, RaftError> {
+        Ok(None)
+    }
+    fn last_log_position(&self) -> Result<(LogIndex, Term), RaftError> {
+        Ok(self
+            .log
+            .lock()
+            .unwrap()
+            .last()
+            .copied()
+            .unwrap_or((LogIndex(0), Term(0))))
+    }
+    fn entry_at<'a>(
+        &self,
+        index: LogIndex,
+        _p: &'a mut [u8],
+    ) -> Result<Option<LogEntry<'a>>, RaftError> {
         let log = self.log.lock().unwrap();
         if let Some(&(_, term)) = log.iter().find(|&&(idx, _)| idx == index) {
-            Ok(Some(LogEntry { term, index, payload: EntryPayload(&[]) }))
+            Ok(Some(LogEntry {
+                term,
+                index,
+                payload: EntryPayload(&[]),
+            }))
         } else {
             Ok(None)
         }
@@ -79,29 +109,38 @@ impl RaftTransport for TcpTransport {
     ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
         let peer_addrs = self.peer_addrs.clone();
         let connections = self.connections.clone();
-        let slices_static = unsafe { std::mem::transmute::<&[&[u8]], &'static [&'static [u8]]>(slices) };
+        let slices_static =
+            unsafe { std::mem::transmute::<&[&[u8]], &'static [&'static [u8]]>(slices) };
 
         async move {
-            let addr = *peer_addrs.get(&peer).ok_or_else(|| RaftError::Transport(format!("unknown peer {:?}", peer)))?;
+            let addr = *peer_addrs
+                .get(&peer)
+                .ok_or_else(|| RaftError::Transport(format!("unknown peer {:?}", peer)))?;
             let stream = {
                 let mut conns = connections.lock().await;
                 if let Some(s) = conns.get(&peer) {
                     s.clone()
                 } else {
-                    let s = TcpStream::connect(addr).await.map_err(|e| RaftError::Transport(e.to_string()))?;
+                    let s = TcpStream::connect(addr)
+                        .await
+                        .map_err(|e| RaftError::Transport(e.to_string()))?;
                     let s = Arc::new(tokio::sync::Mutex::new(s));
                     conns.insert(peer, s.clone());
                     s
                 }
             };
             let mut s = stream.lock().await;
-            let mut io_bufs: Vec<IoSlice<'_>> = slices_static.iter().map(|s| IoSlice::new(s)).collect();
+            let mut io_bufs: Vec<IoSlice<'_>> =
+                slices_static.iter().map(|s| IoSlice::new(s)).collect();
             let write_fut = async {
                 let mut bufs: &mut [IoSlice<'_>] = &mut io_bufs;
                 while !bufs.is_empty() {
                     let n = s.write_vectored(bufs).await?;
                     if n == 0 {
-                        return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "write_vectored returned 0"));
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "write_vectored returned 0",
+                        ));
                     }
                     IoSlice::advance_slices(&mut bufs, n);
                 }
@@ -125,13 +164,17 @@ impl RaftTransport for TcpTransport {
         let peer_addrs = self.peer_addrs.clone();
         let connections = self.connections.clone();
         async move {
-            let addr = *peer_addrs.get(&peer).ok_or_else(|| RaftError::Transport(format!("unknown peer {:?}", peer)))?;
+            let addr = *peer_addrs
+                .get(&peer)
+                .ok_or_else(|| RaftError::Transport(format!("unknown peer {:?}", peer)))?;
             let stream = {
                 let mut conns = connections.lock().await;
                 if let Some(s) = conns.get(&peer) {
                     s.clone()
                 } else {
-                    let s = TcpStream::connect(addr).await.map_err(|e| RaftError::Transport(e.to_string()))?;
+                    let s = TcpStream::connect(addr)
+                        .await
+                        .map_err(|e| RaftError::Transport(e.to_string()))?;
                     let s = Arc::new(tokio::sync::Mutex::new(s));
                     conns.insert(peer, s.clone());
                     s
@@ -158,7 +201,9 @@ impl RaftTransport for TcpTransport {
             let mut rx = rx.lock().await;
             if let Some(frame) = rx.recv().await {
                 let len = frame.len();
-                if out.len() < len { return Err(RaftError::Transport("buffer too small".into())); }
+                if out.len() < len {
+                    return Err(RaftError::Transport("buffer too small".into()));
+                }
                 out[..len].copy_from_slice(&frame);
                 Ok(len)
             } else {
@@ -178,7 +223,9 @@ impl RaftTransport for TcpTransport {
             if timeout.is_zero() {
                 if let Ok(frame) = rx.try_recv() {
                     let len = frame.len();
-                    if out.len() < len { return Err(RaftError::Transport("buffer too small".into())); }
+                    if out.len() < len {
+                        return Err(RaftError::Transport("buffer too small".into()));
+                    }
                     out[..len].copy_from_slice(&frame);
                     return Ok(Some(len));
                 }
@@ -187,7 +234,9 @@ impl RaftTransport for TcpTransport {
             match tokio::time::timeout(timeout, rx.recv()).await {
                 Ok(Some(frame)) => {
                     let len = frame.len();
-                    if out.len() < len { return Err(RaftError::Transport("buffer too small".into())); }
+                    if out.len() < len {
+                        return Err(RaftError::Transport("buffer too small".into()));
+                    }
                     out[..len].copy_from_slice(&frame);
                     Ok(Some(len))
                 }
@@ -203,7 +252,11 @@ const BODY_LEN_OFFSET: usize = 16;
 async fn read_frame_into(stream: &mut TcpStream, buf: &mut Vec<u8>) -> Option<Vec<u8>> {
     loop {
         if buf.len() >= HEADER_SIZE {
-            let body_len = u32::from_le_bytes(buf[BODY_LEN_OFFSET..BODY_LEN_OFFSET + 4].try_into().unwrap()) as usize;
+            let body_len = u32::from_le_bytes(
+                buf[BODY_LEN_OFFSET..BODY_LEN_OFFSET + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
             let total = HEADER_SIZE + body_len;
             if buf.len() >= total {
                 let frame = buf[..total].to_vec();
@@ -213,7 +266,9 @@ async fn read_frame_into(stream: &mut TcpStream, buf: &mut Vec<u8>) -> Option<Ve
         }
         let mut tmp = [0u8; 4096];
         let n = stream.read(&mut tmp).await.unwrap_or(0);
-        if n == 0 { return None; }
+        if n == 0 {
+            return None;
+        }
         buf.extend_from_slice(&tmp[..n]);
     }
 }
@@ -294,8 +349,15 @@ async fn spawn_node(
         node_id: my_id,
         cluster_id: ClusterId(1),
         peers: all_peers.clone(),
-        bootstrap_peers: addrs.iter().map(|(&id, &addr)| BootstrapPeer { id, addr }).collect(),
-        timing: TimingConfig { heartbeat_ms: 10, election_min_ms, election_max_ms },
+        bootstrap_peers: addrs
+            .iter()
+            .map(|(&id, &addr)| BootstrapPeer { id, addr })
+            .collect(),
+        timing: TimingConfig {
+            heartbeat_ms: 10,
+            election_min_ms,
+            election_max_ms,
+        },
         limits: LimitsConfig::default(),
     };
     let storage = MemStorage::default();
@@ -316,11 +378,22 @@ async fn spawn_node(
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     });
-    NodeInstance { role, raft_handle, run_task, accept_task, shutdown_tx, connections }
+    NodeInstance {
+        role,
+        raft_handle,
+        run_task,
+        accept_task,
+        shutdown_tx,
+        connections,
+    }
 }
 
 fn make_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap()
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap()
 }
 
 fn bench_tcp_election(c: &mut Criterion) {
@@ -358,11 +431,15 @@ fn bench_tcp_election(c: &mut Criterion) {
                                 break;
                             }
                         }
-                        if has_leader { break; }
+                        if has_leader {
+                            break;
+                        }
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                     total_duration += start.elapsed();
-                    for n in nodes { n.stop(); }
+                    for n in nodes {
+                        n.stop();
+                    }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 total_duration
@@ -407,7 +484,9 @@ fn bench_tcp_election_reelection(c: &mut Criterion) {
                             break;
                         }
                     }
-                    if found { break; }
+                    if found {
+                        break;
+                    }
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 let start = Instant::now();
@@ -421,11 +500,15 @@ fn bench_tcp_election_reelection(c: &mut Criterion) {
                             break;
                         }
                     }
-                    if has_leader { break; }
+                    if has_leader {
+                        break;
+                    }
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 total_duration += start.elapsed();
-                for n in nodes { n.stop(); }
+                for n in nodes {
+                    n.stop();
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             total_duration
@@ -469,7 +552,9 @@ fn bench_tcp_election_under_load(c: &mut Criterion) {
                             break;
                         }
                     }
-                    if found { break; }
+                    if found {
+                        break;
+                    }
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 let handle = nodes[leader_idx].raft_handle.clone();
@@ -493,11 +578,15 @@ fn bench_tcp_election_under_load(c: &mut Criterion) {
                             break;
                         }
                     }
-                    if has_leader { break; }
+                    if has_leader {
+                        break;
+                    }
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 total_duration += start.elapsed();
-                for n in nodes { n.stop(); }
+                for n in nodes {
+                    n.stop();
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             total_duration

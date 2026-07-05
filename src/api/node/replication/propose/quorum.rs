@@ -1,9 +1,7 @@
-use std::time::Duration;
-use crate::{
-    AppendEntriesResp, InboundRaftMessage, LogIndex, PeerId, RaftError, RaftMessage,
-};
 use crate::api::node::progress::AppendAdvance;
 use crate::RaftNode;
+use crate::{AppendEntriesResp, InboundRaftMessage, LogIndex, PeerId, RaftError, RaftMessage};
+use std::time::Duration;
 
 impl<S, T> RaftNode<S, T>
 where

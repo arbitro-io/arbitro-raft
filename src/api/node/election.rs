@@ -1,8 +1,8 @@
-use std::time::{Duration, Instant};
-use tracing::{debug, info};
 use super::RaftNode;
 use crate::protocol::{RequestVote, RequestVoteResp};
 use crate::{InboundRaftMessage, RaftError, RaftMessage, Role, Term};
+use std::time::{Duration, Instant};
+use tracing::{debug, info};
 
 impl<S, T> RaftNode<S, T>
 where
@@ -19,11 +19,18 @@ where
         self.storage.save_hard_state(&self.hard_state)?;
         let term = self.hard_state.current_term;
         let votes_needed = super::quorum(self.config.peers.len());
-        info!(node_id = self.config.node_id.0, term = term.0, "starting election");
+        info!(
+            node_id = self.config.node_id.0,
+            term = term.0,
+            "starting election"
+        );
         if super::trace_enabled() {
             super::trace_log(
                 self.config.node_id,
-                format!("campaign_once start term={} votes_needed={}", term.0, votes_needed),
+                format!(
+                    "campaign_once start term={} votes_needed={}",
+                    term.0, votes_needed
+                ),
             );
         }
 
@@ -33,24 +40,35 @@ where
             candidate_id: self.config.node_id.0.into(),
             last_log_index: last_log_idx.0.into(),
             last_log_term: last_log_term.0.into(),
-        };        let possible_votes = self.broadcast_request_vote(&req).await?;
+        };
+        let possible_votes = self.broadcast_request_vote(&req).await?;
         if possible_votes < votes_needed {
             return Err(RaftError::NoQuorum);
         }
 
-        if !self.collect_votes(term, votes_needed, possible_votes, inbound_buf).await? {
+        if !self
+            .collect_votes(term, votes_needed, possible_votes, inbound_buf)
+            .await?
+        {
             return Ok(false);
         }
         self.soft_state.role = Role::Leader;
         self.soft_state.is_leader = true;
         self.soft_state.leader_id = Some(self.config.node_id);
         self.initialize_leader_progress()?;
-        info!(node_id = self.config.node_id.0, term = term.0, "leader elected");
+        info!(
+            node_id = self.config.node_id.0,
+            term = term.0,
+            "leader elected"
+        );
         if super::trace_enabled() {
             let total_us = started.map(|s| s.elapsed().as_micros()).unwrap_or(0);
             super::trace_log(
                 self.config.node_id,
-                format!("campaign_once elected term={} total_us={}", term.0, total_us),
+                format!(
+                    "campaign_once elected term={} total_us={}",
+                    term.0, total_us
+                ),
             );
         }
         Ok(true)
@@ -206,7 +224,7 @@ where
     pub async fn campaign_pre_vote(&mut self, inbound_buf: &mut [u8]) -> Result<bool, RaftError> {
         let pre_vote_term = Term(self.hard_state.current_term.0 + 1);
         let votes_needed = super::quorum(self.config.peers.len());
-        
+
         info!(
             node_id = self.config.node_id.0,
             term = pre_vote_term.0,
@@ -320,8 +338,7 @@ where
         let candidate_up_to_date = msg_log_term.0 > last_log_term.0
             || (msg_log_term == last_log_term && msg_log_idx >= last_log_index);
 
-        let can_grant = msg_term.0 >= self.hard_state.current_term.0
-            && candidate_up_to_date;
+        let can_grant = msg_term.0 >= self.hard_state.current_term.0 && candidate_up_to_date;
 
         let resp_msg = RequestVoteResp {
             term: self.hard_state.current_term.0.into(),

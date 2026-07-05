@@ -15,7 +15,11 @@ pub(crate) struct PeerMap<V> {
 
 impl<V> PeerMap<V> {
     #[allow(dead_code)]
-    pub(crate) fn new() -> Self { Self { entries: Vec::new() } }
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
 
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
@@ -23,8 +27,14 @@ impl<V> PeerMap<V> {
         }
     }
 
-    #[inline] pub(crate) fn is_empty(&self) -> bool { self.entries.is_empty() }
-    #[inline] pub(crate) fn clear(&mut self)          { self.entries.clear(); }
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    #[inline]
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
 
     pub(crate) fn insert(&mut self, key: PeerId, value: V) {
         if let Some(slot) = self.entries.iter_mut().find(|(k, _)| *k == key) {
@@ -41,7 +51,10 @@ impl<V> PeerMap<V> {
 
     #[inline]
     pub(crate) fn get_mut(&mut self, key: &PeerId) -> Option<&mut V> {
-        self.entries.iter_mut().find(|(k, _)| k == key).map(|(_, v)| v)
+        self.entries
+            .iter_mut()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
     }
 
     pub(crate) fn remove(&mut self, key: &PeerId) {
@@ -58,13 +71,13 @@ impl<V> PeerMap<V> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PeerProgress {
-    pub(crate) next_index:  LogIndex,
+    pub(crate) next_index: LogIndex,
     pub(crate) match_index: LogIndex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AppendAttemptState {
-    pub(crate) attempts:        u64,
+    pub(crate) attempts: u64,
     pub(crate) sent_last_index: LogIndex,
 }
 
@@ -81,8 +94,8 @@ pub(crate) const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingSnapshot {
-    pub(crate) meta:     SnapshotMeta,
-    pub(crate) bytes:    Vec<u8>,
+    pub(crate) meta: SnapshotMeta,
+    pub(crate) bytes: Vec<u8>,
     /// Wall-clock deadline after which this transfer is evicted as stalled.
     pub(crate) deadline: Instant,
 }
@@ -91,7 +104,7 @@ impl PendingSnapshot {
     pub(crate) fn new(meta: SnapshotMeta) -> Self {
         Self {
             meta,
-            bytes:    Vec::new(),
+            bytes: Vec::new(),
             deadline: Instant::now() + SNAPSHOT_DEADLINE,
         }
     }

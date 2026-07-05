@@ -31,16 +31,16 @@ pub enum DispatchPeerState<R> {
 
 #[derive(Debug, Clone)]
 pub struct DispatchPeerResult<R> {
-    pub peer:  PeerId,
+    pub peer: PeerId,
     pub state: DispatchPeerState<R>,
 }
 
 #[derive(Debug, Clone)]
 pub struct DispatchResult<R> {
-    pub tx_id:   u64,
+    pub tx_id: u64,
     pub command: u8,
     pub options: DispatchOptions,
-    pub peers:   Vec<DispatchPeerResult<R>>,
+    pub peers: Vec<DispatchPeerResult<R>>,
 }
 
 impl<R> DispatchResult<R> {
@@ -55,7 +55,10 @@ impl<R> DispatchResult<R> {
         self.peers
             .iter()
             .filter(|p| {
-                matches!(p.state, DispatchPeerState::Rejected(_) | DispatchPeerState::Failed(_))
+                matches!(
+                    p.state,
+                    DispatchPeerState::Rejected(_) | DispatchPeerState::Failed(_)
+                )
             })
             .count()
     }

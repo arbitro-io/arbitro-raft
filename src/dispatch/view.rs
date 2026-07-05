@@ -50,9 +50,15 @@ impl<'a> DispatchView<'a> {
         if rest.len() < header.body_len.get() as usize {
             return Err(RaftError::Dispatch("dispatch body length mismatch".into()));
         }
-        if header.scope > 4 { return Err(RaftError::Dispatch("unknown dispatch scope".into())); }
-        if header.ack_policy > 4 { return Err(RaftError::Dispatch("unknown dispatch ack policy".into())); }
-        if header.fail_policy > 4 { return Err(RaftError::Dispatch("unknown dispatch fail policy".into())); }
+        if header.scope > 4 {
+            return Err(RaftError::Dispatch("unknown dispatch scope".into()));
+        }
+        if header.ack_policy > 4 {
+            return Err(RaftError::Dispatch("unknown dispatch ack policy".into()));
+        }
+        if header.fail_policy > 4 {
+            return Err(RaftError::Dispatch("unknown dispatch fail policy".into()));
+        }
         Ok(Self { frame })
     }
 

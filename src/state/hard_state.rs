@@ -1,5 +1,3 @@
-
-
 use crate::{LogIndex, PeerId, Term};
 
 /// Durable state that MUST be persisted before any message is sent.

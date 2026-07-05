@@ -1,9 +1,9 @@
-use crate::{PeerId, RaftError, RaftMessage, Term, LogEntry, LogIndex};
+use super::{body_total_len, kind_of};
 use crate::protocol::codec::wire::{
     AppendEntries, EntryHeader, RaftFrameHeader, KIND_APPEND_ENTRIES, RAFT_FRAME_HEADER_SIZE,
     RAFT_MAGIC, RAFT_VERSION,
 };
-use super::{kind_of, body_total_len};
+use crate::{LogEntry, LogIndex, PeerId, RaftError, RaftMessage, Term};
 use zerocopy::{IntoBytes, Ref};
 
 /// Populates `out_vectored` with references to headers written in `header_buf`

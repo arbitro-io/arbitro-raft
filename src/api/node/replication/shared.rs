@@ -198,7 +198,8 @@ where
         if let Some(term) = self.log_metadata.get_term(index) {
             return Ok(term);
         }
-        let term = self.storage
+        let term = self
+            .storage
             .entry_at(index, &mut self.scratch_payload)?
             .map(|e| e.term)
             .ok_or_else(|| RaftError::CorruptLog(format!("missing term at index {}", index.0)))?;
@@ -237,7 +238,8 @@ where
         } else if let Some(term) = self.log_metadata.get_term(quorum_index) {
             term
         } else {
-            let term = self.storage
+            let term = self
+                .storage
                 .entry_at(quorum_index, &mut self.scratch_payload)?
                 .map(|e| e.term)
                 .unwrap_or(crate::Term(0));

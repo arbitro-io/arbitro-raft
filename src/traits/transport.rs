@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-
 use crate::{PeerId, RaftError};
 
 /// Transport layer for the Raft protocol.
@@ -22,22 +21,32 @@ pub trait RaftTransport: Send + Sync {
     /// Send a Raft message split into multiple slices (Vectored I/O).
     ///
     /// This eliminates copies of large payloads by allowing the transport
-    /// to pass multiple buffers (e.g. headers in one, payload in another) 
+    /// to pass multiple buffers (e.g. headers in one, payload in another)
     /// directly to the OS.
-    fn send_vectored(&self, peer: PeerId, slices: &[&[u8]]) -> impl std::future::Future<Output = Result<(), RaftError>> + Send;
+    fn send_vectored(
+        &self,
+        peer: PeerId,
+        slices: &[&[u8]],
+    ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send;
 
     /// Send a Raft message using an owned buffer (Zero-copy sharing).
     ///
-    /// The transport takes ownership of the `Bytes` object, allowing the 
+    /// The transport takes ownership of the `Bytes` object, allowing the
     /// sender to dispatch multiple parallel sends without lifetime issues.
-    fn send_frame_owned(&self, peer: PeerId, frame: bytes::Bytes) -> impl std::future::Future<Output = Result<(), RaftError>> + Send;
-
+    fn send_frame_owned(
+        &self,
+        peer: PeerId,
+        frame: bytes::Bytes,
+    ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send;
 
     /// Receive the next incoming raw frame from any peer into the provided buffer.
     ///
     /// The transport writes exactly the frame bytes into `out` and returns the length.
     /// Blocks until a frame arrives.
-    fn recv_frame(&self, out: &mut [u8]) -> impl std::future::Future<Output = Result<usize, RaftError>> + Send;
+    fn recv_frame(
+        &self,
+        out: &mut [u8],
+    ) -> impl std::future::Future<Output = Result<usize, RaftError>> + Send;
 
     /// Receive the next incoming raw frame into the provided buffer, returning `None` if `timeout` elapses.
     fn recv_frame_timeout(
@@ -55,7 +64,9 @@ pub trait RaftTransport: Send + Sync {
         _file: std::fs::File,
     ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
         async move {
-            Err(RaftError::Transport("DMA not supported by this transport".into()))
+            Err(RaftError::Transport(
+                "DMA not supported by this transport".into(),
+            ))
         }
     }
 }

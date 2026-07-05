@@ -1,6 +1,6 @@
-use async_trait::async_trait;
 use crate::dispatch::DispatchSpec;
 use crate::RaftError;
+use async_trait::async_trait;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchResponseKind {
@@ -132,7 +132,8 @@ impl<'a> DispatchContextView<'a> {
         spec: &DispatchSpec<P, R>,
         value: &R,
     ) -> Result<(), RaftError> {
-        self.accept_bytes(spec.encode_response(value)?.to_vec()).await
+        self.accept_bytes(spec.encode_response(value)?.to_vec())
+            .await
     }
 
     pub async fn reject(&self, reason: impl Into<String>) -> Result<(), RaftError> {

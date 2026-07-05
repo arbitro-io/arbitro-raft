@@ -165,7 +165,9 @@ fn config_3node(node_id: u64) -> NodeConfig {
 // Network Hub & Routing Transport
 // ---------------------------------------------------------------------------
 struct NetworkHub {
-    senders: Mutex<std::collections::HashMap<PeerId, tokio::sync::mpsc::UnboundedSender<(PeerId, Vec<u8>)>>>,
+    senders: Mutex<
+        std::collections::HashMap<PeerId, tokio::sync::mpsc::UnboundedSender<(PeerId, Vec<u8>)>>,
+    >,
     partitions: Arc<Mutex<std::collections::HashSet<(PeerId, PeerId)>>>,
 }
 
@@ -177,7 +179,11 @@ impl NetworkHub {
         }
     }
 
-    fn register(&self, peer: PeerId, sender: tokio::sync::mpsc::UnboundedSender<(PeerId, Vec<u8>)>) {
+    fn register(
+        &self,
+        peer: PeerId,
+        sender: tokio::sync::mpsc::UnboundedSender<(PeerId, Vec<u8>)>,
+    ) {
         self.senders.lock().unwrap().insert(peer, sender);
     }
 
@@ -310,11 +316,20 @@ async fn test_prevote_prevents_term_inflation() {
     // Let election complete and leader term establish
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let term_after_election = storages[0].load_hard_state().unwrap().current_term;
-    assert!(term_after_election.0 >= 1, "Leader should have been elected with a term of at least 1");
+    assert!(
+        term_after_election.0 >= 1,
+        "Leader should have been elected with a term of at least 1"
+    );
 
     // Partition Node 3 completely
-    hub.partitions.lock().unwrap().insert((PeerId(1), PeerId(3)));
-    hub.partitions.lock().unwrap().insert((PeerId(2), PeerId(3)));
+    hub.partitions
+        .lock()
+        .unwrap()
+        .insert((PeerId(1), PeerId(3)));
+    hub.partitions
+        .lock()
+        .unwrap()
+        .insert((PeerId(2), PeerId(3)));
 
     // Let Node 3 run isolated and timeout several times
     tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -373,7 +388,10 @@ async fn test_concurrent_campaign_converges() {
     let term2 = storages[1].load_hard_state().unwrap().current_term;
     let term3 = storages[2].load_hard_state().unwrap().current_term;
 
-    assert!(term1.0 >= 1, "Cluster failed to elect a leader during simultaneous startup");
+    assert!(
+        term1.0 >= 1,
+        "Cluster failed to elect a leader during simultaneous startup"
+    );
     assert_eq!(term1, term2, "Node terms did not converge");
     assert_eq!(term2, term3, "Node terms did not converge");
 }

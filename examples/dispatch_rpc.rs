@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use arbitro_raft::{
     BootstrapPeer, ClusterId, DispatchAckPolicy, DispatchPeerState, DispatchScope, DispatchSpec,
-    EntryPayload, HardState, LogEntry, LogIndex, NodeConfig, PeerId, RaftError,
-    RaftNode, RaftStorage, RaftTransport, SnapshotMeta, Term,
+    EntryPayload, HardState, LogEntry, LogIndex, NodeConfig, PeerId, RaftError, RaftNode,
+    RaftStorage, RaftTransport, SnapshotMeta, Term,
 };
 
 // ── Minimal storage / transport ── (Simplistic for example)

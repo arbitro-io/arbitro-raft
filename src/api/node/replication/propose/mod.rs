@@ -1,9 +1,9 @@
-use std::time::Duration;
+use super::super::RaftNode;
 use crate::{
     protocol::codec::{encode_message_to_bytes, encode_message_vectored},
     AppendEntries, EntryPayload, LogEntry, LogIndex, RaftError, RaftMessage,
 };
-use super::super::RaftNode;
+use std::time::Duration;
 
 mod initial;
 mod quorum;
@@ -141,12 +141,7 @@ where
                     &mut self.scratch_vectored,
                 )
             };
-            encode_message_vectored(
-                self.config.node_id,
-                &msg,
-                &mut self.scratch_outbound,
-                iovs,
-            )?;
+            encode_message_vectored(self.config.node_id, &msg, &mut self.scratch_outbound, iovs)?;
 
             let slices: &[&[u8]] = iovs.as_slice();
             let transport = &self.transport;

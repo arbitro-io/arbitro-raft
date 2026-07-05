@@ -598,7 +598,9 @@ async fn run_follower_sim(listener: TcpListener, leader_addr: SocketAddr, my_id:
 
                 if success {
                     for (h, _) in iter {
-                        state.log.push((LogIndex(h.index.get()), Term(h.term.get())));
+                        state
+                            .log
+                            .push((LogIndex(h.index.get()), Term(h.term.get())));
                     }
                 }
 
@@ -884,7 +886,7 @@ fn bench_tcp_seeded_comparison(c: &mut Criterion) {
                 let p = payload.clone();
                 async move {
                     let mut cluster = make_cluster().await;
-                    
+
                     // Pre-fill storage to ensure Seeded path is primed
                     let mut initial_entries = Vec::new();
                     for i in 0..batch {
@@ -913,7 +915,6 @@ fn bench_tcp_seeded_comparison(c: &mut Criterion) {
 
     group.finish();
 }
-
 
 criterion_group!(
     benches,

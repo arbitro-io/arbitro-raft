@@ -22,7 +22,6 @@ use arbitro_raft::{
     PeerId, RaftError, RaftNode, RaftStorage, RaftTransport, SnapshotMeta, Term,
 };
 
-
 // ── Minimal in-memory storage ─────────────────────────────────────────────────
 
 #[derive(Clone, Default)]
