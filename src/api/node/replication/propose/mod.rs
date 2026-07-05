@@ -53,7 +53,7 @@ where
         if accepted < needed {
             return Err(RaftError::NoQuorum);
         }
-        self.soft_state.commit_index = last_index;
+        self.set_commit_index(last_index);
         self.drain_inbound_ready().await?;
         Ok(&self.scratch_indexes)
     }

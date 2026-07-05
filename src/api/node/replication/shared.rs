@@ -249,7 +249,7 @@ where
             term
         };
         if quorum_term == self.hard_state.current_term {
-            self.soft_state.commit_index = quorum_index;
+            self.set_commit_index(quorum_index);
         }
         Ok(())
     }

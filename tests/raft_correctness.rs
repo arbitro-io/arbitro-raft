@@ -363,3 +363,53 @@ fn invariant_benchmark_leader_promotion_is_consistent() {
     assert!(node.is_leader());
     assert_eq!(node.current_term(), Term(4));
 }
+
+// ---------------------------------------------------------------------------
+// Test 6 (BUG-1 regression): CommitIndexObserver observes commit_index writes.
+// ---------------------------------------------------------------------------
+//
+// The apply loop in arbitro-server polls this observer to bound the entries
+// it applies to the state machine at the current commit boundary — never past
+// the Raft-committed frontier. If a code path writes `soft_state.commit_index`
+// without going through `set_commit_index`, the observer would not see the new
+// value and the apply loop would either apply too little (safe, only stalls)
+// or, worse, would fall back to reading `last_log_position` and apply
+// uncommitted entries (unsafe, violates State Machine Safety).
+//
+// This test locks in the invariant: every `commit_index` write updates the
+// atomic mirror.
+
+#[test]
+fn commit_index_observer_reflects_writes() {
+    let (transport, _) = TestTransport::new();
+    let mut node =
+        arbitro_raft::RaftNode::new(config_3node(1), TestStorage::default(), transport).unwrap();
+
+    let observer = node.commit_index_observer();
+    assert_eq!(
+        observer.get(),
+        LogIndex(0),
+        "freshly-created node must publish commit_index = 0"
+    );
+
+    // Drive the single write path: set_commit_index() must update both
+    // soft_state (visible via commit_index()) and the atomic mirror.
+    node.set_commit_index(LogIndex(7));
+    assert_eq!(node.commit_index(), LogIndex(7));
+    assert_eq!(
+        observer.get(),
+        LogIndex(7),
+        "observer must see the new commit_index"
+    );
+
+    // Monotonic advance — Raft never regresses commit_index in normal
+    // operation, but this test also exercises the storage on a second write.
+    node.set_commit_index(LogIndex(42));
+    assert_eq!(observer.get(), LogIndex(42));
+
+    // A cloned observer sees the same value — the atomic is shared.
+    let observer2 = observer.clone();
+    node.set_commit_index(LogIndex(100));
+    assert_eq!(observer.get(), LogIndex(100));
+    assert_eq!(observer2.get(), LogIndex(100));
+}

@@ -92,6 +92,17 @@ where
     pub fn commit_index(&self) -> LogIndex {
         self.node.commit_index()
     }
+
+    /// Cheaply-clonable read-only observer over the committed log index.
+    ///
+    /// Clone this before moving `self` into a background task so external
+    /// consumers (for example an apply loop that lives in another task)
+    /// can safely poll the current commit boundary without holding the
+    /// node.
+    #[inline]
+    pub fn commit_index_observer(&self) -> crate::CommitIndexObserver {
+        self.node.commit_index_observer()
+    }
     #[inline]
     pub fn node_id(&self) -> PeerId {
         self.node.node_id()

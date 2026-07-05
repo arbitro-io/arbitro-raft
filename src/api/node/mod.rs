@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::{
     HardState, InboundRaftMessage, LogEntry, LogIndex, NodeConfig, PeerId, RaftCustomRegistry,
@@ -53,6 +54,30 @@ pub struct RaftNode<S, T> {
     /// Cached last-log position — kept in sync with every append/truncate so
     /// `try_advance_commit_index` and leader-progress init avoid a storage read.
     pub(crate) cached_last_log: (LogIndex, Term),
+
+    /// Atomic mirror of `soft_state.commit_index`, updated via
+    /// [`RaftNode::set_commit_index`] so external observers (e.g. an
+    /// apply loop that lives in another task) can safely read the
+    /// committed boundary without holding the node lock.
+    pub(crate) commit_index_pub: Arc<AtomicU64>,
+}
+
+/// Read-only, cheaply-clonable view of a Raft node's committed log index.
+///
+/// The Raft protocol guarantees that once an entry is committed it is
+/// safe to apply to the state machine. Consumers polling `get()` see a
+/// monotonically non-decreasing value.
+#[derive(Debug, Clone)]
+pub struct CommitIndexObserver {
+    inner: Arc<AtomicU64>,
+}
+
+impl CommitIndexObserver {
+    /// Current committed index. Safe to call from any thread.
+    #[inline]
+    pub fn get(&self) -> LogIndex {
+        LogIndex(self.inner.load(Ordering::Acquire))
+    }
 }
 
 // SAFETY: All raw pointers in scratch_vectored are ephemeral and cleared after use.
@@ -109,7 +134,38 @@ where
             scratch_responders: Vec::with_capacity(peer_count),
             cached_last_log,
             log_metadata: generational::LogMetadataArena::new(8192),
+            commit_index_pub: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Update `soft_state.commit_index` and publish the new value to
+    /// any [`CommitIndexObserver`] holding a clone of the atomic mirror.
+    ///
+    /// This is the single write path for the commit index — call this
+    /// instead of assigning `soft_state.commit_index` directly so
+    /// external observers (e.g. an apply loop in another task) stay
+    /// consistent.
+    ///
+    /// Callers outside the crate should NOT invoke this directly in
+    /// production; the Raft loop drives commit-index progression. It
+    /// is exposed (hidden from docs) purely so correctness tests can
+    /// simulate commit advances without spinning up a full cluster.
+    #[doc(hidden)]
+    #[inline]
+    pub fn set_commit_index(&mut self, idx: LogIndex) {
+        self.soft_state.commit_index = idx;
+        self.commit_index_pub.store(idx.0, Ordering::Release);
+    }
+
+    /// Cheaply-clonable read-only observer over the committed log index.
+    ///
+    /// Consumers must clone the observer before the node is moved into
+    /// its background task (as with [`ArbitroRaft::client_handle`]).
+    #[inline]
+    pub fn commit_index_observer(&self) -> CommitIndexObserver {
+        CommitIndexObserver {
+            inner: self.commit_index_pub.clone(),
+        }
     }
 
     #[inline]

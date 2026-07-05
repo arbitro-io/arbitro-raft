@@ -4,4 +4,4 @@ mod node;
 
 pub use arbitro_raft::{ArbitroRaft, ClientHandle};
 pub use custom_registry::RaftCustomRegistry;
-pub use node::RaftNode;
+pub use node::{CommitIndexObserver, RaftNode};

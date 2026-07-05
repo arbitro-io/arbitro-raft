@@ -186,7 +186,7 @@ where
 
         let last_log_index = self.cached_last_log.0;
         if leader_commit > self.soft_state.commit_index {
-            self.soft_state.commit_index = LogIndex(leader_commit.0.min(last_log_index.0));
+            self.set_commit_index(LogIndex(leader_commit.0.min(last_log_index.0)));
         }
 
         let resp = AppendEntriesResp {
@@ -257,7 +257,7 @@ where
 
         let last_log_index = self.cached_last_log.0;
         if leader_commit > self.soft_state.commit_index {
-            self.soft_state.commit_index = LogIndex(leader_commit.0.min(last_log_index.0));
+            self.set_commit_index(LogIndex(leader_commit.0.min(last_log_index.0)));
         }
 
         let resp = AppendEntriesResp {

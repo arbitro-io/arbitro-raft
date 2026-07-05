@@ -169,7 +169,7 @@ where
             self.storage
                 .save_snapshot(&completed.meta, &completed.bytes)?;
             if self.soft_state.commit_index.0 < completed.meta.last_included_index.0 {
-                self.soft_state.commit_index = completed.meta.last_included_index;
+                self.set_commit_index(completed.meta.last_included_index);
             }
         }
 

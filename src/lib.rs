@@ -10,7 +10,7 @@ pub mod traits;
 pub mod types;
 pub mod validation;
 
-pub use api::{ArbitroRaft, ClientHandle, RaftCustomRegistry, RaftNode};
+pub use api::{ArbitroRaft, ClientHandle, CommitIndexObserver, RaftCustomRegistry, RaftNode};
 pub use config::BootstrapPeer;
 pub use config::{LimitsConfig, NodeConfig, TimingConfig};
 pub use dispatch::{
