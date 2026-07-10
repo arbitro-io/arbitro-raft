@@ -171,6 +171,10 @@ fn dispatch_tx_times_out_when_no_peer_finishes() {
         .unwrap();
     let (handle, _tx) = envelope.begin([PeerId(2), PeerId(3)], decode_sync_ack);
 
-    let err = block_on(handle.wait()).unwrap_err();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let err = rt.block_on(handle.wait()).unwrap_err();
     assert!(matches!(err, RaftError::Dispatch(_)));
 }
