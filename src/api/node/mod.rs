@@ -13,6 +13,10 @@ mod generational;
 mod progress;
 mod replication;
 mod snapshot;
+mod leader_balance;
+mod log_compaction;
+pub(crate) mod membership;
+mod snapshot_install;
 
 pub(crate) use dispatch::PendingCustomDispatch;
 pub(crate) use progress::{AppendAttemptState, PeerMap, PeerProgress, PendingSnapshot};
@@ -192,6 +196,17 @@ where
     #[inline]
     pub fn node_id(&self) -> PeerId {
         self.config.node_id
+    }
+
+    /// Voter set this node is currently configured with.
+    ///
+    /// This is the same slice that `RaftGroupRegistry` uses for quorum math.
+    /// The membership-change task (Group 2) mutates this set in place when a
+    /// joint-consensus transition applies; readers must not cache the slice
+    /// across a `run_once` boundary.
+    #[inline]
+    pub fn peers(&self) -> &[PeerId] {
+        &self.config.peers
     }
 
     #[inline]

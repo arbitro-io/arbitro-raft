@@ -4,6 +4,6 @@ mod storage;
 mod transport;
 
 pub use clock::Clock;
-pub use state_machine::StateMachine;
+pub use state_machine::{NoopStateMachine, StateMachine};
 pub use storage::RaftStorage;
 pub use transport::RaftTransport;

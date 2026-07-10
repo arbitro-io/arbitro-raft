@@ -58,6 +58,17 @@ pub trait RaftStorage: Send + Sync + 'static {
     fn last_log_position(&self) -> Result<(LogIndex, Term), RaftError>;
 
     fn truncate_suffix(&self, from: LogIndex) -> Result<(), RaftError>;
+
+    /// Delete every log entry with index STRICTLY LESS THAN `up_to`.
+    ///
+    /// Called after a snapshot has been saved via `save_snapshot`. The default
+    /// implementation is a no-op — storages that want log compaction must
+    /// override it. It is NEVER an error to leave entries in place; the log
+    /// simply grows unbounded (existing behavior).
+    fn truncate_before(&self, _up_to: LogIndex) -> Result<(), RaftError> {
+        Ok(())
+    }
+
     fn save_snapshot(&self, meta: &SnapshotMeta, snapshot: &[u8]) -> Result<(), RaftError>;
     fn load_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, RaftError>;
 }

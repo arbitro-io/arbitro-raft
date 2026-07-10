@@ -164,6 +164,58 @@ where
         self.node.propose_batch_once(payloads).await
     }
 
+    /// Propose a joint-consensus membership change transitioning the
+    /// cluster from the current voter set to `new_peers`.
+    ///
+    /// Semantics: appends TWO entries to the log — first the joint
+    /// configuration `C_old_new` (safe under both quorums), then, once
+    /// that entry commits, the final configuration `C_new`. Returns the
+    /// `LogIndex` of the FINAL entry.
+    ///
+    /// This method drives the transition to completion before returning.
+    /// If the leader steps down mid-transition, the underlying
+    /// `propose_once` returns `RaftError::NotLeader` and the caller
+    /// should retry against the new leader.
+    pub async fn propose_config_change(
+        &mut self,
+        new_peers: Vec<PeerId>,
+    ) -> Result<LogIndex, RaftError> {
+        use crate::api::node::membership::{ConfigChangeEntry, ConfigChangePhase};
+
+        if !self.node.is_leader() {
+            return Err(RaftError::NotLeader {
+                leader_hint: self
+                    .node
+                    .hard_state()
+                    .voted_for
+                    .map(|leader_id| crate::LeaderHint { leader_id }),
+            });
+        }
+        let old_peers = self.node.peers().to_vec();
+
+        // Phase 1 — joint entry (C_old_new).
+        let joint = ConfigChangeEntry {
+            phase: ConfigChangePhase::Joint,
+            old_peers: old_peers.clone(),
+            new_peers: new_peers.clone(),
+        };
+        let joint_bytes = joint.encode();
+        let _joint_idx = self.node.propose_once(&joint_bytes).await?;
+
+        // Phase 2 — final entry (C_new). `propose_once` only returns
+        // after the entry commits via `gather_quorum_acks`, so we know
+        // the joint entry has been durably replicated before we append
+        // the final one.
+        let final_entry = ConfigChangeEntry {
+            phase: ConfigChangePhase::Final,
+            old_peers,
+            new_peers,
+        };
+        let final_bytes = final_entry.encode();
+        let final_idx = self.node.propose_once(&final_bytes).await?;
+        Ok(final_idx)
+    }
+
     #[inline]
     pub async fn campaign_once(&mut self) -> Result<bool, RaftError> {
         let elected = self.node.campaign_once(&mut self.inbound_buf).await?;

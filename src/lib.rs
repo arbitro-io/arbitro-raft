@@ -10,6 +10,9 @@ pub mod traits;
 pub mod types;
 pub mod validation;
 
+pub use api::node::membership::{
+    ConfigChangeEntry, ConfigChangePhase, CONFIG_CHANGE_MAGIC, CONFIG_CHANGE_VERSION,
+};
 pub use api::{ArbitroRaft, ClientHandle, CommitIndexObserver, RaftCustomRegistry, RaftNode};
 pub use config::BootstrapPeer;
 pub use config::{LimitsConfig, NodeConfig, TimingConfig};
@@ -35,6 +38,6 @@ pub use protocol::{
 };
 pub use state::Role;
 pub use state::{HardState, SnapshotMeta, SoftState};
-pub use traits::{Clock, RaftStorage, RaftTransport, StateMachine};
+pub use traits::{Clock, NoopStateMachine, RaftStorage, RaftTransport, StateMachine};
 pub use types::{ClusterId, GroupId, LeaderHint, LogIndex, PeerId, Term};
 pub use validation::validate_node_config;

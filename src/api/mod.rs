@@ -1,6 +1,6 @@
 mod arbitro_raft;
 mod custom_registry;
-mod node;
+pub(crate) mod node;
 pub mod registry;
 pub mod transport;
 

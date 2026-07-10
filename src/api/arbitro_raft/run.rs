@@ -40,6 +40,12 @@ where
     ///     machine is a hard bug; the node should crash rather than
     ///     silently continue.
     pub(super) fn apply_committed_entries(&mut self) -> Result<(), RaftError> {
+        // Consume any freshly-installed snapshot before walking log entries.
+        // This re-anchors `last_applied` to the snapshot boundary so the
+        // loop below doesn't hit a `None` from `read_entry_payload_into`
+        // for entries the snapshot has replaced.
+        self.node
+            .restore_state_machine_from_snapshot(&mut self.state_machine)?;
         let commit = self.node.commit_index();
         let mut next = LogIndex(self.node.last_applied().0 + 1);
         while next <= commit {
@@ -344,5 +350,30 @@ where
         for w in self.commit_waiters.drain(..) {
             self.registry.get(w.slot_id).notify_error();
         }
+    }
+
+    /// Leader-side helper: for every peer whose `next_index` has fallen
+    /// below the on-disk snapshot boundary, stream the snapshot instead
+    /// of an `AppendEntries`. No-op on followers.
+    ///
+    /// Returns the number of peers a snapshot was actually sent to.
+    pub async fn install_snapshot_to_lagging_peers(&mut self) -> Result<usize, RaftError> {
+        if !self.node.is_leader() {
+            return Ok(0);
+        }
+        // Copy the peer list out so the async call below can take
+        // `&mut self.node` without aliasing the borrow of `config.peers`.
+        let peers: Vec<_> = self.node.peers().to_vec();
+        let self_id = self.node.node_id();
+        let mut sent = 0usize;
+        for peer in peers {
+            if peer == self_id {
+                continue;
+            }
+            if self.node.maybe_install_snapshot_to_lagging_peer(peer).await? {
+                sent += 1;
+            }
+        }
+        Ok(sent)
     }
 }

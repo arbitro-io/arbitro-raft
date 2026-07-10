@@ -172,6 +172,9 @@ where
             if self.soft_state.commit_index.0 < completed.meta.last_included_index.0 {
                 self.set_commit_index(completed.meta.last_included_index);
             }
+            // Hand off to the outer apply loop. Source-of-truth is the storage
+            // layer (`load_snapshot`) — this call is a discoverable hook point.
+            super::snapshot_install::mark_snapshot_installed(self, &completed.meta);
         }
 
         let resp = InstallSnapshotResp {
@@ -195,5 +198,35 @@ where
             self.step_down(resp_term)?;
         }
         Ok(())
+    }
+
+    /// If `peer`'s `next_index` has fallen below the on-disk snapshot's
+    /// `last_included_index`, stream the snapshot to it. Otherwise no-op.
+    ///
+    /// Public bridge into the `snapshot_install` module — that module is
+    /// private to `node/` so `ArbitroRaft` reaches it through this method.
+    #[inline]
+    pub async fn maybe_install_snapshot_to_lagging_peer(
+        &mut self,
+        peer: PeerId,
+    ) -> Result<bool, RaftError> {
+        super::snapshot_install::maybe_install_snapshot_to_lagging_peer(self, peer).await
+    }
+
+    /// If the on-disk snapshot is more recent than `last_applied`, restore
+    /// `sm` from it and jump `last_applied` to the snapshot boundary.
+    /// Idempotent — returns `false` when nothing to do.
+    ///
+    /// Public bridge into the `snapshot_install` module — that module is
+    /// private to `node/` so `ArbitroRaft` reaches it through this method.
+    #[inline]
+    pub fn restore_state_machine_from_snapshot<SM>(
+        &mut self,
+        sm: &mut SM,
+    ) -> Result<bool, RaftError>
+    where
+        SM: crate::StateMachine,
+    {
+        super::snapshot_install::restore_state_machine_from_snapshot(self, sm)
     }
 }
