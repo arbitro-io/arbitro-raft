@@ -14,6 +14,29 @@ pub fn encode_message_vectored<'a>(
     header_buf: &'a mut [u8],
     out_vectored: &mut Vec<&'a [u8]>,
 ) -> Result<(), RaftError> {
+    encode_message_vectored_impl(from, 0, msg, header_buf, out_vectored)
+}
+
+/// Same as [`encode_message_vectored`] but stamps `group_id` into the frame
+/// header, allowing a single transport to multiplex frames for many Raft
+/// groups. Use `GroupId(0)` for the default single-group behavior.
+pub fn encode_message_vectored_with_group<'a>(
+    from: PeerId,
+    group_id: crate::GroupId,
+    msg: &RaftMessage<'a>,
+    header_buf: &'a mut [u8],
+    out_vectored: &mut Vec<&'a [u8]>,
+) -> Result<(), RaftError> {
+    encode_message_vectored_impl(from, group_id.0, msg, header_buf, out_vectored)
+}
+
+fn encode_message_vectored_impl<'a>(
+    from: PeerId,
+    group_id: u64,
+    msg: &RaftMessage<'a>,
+    header_buf: &'a mut [u8],
+    out_vectored: &mut Vec<&'a [u8]>,
+) -> Result<(), RaftError> {
     out_vectored.clear();
 
     let body_len = body_total_len(msg);
@@ -38,7 +61,7 @@ pub fn encode_message_vectored<'a>(
         header.from.set(from.0);
         header.body_len.set(body_len as u32);
         header.reserved.set(0);
-        header._pad.set(0);
+        header.group_id.set(group_id);
     }
 
     match msg {
@@ -180,7 +203,7 @@ pub fn encode_append_entries_vectored<'a>(
         header.kind = KIND_APPEND_ENTRIES;
         header.from.set(from.0);
         header.body_len.set(body_wire_len as u32);
-        header._pad.set(0);
+        header.group_id.set(0);
 
         // AppendEntries Body
         let ae_ptr = header_buf_ptr.add(RAFT_FRAME_HEADER_SIZE);

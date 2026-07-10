@@ -11,8 +11,16 @@ use std::time::{Duration, Instant};
 use arbitro_raft::{
     ArbitroRaft, BootstrapPeer, ClientHandle, ClusterId, EntryPayload, HardState, LimitsConfig,
     LogEntry, LogIndex, NodeConfig, PeerId, RaftError, RaftStorage, RaftTransport, Role,
-    SnapshotMeta, Term, TimingConfig,
+    SnapshotMeta, StateMachine, Term, TimingConfig,
 };
+
+/// Bench-local no-op StateMachine — apply is a no-op; snapshot/restore return empty.
+struct NoopSM;
+impl StateMachine for NoopSM {
+    fn apply(&mut self, _entry: &[u8]) -> Result<(), RaftError> { Ok(()) }
+    fn snapshot(&self) -> Result<Vec<u8>, RaftError> { Ok(Vec::new()) }
+    fn restore(&mut self, _snapshot: &[u8]) -> Result<(), RaftError> { Ok(()) }
+}
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -362,7 +370,7 @@ async fn spawn_node(
     };
     let storage = MemStorage::default();
     let node = arbitro_raft::RaftNode::new(config, storage, transport).unwrap();
-    let mut raft = ArbitroRaft::new(node);
+    let mut raft = ArbitroRaft::new(node, NoopSM);
     let raft_handle = raft.client_handle();
     let role = Arc::new(Mutex::new(Role::Follower));
     let role_clone = role.clone();

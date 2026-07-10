@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crate::{RaftStorage, RaftTransport};
+use crate::{RaftStorage, RaftTransport, StateMachine};
 
 use super::ArbitroRaft;
 
@@ -23,10 +23,11 @@ pub(super) fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-impl<S, T> ArbitroRaft<S, T>
+impl<S, T, SM> ArbitroRaft<S, T, SM>
 where
     S: RaftStorage,
     T: RaftTransport,
+    SM: StateMachine,
 {
     #[inline]
     pub(super) fn reset_heartbeat_deadline(&mut self) {

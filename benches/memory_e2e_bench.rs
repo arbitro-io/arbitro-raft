@@ -22,8 +22,16 @@ use arbitro_raft::protocol::{
 use arbitro_raft::{
     decode_message, encode_message_vectored, ArbitroRaft, BootstrapPeer, ClusterId, EntryPayload,
     HardState, LogEntry, LogIndex, NodeConfig, PeerId, RaftError, RaftStorage, RaftTransport,
-    SnapshotMeta, Term,
+    SnapshotMeta, StateMachine, Term,
 };
+
+/// Bench-local no-op StateMachine — apply is a no-op; snapshot/restore return empty.
+struct NoopSM;
+impl StateMachine for NoopSM {
+    fn apply(&mut self, _entry: &[u8]) -> Result<(), RaftError> { Ok(()) }
+    fn snapshot(&self) -> Result<Vec<u8>, RaftError> { Ok(Vec::new()) }
+    fn restore(&mut self, _snapshot: &[u8]) -> Result<(), RaftError> { Ok(()) }
+}
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
@@ -764,12 +772,12 @@ fn make_config(node_id: PeerId) -> NodeConfig {
     }
 }
 
-fn make_leader() -> ArbitroRaft<MemStorage, MemTransport> {
+fn make_leader() -> ArbitroRaft<MemStorage, MemTransport, NoopSM> {
     let storage = MemStorage::new();
     let transport = MemTransport::new();
     let mut node = arbitro_raft::RaftNode::new(make_config(PeerId(1)), storage, transport).unwrap();
     node.become_leader_for_benchmark(Term(1));
-    ArbitroRaft::new(node)
+    ArbitroRaft::new(node, NoopSM)
 }
 
 fn make_runtime(workers: usize) -> tokio::runtime::Runtime {
@@ -780,12 +788,12 @@ fn make_runtime(workers: usize) -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-fn make_seeded_leader() -> ArbitroRaft<SeededMemStorage, SeededTransport> {
+fn make_seeded_leader() -> ArbitroRaft<SeededMemStorage, SeededTransport, NoopSM> {
     let storage = SeededMemStorage::new();
     let transport = SeededTransport::new();
     let mut node = arbitro_raft::RaftNode::new(make_config(PeerId(1)), storage, transport).unwrap();
     node.become_leader_for_benchmark(Term(1));
-    ArbitroRaft::new(node)
+    ArbitroRaft::new(node, NoopSM)
 }
 
 fn bench_seeded_vs_ergo(c: &mut Criterion) {

@@ -17,8 +17,16 @@ use arbitro_raft::protocol::{
 use arbitro_raft::{
     decode_message, encode_message_vectored, ArbitroRaft, BootstrapPeer, ClusterId, EntryPayload,
     HardState, LogEntry, LogIndex, NodeConfig, PeerId, RaftError, RaftStorage, RaftTransport,
-    SnapshotMeta, Term,
+    SnapshotMeta, StateMachine, Term,
 };
+
+/// Bench-local no-op StateMachine — apply is a no-op; snapshot/restore return empty.
+struct NoopSM;
+impl StateMachine for NoopSM {
+    fn apply(&mut self, _entry: &[u8]) -> Result<(), RaftError> { Ok(()) }
+    fn snapshot(&self) -> Result<Vec<u8>, RaftError> { Ok(Vec::new()) }
+    fn restore(&mut self, _snapshot: &[u8]) -> Result<(), RaftError> { Ok(()) }
+}
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use futures::channel::mpsc::{self, UnboundedReceiver};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -631,7 +639,7 @@ async fn run_follower_sim(listener: TcpListener, leader_addr: SocketAddr, my_id:
 }
 
 struct BenchCluster {
-    raft: ArbitroRaft<SeededMemStorage, TcpTransport>,
+    raft: ArbitroRaft<SeededMemStorage, TcpTransport, NoopSM>,
     storage: SeededMemStorage,
     _tasks: Vec<JoinHandle<()>>,
 }
@@ -692,7 +700,7 @@ async fn make_cluster() -> BenchCluster {
     let node_storage = storage.clone();
     let mut node = arbitro_raft::RaftNode::new(config, node_storage, transport).unwrap();
     node.become_leader_for_benchmark(Term(1));
-    let raft = ArbitroRaft::new(node);
+    let raft = ArbitroRaft::new(node, NoopSM);
 
     let f2 = tokio::spawn(run_follower_sim(l2, addr1, PeerId(2)));
     let f3 = tokio::spawn(run_follower_sim(l3, addr1, PeerId(3)));

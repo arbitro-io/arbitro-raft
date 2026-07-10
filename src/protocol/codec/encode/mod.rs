@@ -11,7 +11,9 @@ mod contiguous;
 mod vectored;
 
 pub use contiguous::encode_message_to_bytes;
-pub use vectored::{encode_append_entries_vectored, encode_message_vectored};
+pub use vectored::{
+    encode_append_entries_vectored, encode_message_vectored, encode_message_vectored_with_group,
+};
 
 pub(super) fn kind_of(msg: &RaftMessage) -> u8 {
     match msg {

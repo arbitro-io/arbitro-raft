@@ -74,6 +74,7 @@ where
             {
                 let inbound = crate::decode_message(&guard.buf[..n])?;
                 let from = inbound.from;
+                let group_id = inbound.group_id;
                 match inbound.message {
                     RaftMessage::AppendEntriesResp(resp) => {
                         guard
@@ -84,7 +85,7 @@ where
                     message => {
                         guard
                             .node
-                            .handle_inbound(InboundRaftMessage { from, message })
+                            .handle_inbound(InboundRaftMessage { from, group_id, message })
                             .await?;
                     }
                 }
@@ -105,6 +106,7 @@ where
             {
                 let inbound = crate::decode_message(&guard.buf[..n])?;
                 let from = inbound.from;
+                let group_id = inbound.group_id;
                 match inbound.message {
                     RaftMessage::AppendEntriesResp(resp) => {
                         guard
@@ -115,7 +117,7 @@ where
                     message => {
                         guard
                             .node
-                            .handle_inbound(InboundRaftMessage { from, message })
+                            .handle_inbound(InboundRaftMessage { from, group_id, message })
                             .await?;
                     }
                 }

@@ -19,8 +19,16 @@ use std::time::Duration;
 
 use arbitro_raft::{
     ArbitroRaft, BootstrapPeer, ClusterId, EntryPayload, HardState, LogEntry, LogIndex, NodeConfig,
-    PeerId, RaftError, RaftNode, RaftStorage, RaftTransport, SnapshotMeta, Term,
+    PeerId, RaftError, RaftNode, RaftStorage, RaftTransport, SnapshotMeta, StateMachine, Term,
 };
+
+/// Example no-op StateMachine — apply is a no-op; snapshot/restore return empty.
+struct NoopSM;
+impl StateMachine for NoopSM {
+    fn apply(&mut self, _entry: &[u8]) -> Result<(), RaftError> { Ok(()) }
+    fn snapshot(&self) -> Result<Vec<u8>, RaftError> { Ok(Vec::new()) }
+    fn restore(&mut self, _snapshot: &[u8]) -> Result<(), RaftError> { Ok(()) }
+}
 
 // ── Minimal in-memory storage ─────────────────────────────────────────────────
 
@@ -183,7 +191,7 @@ async fn main() {
     #[allow(deprecated)]
     node.become_leader_for_benchmark(Term(1));
 
-    let mut raft = ArbitroRaft::new(node);
+    let mut raft = ArbitroRaft::new(node, NoopSM);
 
     let idx_a = raft.propose_once(b"entry-a").await.unwrap();
     let idx_b = raft.propose_once(b"entry-b").await.unwrap();

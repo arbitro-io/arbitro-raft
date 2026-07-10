@@ -26,7 +26,7 @@ pub fn encode_message_to_bytes(from: PeerId, msg: &RaftMessage) -> Result<bytes:
         header.kind = kind_of(msg);
         header.from.set(from.0);
         header.body_len.set(body_len as u32);
-        header._pad.set(0);
+        header.group_id.set(0);
     }
 
     match msg {

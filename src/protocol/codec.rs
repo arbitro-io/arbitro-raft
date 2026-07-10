@@ -8,6 +8,7 @@ pub use view::AppendEntriesView;
 
 pub use encode::{
     encode_append_entries_vectored, encode_message_to_bytes, encode_message_vectored,
+    encode_message_vectored_with_group,
 };
 
 pub use wire::{

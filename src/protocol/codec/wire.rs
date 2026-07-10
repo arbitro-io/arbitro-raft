@@ -33,8 +33,10 @@ pub(crate) struct RaftFrameHeader {
     pub(crate) from: U64,     // [8..16]
     pub(crate) body_len: U32, // [16..20]
     pub(crate) reserved: U32, // [20..24]
-    pub(crate) _pad: U64,     // [24..32] — aligns header to 32 bytes (power-of-2, half cache line)
+    pub(crate) group_id: U64, // [24..32] — was _pad; GroupId(0) = default single-group
 }
+
+const _: () = assert!(RAFT_FRAME_HEADER_SIZE == 32);
 
 #[derive(
     IntoBytes, FromBytes, KnownLayout, Immutable, Unaligned, Clone, Copy, Debug, PartialEq, Eq,

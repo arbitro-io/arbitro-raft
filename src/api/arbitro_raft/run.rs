@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use futures::{FutureExt, StreamExt};
 
-use crate::{LogIndex, RaftError, RaftStorage, RaftTransport};
+use crate::{LogIndex, RaftError, RaftStorage, RaftTransport, StateMachine};
 
 use super::client::CommitWaiter;
 use super::ArbitroRaft;
@@ -18,11 +18,63 @@ use super::ArbitroRaft;
 //   - fail_commit_waiters  — notify all pending clients on step-down
 // ---------------------------------------------------------------------------
 
-impl<S, T> ArbitroRaft<S, T>
+impl<S, T, SM> ArbitroRaft<S, T, SM>
 where
     S: RaftStorage,
     T: RaftTransport,
+    SM: StateMachine,
 {
+    /// Apply all committed-but-not-yet-applied entries to the state
+    /// machine, in strict log order.
+    ///
+    /// Invariants:
+    ///   - `last_applied <= commit_index` at all times (Raft protocol).
+    ///   - Apply is per-node local. On leader step-down, in-flight
+    ///     committed entries MUST still be applied — they are durable
+    ///     in the log. This helper does NOT gate on `is_leader()`.
+    ///   - Apply is idempotent-per-index across restarts because
+    ///     `last_applied` is volatile (reset to 0) and the state
+    ///     machine is responsible for its own persistence and
+    ///     reconciliation via `snapshot`/`restore`.
+    ///   - Errors from `sm.apply` propagate — a diverging state
+    ///     machine is a hard bug; the node should crash rather than
+    ///     silently continue.
+    pub(super) fn apply_committed_entries(&mut self) -> Result<(), RaftError> {
+        let commit = self.node.commit_index();
+        let mut next = LogIndex(self.node.last_applied().0 + 1);
+        while next <= commit {
+            // Split-borrow: `read_entry_payload_into` borrows
+            // `&self.node.storage` immutably via `&self.node`; the
+            // subsequent `self.state_machine.apply` borrows the
+            // disjoint `state_machine` field mutably. We copy the
+            // payload bytes out into a local slice so that the
+            // read-borrow of `self.node` ends before we touch
+            // `self.state_machine`.
+            let payload_len = {
+                let entry_opt =
+                    self.node.read_entry_payload_into(next, &mut self.apply_buf)?;
+                match entry_opt {
+                    Some(entry) => entry.payload.0.len(),
+                    // Entry missing at an index <= commit_index is only
+                    // possible if a snapshot install has advanced the
+                    // log start beyond `last_applied`. In that case the
+                    // state machine will have been restored by the
+                    // snapshot handler; stop applying and let the
+                    // snapshot path re-anchor `last_applied`.
+                    None => break,
+                }
+            };
+            // Reborrow the just-written payload bytes as an immutable
+            // slice, then hand them to the state machine. The buffer
+            // is not touched again until the next iteration.
+            let payload = &self.apply_buf[..payload_len];
+            self.state_machine.apply(payload)?;
+            self.node.set_last_applied(next);
+            next = LogIndex(next.0 + 1);
+        }
+        Ok(())
+    }
+
     pub(super) async fn run_leader_once(&mut self) -> Result<(), RaftError> {
         // 1. Drain inbound client proposals → pending_batch + pending_slots.
         //    NOTE: do NOT clear first — items may have been pushed by the idle-path select
@@ -61,6 +113,10 @@ where
         if processed > 0 {
             self.node.try_advance_commit_index()?;
             self.drain_commit_waiters();
+            // Apply committed entries locally — safe even if we just
+            // stepped down: entries already committed remain durable
+            // and must be applied to keep the state machine in sync.
+            self.apply_committed_entries()?;
             if !self.node.is_leader() {
                 self.fail_commit_waiters();
             }
@@ -94,6 +150,7 @@ where
                     self.node.handle_inbound(inbound).await?;
                     self.node.try_advance_commit_index()?;
                     self.drain_commit_waiters();
+                    self.apply_committed_entries()?;
                     if !self.node.is_leader() { self.fail_commit_waiters(); }
                 }
                 // else: timeout, heartbeat sent on next tick
@@ -189,6 +246,10 @@ where
         }
 
         if processed > 0 {
+            // Followers learn about commit-index advances through
+            // AppendEntries; apply any newly-committed entries before
+            // returning so the state machine tracks the leader.
+            self.apply_committed_entries()?;
             self.reset_election_deadline();
             return Ok(());
         }
@@ -204,6 +265,7 @@ where
             Some(n) => {
                 let inbound = crate::decode_message(&self.inbound_buf[..n])?;
                 self.node.handle_inbound(inbound).await?;
+                self.apply_committed_entries()?;
                 self.reset_election_deadline();
                 if self.node.is_leader() {
                     self.reset_heartbeat_deadline();

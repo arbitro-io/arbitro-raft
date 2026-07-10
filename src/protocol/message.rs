@@ -2,7 +2,7 @@ use super::codec::wire::{
     AppendEntries, AppendEntriesResp, EntryHeader, InstallSnapshot, InstallSnapshotResp,
     RequestVote, RequestVoteResp,
 };
-use crate::{EntryPayload, LogEntry, LogIndex, PeerId, Term};
+use crate::{EntryPayload, GroupId, LogEntry, LogIndex, PeerId, Term};
 use zerocopy::Ref;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +35,7 @@ pub enum RaftMessage<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InboundRaftMessage<'a> {
     pub from: PeerId,
+    pub group_id: GroupId,
     pub message: RaftMessage<'a>,
 }
 

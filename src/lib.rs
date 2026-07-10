@@ -27,14 +27,14 @@ pub use entry::{EntryPayload, LogEntry};
 pub use error::RaftError;
 pub use protocol::{
     decode_message, encode_append_entries_vectored, encode_message_to_bytes,
-    encode_message_vectored, AppendEntries, AppendEntriesResp, EntryHeader, InboundRaftMessage,
-    InstallSnapshot, InstallSnapshotResp, RaftMessage, RequestVote, RequestVoteResp,
-    KIND_APPEND_ENTRIES, KIND_APPEND_ENTRIES_RESP, KIND_CUSTOM, KIND_CUSTOM_RESPONSE,
-    KIND_INSTALL_SNAPSHOT, KIND_INSTALL_SNAPSHOT_RESP, KIND_REQUEST_VOTE, KIND_REQUEST_VOTE_RESP,
-    RAFT_FRAME_HEADER_SIZE, RAFT_MAGIC, RAFT_VERSION,
+    encode_message_vectored, encode_message_vectored_with_group, AppendEntries,
+    AppendEntriesResp, EntryHeader, InboundRaftMessage, InstallSnapshot, InstallSnapshotResp,
+    RaftMessage, RequestVote, RequestVoteResp, KIND_APPEND_ENTRIES, KIND_APPEND_ENTRIES_RESP,
+    KIND_CUSTOM, KIND_CUSTOM_RESPONSE, KIND_INSTALL_SNAPSHOT, KIND_INSTALL_SNAPSHOT_RESP,
+    KIND_REQUEST_VOTE, KIND_REQUEST_VOTE_RESP, RAFT_FRAME_HEADER_SIZE, RAFT_MAGIC, RAFT_VERSION,
 };
 pub use state::Role;
 pub use state::{HardState, SnapshotMeta, SoftState};
 pub use traits::{Clock, RaftStorage, RaftTransport, StateMachine};
-pub use types::{ClusterId, LeaderHint, LogIndex, PeerId, Term};
+pub use types::{ClusterId, GroupId, LeaderHint, LogIndex, PeerId, Term};
 pub use validation::validate_node_config;

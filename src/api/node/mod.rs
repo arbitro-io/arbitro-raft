@@ -60,6 +60,14 @@ pub struct RaftNode<S, T> {
     /// apply loop that lives in another task) can safely read the
     /// committed boundary without holding the node lock.
     pub(crate) commit_index_pub: Arc<AtomicU64>,
+
+    /// Highest log index applied to the state machine.
+    ///
+    /// Volatile — reset to `LogIndex(0)` on restart. The state
+    /// machine is responsible for its own persistence and
+    /// reconciliation via `snapshot`/`restore`. The Raft protocol
+    /// guarantees `last_applied <= commit_index` at all times.
+    pub(crate) last_applied: LogIndex,
 }
 
 /// Read-only, cheaply-clonable view of a Raft node's committed log index.
@@ -135,6 +143,9 @@ where
             cached_last_log,
             log_metadata: generational::LogMetadataArena::new(8192),
             commit_index_pub: Arc::new(AtomicU64::new(0)),
+            // last_applied is volatile — always 0 on restart, mirrors
+            // the invariant that commit_index also re-initializes to 0.
+            last_applied: LogIndex(0),
         })
     }
 
@@ -210,6 +221,45 @@ where
 
     pub fn commit_index(&self) -> LogIndex {
         self.soft_state.commit_index
+    }
+
+    /// Highest log index applied to the state machine so far.
+    ///
+    /// Volatile — resets to `LogIndex(0)` on process restart. Advanced
+    /// only by the apply loop in [`ArbitroRaft`], never larger than
+    /// [`RaftNode::commit_index`].
+    #[inline]
+    pub fn last_applied(&self) -> LogIndex {
+        self.last_applied
+    }
+
+    /// Advance the applied cursor. Callers MUST guarantee
+    /// `idx <= self.commit_index()`; the Raft protocol requires
+    /// `last_applied <= commit_index` at all times.
+    #[inline]
+    pub(crate) fn set_last_applied(&mut self, idx: LogIndex) {
+        debug_assert!(
+            idx <= self.soft_state.commit_index,
+            "last_applied ({}) must not exceed commit_index ({})",
+            idx.0,
+            self.soft_state.commit_index.0,
+        );
+        self.last_applied = idx;
+    }
+
+    /// Read a single log entry into the supplied scratch buffer.
+    ///
+    /// Thin wrapper around [`crate::RaftStorage::entry_at`]. Exposed so
+    /// the apply loop in [`ArbitroRaft`] can read committed entries
+    /// without holding a `&mut` borrow of storage while it also holds
+    /// `&mut` on the state machine (split-borrow via disjoint fields).
+    #[inline]
+    pub fn read_entry_payload_into<'a>(
+        &self,
+        index: LogIndex,
+        buf: &'a mut [u8],
+    ) -> Result<Option<LogEntry<'a>>, RaftError> {
+        self.storage.entry_at(index, buf)
     }
 
     #[inline]

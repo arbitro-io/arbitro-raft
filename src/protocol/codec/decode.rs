@@ -92,6 +92,7 @@ pub fn decode_message<'a>(frame: &'a [u8]) -> Result<InboundRaftMessage<'a>, Raf
     }
 
     let from = PeerId(header.from.get());
+    let group_id = crate::GroupId(header.group_id.get());
     let body = rest;
 
     let message = match header.kind {
@@ -189,5 +190,9 @@ pub fn decode_message<'a>(frame: &'a [u8]) -> Result<InboundRaftMessage<'a>, Raf
         }
     };
 
-    Ok(InboundRaftMessage { from, message })
+    Ok(InboundRaftMessage {
+        from,
+        group_id,
+        message,
+    })
 }

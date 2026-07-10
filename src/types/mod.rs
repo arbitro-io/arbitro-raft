@@ -1,3 +1,3 @@
 mod ids;
 
-pub use ids::{ClusterId, LeaderHint, LogIndex, PeerId, Term};
+pub use ids::{ClusterId, GroupId, LeaderHint, LogIndex, PeerId, Term};

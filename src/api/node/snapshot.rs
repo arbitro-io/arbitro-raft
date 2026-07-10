@@ -68,6 +68,7 @@ where
                 };
                 let inbound = crate::decode_message(&local_buf[..n])?;
                 let from = inbound.from;
+                let group_id = inbound.group_id;
 
                 match inbound.message {
                     RaftMessage::InstallSnapshotResp(resp) if from == peer => {
@@ -91,7 +92,7 @@ where
                         break;
                     }
                     message => {
-                        self.handle_inbound(InboundRaftMessage { from, message })
+                        self.handle_inbound(InboundRaftMessage { from, group_id, message })
                             .await?
                     }
                 }

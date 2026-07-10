@@ -7,7 +7,7 @@ use futures::channel::mpsc;
 
 use crate::{
     DispatchContextView, DispatchHandle, DispatchSpec, LogIndex, PeerId, RaftError, RaftNode,
-    RaftStorage, RaftTransport, Role,
+    RaftStorage, RaftTransport, Role, StateMachine,
 };
 
 mod client;
@@ -26,8 +26,21 @@ pub use client::ClientHandle;
 // ArbitroRaft — execution loop, batching, timers, client backpressure.
 // ---------------------------------------------------------------------------
 
-pub struct ArbitroRaft<S, T> {
+pub struct ArbitroRaft<S, T, SM>
+where
+    S: RaftStorage,
+    T: RaftTransport,
+    SM: StateMachine,
+{
     pub(crate) node: RaftNode<S, T>,
+    /// User-supplied state machine — committed entries are applied to
+    /// it in-order from inside the run loop.
+    pub(crate) state_machine: SM,
+    /// Reusable scratch for `RaftStorage::entry_at` during apply.
+    /// Sized to match the storage-read scratch style used elsewhere
+    /// (16MB). If a payload exceeds this, `entry_at` returns an error
+    /// which is propagated.
+    pub(crate) apply_buf: Vec<u8>,
     stopped: bool,
     pub(crate) next_election_at: Instant,
     pub(crate) next_heartbeat_at: Instant,
@@ -48,18 +61,22 @@ pub struct ArbitroRaft<S, T> {
 
 // --- Public API --------------------------------------------------------------
 
-impl<S, T> ArbitroRaft<S, T>
+impl<S, T, SM> ArbitroRaft<S, T, SM>
 where
     S: RaftStorage,
     T: RaftTransport,
+    SM: StateMachine,
 {
-    pub fn new(node: RaftNode<S, T>) -> Self {
+    pub fn new(node: RaftNode<S, T>, state_machine: SM) -> Self {
         let (client_tx, client_rx) = mpsc::unbounded();
         // 65k slots = 4MB RAM — absorbs extreme concurrent bursts without backpressure.
         let registry_cap = 65536;
         let mut raft = Self {
             election_state: seed(node.node_id()),
             node,
+            state_machine,
+            // 16MB matches the payload scratch style used inside RaftNode.
+            apply_buf: vec![0u8; 16 * 1024 * 1024],
             stopped: false,
             next_election_at: Instant::now(),
             next_heartbeat_at: Instant::now(),
@@ -83,6 +100,17 @@ where
     #[inline]
     pub fn node_mut(&mut self) -> &mut RaftNode<S, T> {
         &mut self.node
+    }
+    /// Shared reference to the state machine.
+    #[inline]
+    pub fn state_machine(&self) -> &SM {
+        &self.state_machine
+    }
+    /// Mutable reference to the state machine. Callers must NOT mutate
+    /// applied state directly; use it for snapshot/introspection only.
+    #[inline]
+    pub fn state_machine_mut(&mut self) -> &mut SM {
+        &mut self.state_machine
     }
     #[inline]
     pub fn role(&self) -> Role {
