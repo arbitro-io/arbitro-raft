@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
+use std::time::{Duration, Instant};
 
 use crate::dispatch::spec::{DispatchAckPolicy, DispatchFailPolicy, DispatchOptions};
 use crate::PeerId;
@@ -28,6 +29,8 @@ pub(crate) struct DispatchState<R> {
     pub(crate) peers: Vec<DispatchPeerSlot<R>>,
     pub(crate) completion: Option<DispatchCompletion<R>>,
     pub(crate) wakers: Vec<Waker>,
+    pub(crate) start_instant: Instant,
+    pub(crate) timeout: Duration,
 }
 
 // ── State queries ─────────────────────────────────────────────────────────────
@@ -52,6 +55,27 @@ impl<R: Clone> DispatchState<R> {
     pub(crate) fn wake_all(&mut self) {
         for waker in self.wakers.drain(..) {
             waker.wake();
+        }
+    }
+
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        if self.timeout.is_zero() {
+            None
+        } else {
+            Some(self.start_instant + self.timeout)
+        }
+    }
+
+    pub(crate) fn check_timeout(&mut self) {
+        if self.completion.is_some() {
+            return;
+        }
+        let Some(deadline) = self.deadline() else {
+            return;
+        };
+        if Instant::now() >= deadline {
+            self.completion = Some(DispatchCompletion::Failed(DispatchFailure::Timeout));
+            self.wake_all();
         }
     }
 

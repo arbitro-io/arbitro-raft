@@ -8,7 +8,7 @@ mod view;
 pub use builder::{DispatchBuilder, DispatchEnvelope};
 pub use context::{
     DispatchContextView, DispatchRequester, DispatchResponder, DispatchResponse,
-    DispatchResponseKind, DispatchStreamView,
+    DispatchResponseKind, DispatchResponseRef, DispatchStreamView,
 };
 pub use response::{
     encode_dispatch_response, DispatchResponseView, RAFT_DISPATCH_RESPONSE_FRAME_HEADER_SIZE,

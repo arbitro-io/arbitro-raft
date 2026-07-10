@@ -3,8 +3,8 @@ use crate::dispatch::encode_dispatch_response;
 use crate::dispatch::DispatchResponseView;
 use crate::{
     DispatchContextView, DispatchHandle, DispatchNodeRole, DispatchResponder, DispatchResponse,
-    DispatchResponseKind, DispatchRoute, DispatchScope, DispatchSpec, DispatchTx, PeerId,
-    RaftError, RaftMessage,
+    DispatchResponseKind, DispatchResponseRef, DispatchRoute, DispatchScope, DispatchSpec,
+    DispatchTx, PeerId, RaftError, RaftMessage,
 };
 use async_trait::async_trait;
 use std::future::Future;
@@ -12,6 +12,11 @@ use std::pin::Pin;
 
 pub(crate) trait PendingCustomDispatch: Send + Sync {
     fn on_response(&self, peer: PeerId, response: DispatchResponse) -> Result<(), RaftError>;
+    fn on_response_ref(
+        &self,
+        peer: PeerId,
+        response: DispatchResponseRef<'_>,
+    ) -> Result<(), RaftError>;
     fn is_ready(&self) -> bool;
 }
 
@@ -29,6 +34,20 @@ impl<R: Clone + Send + 'static> PendingCustomDispatch for PendingCustomTx<R> {
             DispatchResponseKind::Failed => self.tx.fail(peer, response.payload),
         }
     }
+
+    fn on_response_ref(
+        &self,
+        peer: PeerId,
+        response: DispatchResponseRef<'_>,
+    ) -> Result<(), RaftError> {
+        match response.kind {
+            DispatchResponseKind::Accepted => self.tx.accept_raw_ref(peer, response.payload),
+            DispatchResponseKind::Rejected => self.tx.reject(peer, response.payload.to_vec()),
+            DispatchResponseKind::Progress => self.tx.progress(peer, response.payload.to_vec()),
+            DispatchResponseKind::Failed => self.tx.fail(peer, response.payload.to_vec()),
+        }
+    }
+
     fn is_ready(&self) -> bool {
         self.handle.is_ready()
     }
@@ -155,21 +174,22 @@ where
         payload: &[u8],
     ) -> Result<(), RaftError> {
         let view = DispatchResponseView::parse(payload)?;
+        let tx_id = view.tx_id();
 
-        let response = DispatchResponse {
-            tx_id: view.tx_id(),
+        let response = DispatchResponseRef {
+            tx_id,
             command: view.command(),
             kind: view.kind(),
-            payload: view.body_bytes().to_vec(),
+            payload: view.body_bytes(),
         };
-        let ready = if let Some(pending) = self.pending_custom.get(&view.tx_id()) {
-            pending.on_response(from, response)?;
+        let ready = if let Some(pending) = self.pending_custom.get(&tx_id) {
+            pending.on_response_ref(from, response)?;
             pending.is_ready()
         } else {
             false
         };
         if ready {
-            self.pending_custom.remove(&view.tx_id());
+            self.pending_custom.remove(&tx_id);
         }
         Ok(())
     }

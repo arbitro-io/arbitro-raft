@@ -22,9 +22,17 @@ where
         let mut append_from = entry_count;
         let iter = AppendEntriesEntryIter::new(payload, entry_count);
         for (idx, incoming) in iter.enumerate() {
-            let mut dummy = [0u8; 8];
-            match self.storage.entry_at(incoming.index, &mut dummy)? {
-                Some(local) if local.term == incoming.term => {}
+            let local_term = match self.log_metadata.get_term(incoming.index) {
+                Some(t) => Some(t),
+                None => {
+                    let mut dummy = [0u8; 8];
+                    self.storage
+                        .entry_at(incoming.index, &mut dummy)?
+                        .map(|e| e.term)
+                }
+            };
+            match local_term {
+                Some(t) if t == incoming.term => {}
                 Some(_) => {
                     self.storage_truncate(incoming.index)?;
                     append_from = idx;
@@ -78,12 +86,20 @@ where
 
         let iter = AppendEntriesRawIter::new(headers_bytes, SeededPayloads::Contiguous(payloads));
         for (idx, (incoming_header, _)) in iter.enumerate() {
-            let mut dummy = [0u8; 8];
             let incoming_index = LogIndex(incoming_header.index.get());
             let incoming_term = crate::Term(incoming_header.term.get());
 
-            match self.storage.entry_at(incoming_index, &mut dummy)? {
-                Some(local) if local.term == incoming_term => {}
+            let local_term = match self.log_metadata.get_term(incoming_index) {
+                Some(t) => Some(t),
+                None => {
+                    let mut dummy = [0u8; 8];
+                    self.storage
+                        .entry_at(incoming_index, &mut dummy)?
+                        .map(|e| e.term)
+                }
+            };
+            match local_term {
+                Some(t) if t == incoming_term => {}
                 Some(_) => {
                     self.storage_truncate(incoming_index)?;
                     append_from = idx;
@@ -160,17 +176,19 @@ where
         self.soft_state.is_leader = false;
         self.soft_state.leader_id = Some(leader_id);
 
-        let prev_ok = if prev_log_idx.0 == 0 {
-            true
-        } else {
-            let mut dummy = [0; 8];
-            match self.storage.entry_at(prev_log_idx, &mut dummy)? {
-                Some(e) => e.term == prev_log_term,
-                // Entry may have been compacted by a snapshot. It matches iff
-                // it lines up with the snapshot boundary we last installed.
-                None => {
-                    self.cached_last_log.0 == prev_log_idx
-                        && self.cached_last_log.1 == prev_log_term
+        let prev_ok = match self.log_metadata.get_term(prev_log_idx) {
+            Some(t) => t == prev_log_term,
+            None if prev_log_idx.0 == 0 => true,
+            None => {
+                let mut dummy = [0; 8];
+                match self.storage.entry_at(prev_log_idx, &mut dummy)? {
+                    Some(e) => e.term == prev_log_term,
+                    // Entry may have been compacted by a snapshot. It matches iff
+                    // it lines up with the snapshot boundary we last installed.
+                    None => {
+                        self.cached_last_log.0 == prev_log_idx
+                            && self.cached_last_log.1 == prev_log_term
+                    }
                 }
             }
         };
@@ -236,17 +254,19 @@ where
         self.soft_state.is_leader = false;
         self.soft_state.leader_id = Some(leader_id);
 
-        let prev_ok = if prev_log_idx.0 == 0 {
-            true
-        } else {
-            let mut dummy = [0; 8];
-            match self.storage.entry_at(prev_log_idx, &mut dummy)? {
-                Some(e) => e.term == prev_log_term,
-                // Entry may have been compacted by a snapshot. It matches iff
-                // it lines up with the snapshot boundary we last installed.
-                None => {
-                    self.cached_last_log.0 == prev_log_idx
-                        && self.cached_last_log.1 == prev_log_term
+        let prev_ok = match self.log_metadata.get_term(prev_log_idx) {
+            Some(t) => t == prev_log_term,
+            None if prev_log_idx.0 == 0 => true,
+            None => {
+                let mut dummy = [0; 8];
+                match self.storage.entry_at(prev_log_idx, &mut dummy)? {
+                    Some(e) => e.term == prev_log_term,
+                    // Entry may have been compacted by a snapshot. It matches iff
+                    // it lines up with the snapshot boundary we last installed.
+                    None => {
+                        self.cached_last_log.0 == prev_log_idx
+                            && self.cached_last_log.1 == prev_log_term
+                    }
                 }
             }
         };

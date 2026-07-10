@@ -21,8 +21,8 @@ pub use dispatch::{
     DispatchContextView, DispatchEnvelope, DispatchFailOptions, DispatchFailPolicy,
     DispatchFailure, DispatchHandle, DispatchNodeRole, DispatchOptions, DispatchPeerResult,
     DispatchPeerState, DispatchRequester, DispatchResponder, DispatchResponse,
-    DispatchResponseKind, DispatchResponseView, DispatchResult, DispatchRoute, DispatchScope,
-    DispatchSpec, DispatchStreamView, DispatchTx, DispatchTxResponder, DispatchView,
+    DispatchResponseKind, DispatchResponseRef, DispatchResponseView, DispatchResult, DispatchRoute,
+    DispatchScope, DispatchSpec, DispatchStreamView, DispatchTx, DispatchTxResponder, DispatchView,
     RAFT_DISPATCH_FRAME_HEADER_SIZE, RAFT_DISPATCH_MAGIC, RAFT_DISPATCH_RESPONSE_FRAME_HEADER_SIZE,
     RAFT_DISPATCH_RESPONSE_MAGIC, RAFT_DISPATCH_RESPONSE_VERSION, RAFT_DISPATCH_VERSION,
 };

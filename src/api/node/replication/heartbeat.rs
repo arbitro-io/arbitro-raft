@@ -34,15 +34,6 @@ where
         }))
     }
 
-    /// Crate-internal accessor for this node's configured peer set.
-    ///
-    /// Exposed only inside the `node` module tree so the multi-Raft batched
-    /// heartbeat path can iterate peers per group without going through
-    /// `RaftNode::config` (which is `pub(crate)` on the struct itself).
-    pub(crate) fn peers_view(&self) -> &[PeerId] {
-        &self.config.peers
-    }
-
     pub async fn send_heartbeat_once(&mut self) -> Result<(), RaftError> {
         if !self.is_leader() {
             return Err(RaftError::NotLeader {

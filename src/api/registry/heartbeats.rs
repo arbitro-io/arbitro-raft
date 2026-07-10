@@ -31,9 +31,17 @@ where
     ///
     /// Returns the total number of (group, peer) heartbeat frames enqueued.
     pub async fn tick_heartbeats(&mut self, transport: &Arc<T>) -> Result<usize, RaftError> {
+        let expected_leader_groups = self.len();
+        // Split the borrow so `groups` (for the node iterator) and
+        // `scratch` (the reusable per-tick buffers) can be held mutably at
+        // the same time — going through a method like `iter_mut()` here
+        // would borrow all of `self` and conflict with `&mut self.scratch`.
+        let RaftGroupRegistry { groups, scratch, .. } = self;
         heartbeat_batch_inline::send_batched_heartbeats(
-            self.iter_mut().map(|(gid, node)| (*gid, node)),
+            groups.iter_mut().map(|(gid, entry)| (*gid, &mut entry.node)),
+            scratch,
             transport,
+            expected_leader_groups,
         )
         .await
     }

@@ -18,6 +18,14 @@ pub struct DispatchResponse {
     pub payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct DispatchResponseRef<'a> {
+    pub tx_id: u64,
+    pub command: u8,
+    pub kind: DispatchResponseKind,
+    pub payload: &'a [u8],
+}
+
 #[async_trait]
 pub trait DispatchResponder: Send + Sync {
     async fn send_response(&self, response: DispatchResponse) -> Result<(), RaftError>;

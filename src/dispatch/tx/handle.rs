@@ -1,9 +1,14 @@
-use std::future::poll_fn;
+use std::future::{poll_fn, Future};
+use std::pin::Pin;
+use std::task::Poll;
+use std::time::Instant;
+
+use tokio::time::Sleep;
 
 use crate::{PeerId, RaftError};
 
 use super::state::{DispatchCompletion, DispatchShared};
-use super::types::{DispatchPeerState, DispatchResult};
+use super::types::{DispatchFailure, DispatchPeerState, DispatchResult};
 
 // ── DispatchHandle ────────────────────────────────────────────────────────────
 
@@ -22,11 +27,14 @@ impl<R: Clone> DispatchHandle<R> {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.shared.inner.lock().unwrap().completion.is_some()
+        let mut guard = self.shared.inner.lock().unwrap();
+        guard.check_timeout();
+        guard.completion.is_some()
     }
 
     pub fn try_result(&self) -> Option<Result<DispatchResult<R>, RaftError>> {
-        let guard = self.shared.inner.lock().unwrap();
+        let mut guard = self.shared.inner.lock().unwrap();
+        guard.check_timeout();
         guard.completion.as_ref().map(|c| match c {
             DispatchCompletion::Succeeded(r) => Ok(r.clone()),
             DispatchCompletion::Failed(f) => Err(RaftError::from(f.clone())),
@@ -34,18 +42,40 @@ impl<R: Clone> DispatchHandle<R> {
     }
 
     pub async fn wait(&self) -> Result<DispatchResult<R>, RaftError> {
-        poll_fn(|cx| {
+        let deadline: Option<Instant> = self.shared.inner.lock().unwrap().deadline();
+        let mut timeout_sleep: Option<Pin<Box<Sleep>>> = None;
+
+        poll_fn(move |cx| {
             let mut guard = self.shared.inner.lock().unwrap();
             match &guard.completion {
-                Some(DispatchCompletion::Succeeded(r)) => std::task::Poll::Ready(Ok(r.clone())),
+                Some(DispatchCompletion::Succeeded(r)) => return Poll::Ready(Ok(r.clone())),
                 Some(DispatchCompletion::Failed(f)) => {
-                    std::task::Poll::Ready(Err(RaftError::from(f.clone())))
+                    return Poll::Ready(Err(RaftError::from(f.clone())));
                 }
-                None => {
-                    guard.wakers.push(cx.waker().clone());
-                    std::task::Poll::Pending
+                None => {}
+            }
+
+            if let Some(deadline) = deadline {
+                if Instant::now() >= deadline {
+                    guard.completion =
+                        Some(DispatchCompletion::Failed(DispatchFailure::Timeout));
+                    guard.wake_all();
+                    return Poll::Ready(Err(RaftError::from(DispatchFailure::Timeout)));
+                }
+
+                let sleep = timeout_sleep.get_or_insert_with(|| {
+                    Box::pin(tokio::time::sleep_until(deadline.into()))
+                });
+                if let Poll::Ready(()) = sleep.as_mut().poll(cx) {
+                    guard.completion =
+                        Some(DispatchCompletion::Failed(DispatchFailure::Timeout));
+                    guard.wake_all();
+                    return Poll::Ready(Err(RaftError::from(DispatchFailure::Timeout)));
                 }
             }
+
+            guard.wakers.push(cx.waker().clone());
+            Poll::Pending
         })
         .await
     }
@@ -88,7 +118,11 @@ impl<R: Clone> DispatchTx<R> {
     }
 
     pub fn accept_raw(&self, peer: PeerId, payload: Vec<u8>) -> Result<(), RaftError> {
-        let value = (self.decode_response)(&payload)?;
+        self.accept_raw_ref(peer, &payload)
+    }
+
+    pub fn accept_raw_ref(&self, peer: PeerId, payload: &[u8]) -> Result<(), RaftError> {
+        let value = (self.decode_response)(payload)?;
         self.accept(peer, value)
     }
 

@@ -11,7 +11,10 @@ use crate::{
     GroupId, InboundRaftMessage, RaftError, RaftNode, RaftStorage, RaftTransport, StateMachine,
 };
 
+pub(crate) mod batch_scratch;
 pub mod heartbeats;
+
+pub(crate) use batch_scratch::{BatchScratch, FrameOut};
 
 pub(crate) struct GroupEntry<S, T, SM> {
     pub(crate) node: RaftNode<S, T>,
@@ -25,6 +28,10 @@ where
     SM: StateMachine,
 {
     groups: HashMap<GroupId, GroupEntry<S, T, SM>>,
+    /// Reusable scratch buffers for the batched heartbeat tick — see
+    /// [`BatchScratch`]. Cleared (not reallocated) at the start of every
+    /// `tick_heartbeats` call.
+    scratch: BatchScratch,
 }
 
 impl<S, T, SM> RaftGroupRegistry<S, T, SM>
@@ -34,11 +41,17 @@ where
     SM: StateMachine,
 {
     pub fn new() -> Self {
-        Self { groups: HashMap::new() }
+        Self {
+            groups: HashMap::new(),
+            scratch: BatchScratch::default(),
+        }
     }
 
     pub fn with_capacity(cap: usize) -> Self {
-        Self { groups: HashMap::with_capacity(cap) }
+        Self {
+            groups: HashMap::with_capacity(cap),
+            scratch: BatchScratch::default(),
+        }
     }
 
     /// Insert a new group. Panics-free: returns Err if the id is already used.

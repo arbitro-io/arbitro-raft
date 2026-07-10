@@ -37,6 +37,21 @@ fn encode_message_vectored_impl<'a>(
     header_buf: &'a mut [u8],
     out_vectored: &mut Vec<&'a [u8]>,
 ) -> Result<(), RaftError> {
+    if let RaftMessage::AppendEntriesVectored(m, entries) = msg {
+        return encode_append_entries_vectored(
+            from,
+            group_id,
+            Term(m.term.get()),
+            PeerId(m.leader_id.get()),
+            LogIndex(m.prev_log_index.get()),
+            Term(m.prev_log_term.get()),
+            LogIndex(m.leader_commit.get()),
+            entries,
+            header_buf,
+            out_vectored,
+        );
+    }
+
     out_vectored.clear();
 
     let body_len = body_total_len(msg);
@@ -65,20 +80,7 @@ fn encode_message_vectored_impl<'a>(
     }
 
     match msg {
-        RaftMessage::AppendEntriesVectored(m, entries) => {
-            // Specialized function handles everything including frame header and clearing out_vectored
-            return encode_append_entries_vectored(
-                from,
-                Term(m.term.get()),
-                PeerId(m.leader_id.get()),
-                LogIndex(m.prev_log_index.get()),
-                Term(m.prev_log_term.get()),
-                LogIndex(m.leader_commit.get()),
-                entries,
-                header_buf,
-                out_vectored,
-            );
-        }
+        RaftMessage::AppendEntriesVectored(..) => unreachable!("handled above"),
         RaftMessage::RequestVote(m) => {
             out_vectored.push(&header_buf[..RAFT_FRAME_HEADER_SIZE]);
             out_vectored.push(m.as_bytes());
@@ -125,6 +127,7 @@ fn encode_message_vectored_impl<'a>(
             headers,
             payloads,
         } => {
+            out_vectored.reserve(payloads.len() + 3);
             out_vectored.push(&header_buf[..RAFT_FRAME_HEADER_SIZE]);
             out_vectored.push(ae.as_bytes());
             if !headers.is_empty() {
@@ -163,6 +166,7 @@ fn encode_message_vectored_impl<'a>(
 #[allow(clippy::too_many_arguments)]
 pub fn encode_append_entries_vectored<'a>(
     from: PeerId,
+    group_id: u64,
     term: Term,
     leader_id: PeerId,
     prev_log_index: LogIndex,
@@ -173,6 +177,7 @@ pub fn encode_append_entries_vectored<'a>(
     out_vectored: &mut Vec<&'a [u8]>,
 ) -> Result<(), RaftError> {
     out_vectored.clear();
+    out_vectored.reserve(2 * entries.len() + 1);
 
     let mut body_payload_len = 0;
     for e in entries {
@@ -201,9 +206,11 @@ pub fn encode_append_entries_vectored<'a>(
         header.magic.set(RAFT_MAGIC);
         header.version = RAFT_VERSION;
         header.kind = KIND_APPEND_ENTRIES;
+        header.flags.set(0);
         header.from.set(from.0);
         header.body_len.set(body_wire_len as u32);
-        header.group_id.set(0);
+        header.reserved.set(0);
+        header.group_id.set(group_id);
 
         // AppendEntries Body
         let ae_ptr = header_buf_ptr.add(RAFT_FRAME_HEADER_SIZE);

@@ -23,24 +23,17 @@
 //!
 //! [`RaftGroupRegistry`]: crate::api::registry::RaftGroupRegistry
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use tracing::warn;
 use zerocopy::IntoBytes;
 
+use crate::api::registry::{BatchScratch, FrameOut};
 use crate::api::RaftNode;
 use crate::protocol::codec::wire::{
     RaftFrameHeader, KIND_APPEND_ENTRIES, RAFT_FRAME_HEADER_SIZE, RAFT_MAGIC, RAFT_VERSION,
 };
 use crate::{GroupId, PeerId, RaftError, RaftStorage, RaftTransport};
-
-/// One (group, from, body) frame destined for a specific peer.
-struct FrameOut {
-    group_id: GroupId,
-    from: PeerId,
-    ae: crate::protocol::AppendEntries,
-}
 
 /// Send heartbeats for every group in `groups` to every peer, coalescing
 /// per-peer sends into a single vectored write.
@@ -55,6 +48,13 @@ struct FrameOut {
 /// Returns the total number of frames enqueued (equals the sum, over each
 /// group that led, of the number of non-self peers in that group).
 ///
+/// `scratch` holds the reusable per-tick buffers (see [`BatchScratch`]) —
+/// callers own one instance (typically on [`RaftGroupRegistry`]) and pass
+/// it in by mutable reference so this hot periodic path does not allocate
+/// a fresh `HashMap`/`Vec`s every tick. `expected_leader_groups` sizes the
+/// initial per-peer `Vec` on first insert (a cheap hint, not a hard cap —
+/// e.g. the registry's group count).
+///
 /// # Contract
 ///
 /// Sprint 1 assumes single-threaded caller ownership of every node in
@@ -63,7 +63,9 @@ struct FrameOut {
 /// [`RaftGroupRegistry`]: crate::api::registry::RaftGroupRegistry
 pub async fn send_batched_heartbeats<'a, S, T, I>(
     groups: I,
+    scratch: &mut BatchScratch,
     transport: &Arc<T>,
+    expected_leader_groups: usize,
 ) -> Result<usize, RaftError>
 where
     S: RaftStorage + 'a,
@@ -71,7 +73,7 @@ where
     I: IntoIterator<Item = (GroupId, &'a mut RaftNode<S, T>)>,
 {
     // ── Phase 1: build wires, bucket per destination peer ────────────────
-    let mut per_peer: HashMap<PeerId, Vec<FrameOut>> = HashMap::new();
+    scratch.per_peer.clear();
     let mut group_errors = 0usize;
 
     for (gid, node) in groups {
@@ -80,16 +82,18 @@ where
         }
         let from = node.node_id();
 
-        // Snapshot the peer list before the mutable borrow needed by
-        // build_heartbeat_wire. Skip self.
-        let peers: Vec<PeerId> = node
-            .peers_view()
-            .iter()
-            .copied()
-            .filter(|p| *p != from)
-            .collect();
+        // Snapshot the peer list into the node's own scratch buffer (the
+        // same buffer send_heartbeat_once reuses) before the mutable
+        // borrow needed by build_heartbeat_wire. Skip self. Read directly
+        // off `node.config.peers` (not through a method) so this borrows
+        // only that field, leaving `node.scratch_peers` free to be
+        // borrowed mutably at the same time.
+        node.scratch_peers.clear();
+        node.scratch_peers
+            .extend(node.config.peers.iter().copied().filter(|p| *p != from));
 
-        for peer in peers {
+        for i in 0..node.scratch_peers.len() {
+            let peer = node.scratch_peers[i];
             // build_heartbeat_wire rechecks is_leader defensively; a group
             // that stepped down mid-iteration returns None and is skipped.
             // A storage error building this group's wire must not abort
@@ -97,11 +101,15 @@ where
             // log and move on instead of propagating.
             match node.build_heartbeat_wire(peer) {
                 Ok(Some(ae)) => {
-                    per_peer.entry(peer).or_default().push(FrameOut {
-                        group_id: gid,
-                        from,
-                        ae,
-                    });
+                    scratch
+                        .per_peer
+                        .entry(peer)
+                        .or_insert_with(|| Vec::with_capacity(expected_leader_groups))
+                        .push(FrameOut {
+                            group_id: gid,
+                            from,
+                            ae,
+                        });
                 }
                 Ok(None) => {
                     // Not the leader anymore for this group — stop
@@ -126,28 +134,33 @@ where
     // ── Phase 2: one coalesced send_vectored per peer ────────────────────
     let mut total = 0usize;
     let mut peer_errors = 0usize;
-    for (peer, frames) in per_peer.iter() {
+    for (peer, frames) in scratch.per_peer.iter() {
         // Owned storage for headers (32 bytes each) and AppendEntries bodies
-        // (48 bytes each). Both are held stable in this scope so the borrows
-        // stored in `slices` remain valid across the transport await.
-        let mut header_bufs: Vec<[u8; RAFT_FRAME_HEADER_SIZE]> =
-            Vec::with_capacity(frames.len());
-        let mut ae_bodies: Vec<crate::protocol::AppendEntries> = Vec::with_capacity(frames.len());
+        // (48 bytes each), reused across peers/ticks via `scratch`. Both are
+        // held stable in this scope so the borrows stored in `slices`
+        // remain valid across the transport await.
+        scratch.header_bufs.clear();
+        scratch.ae_bodies.clear();
 
         let body_len = std::mem::size_of::<crate::protocol::AppendEntries>() as u32;
         for f in frames {
             let mut hbuf = [0u8; RAFT_FRAME_HEADER_SIZE];
             write_frame_header(&mut hbuf, f.from, f.group_id, KIND_APPEND_ENTRIES, body_len);
-            header_bufs.push(hbuf);
-            ae_bodies.push(f.ae);
+            scratch.header_bufs.push(hbuf);
+            scratch.ae_bodies.push(f.ae);
         }
 
-        // Build the final slice list borrowing from header_bufs + ae_bodies
-        // (both stable in this scope). Two slices per frame: header, body.
+        // Build the final slice list borrowing from scratch.header_bufs +
+        // scratch.ae_bodies (both stable in this scope). Two slices per
+        // frame: header, body. This Vec is not itself kept in `scratch`:
+        // its elements borrow from the two buffers above for the duration
+        // of this send only, so caching it across ticks would require
+        // storing a live borrow across an await point on the next tick —
+        // not sound without unsafe lifetime laundering.
         let mut slices: Vec<&[u8]> = Vec::with_capacity(frames.len() * 2);
         for i in 0..frames.len() {
-            slices.push(&header_bufs[i][..]);
-            slices.push(ae_bodies[i].as_bytes());
+            slices.push(&scratch.header_bufs[i][..]);
+            slices.push(scratch.ae_bodies[i].as_bytes());
         }
 
         // A single peer's transport error must not skip the remaining

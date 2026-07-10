@@ -6,11 +6,12 @@ pub use handle::{DispatchHandle, DispatchTx, DispatchTxResponder};
 pub use types::{DispatchFailure, DispatchPeerResult, DispatchPeerState, DispatchResult};
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::dispatch::DispatchOptions;
 use crate::{PeerId, RaftError};
 
-use state::{DispatchCompletion, DispatchPeerSlot, DispatchShared, DispatchState};
+use state::{DispatchPeerSlot, DispatchShared, DispatchState};
 use types::DispatchPeerState as PeerState;
 
 /// Create a new `(DispatchHandle, DispatchTx)` pair for `targets`.
@@ -39,24 +40,10 @@ where
                 .collect(),
             completion: None,
             wakers: Vec::new(),
+            start_instant: Instant::now(),
+            timeout: options.timeout,
         })),
     };
-
-    if !options.timeout.is_zero() {
-        let weak = Arc::downgrade(&shared.inner);
-        let timeout = options.timeout;
-        std::thread::spawn(move || {
-            std::thread::sleep(timeout);
-            if let Some(inner) = weak.upgrade() {
-                let mut guard = inner.lock().unwrap();
-                if guard.completion.is_none() {
-                    guard.completion =
-                        Some(DispatchCompletion::Failed(types::DispatchFailure::Timeout));
-                    guard.wake_all();
-                }
-            }
-        });
-    }
 
     let handle = DispatchHandle {
         shared: shared.clone(),

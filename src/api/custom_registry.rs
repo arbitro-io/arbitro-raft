@@ -174,8 +174,21 @@ impl RaftCustomRegistry {
         let dispatch = DispatchView::parse(frame)?;
         let cmd = dispatch.command() as usize;
 
-        // Fast path: locked snapshot avoids the RwLock after seal().
-        let handler: ErasedHandler = if let Some(sealed) = self.sealed.get() {
+        let ctx = match requester {
+            Some(req) => DispatchContextView::with_requester(
+                dispatch.tx_id(),
+                dispatch.command(),
+                responder,
+                req,
+            ),
+            None => DispatchContextView::new(dispatch.tx_id(), dispatch.command(), responder),
+        };
+
+        // Sealed fast path: borrow straight out of the frozen, lock-free
+        // array. The slot is immutable once `seal()` has run, so there is
+        // no need to pay for an `Arc::clone` just to escape a lock guard —
+        // there is no guard to escape.
+        if let Some(sealed) = self.sealed.get() {
             let entry = sealed[cmd].as_ref().ok_or_else(|| {
                 RaftError::Dispatch(format!(
                     "no dispatch handler registered for command {}",
@@ -191,8 +204,14 @@ impl RaftCustomRegistry {
                     )));
                 }
             }
-            Arc::clone(&entry.1)
-        } else {
+            let handler = &entry.1;
+            handler(dispatch, ctx).await?;
+            return Ok(dispatch);
+        }
+
+        // Pre-seal path: the RwLock guard cannot be held across an `.await`,
+        // so the Arc must be cloned to escape it.
+        let handler: ErasedHandler = {
             let guard = self
                 .handlers
                 .read()
@@ -215,15 +234,6 @@ impl RaftCustomRegistry {
             Arc::clone(&entry.handler)
         };
 
-        let ctx = match requester {
-            Some(req) => DispatchContextView::with_requester(
-                dispatch.tx_id(),
-                dispatch.command(),
-                responder,
-                req,
-            ),
-            None => DispatchContextView::new(dispatch.tx_id(), dispatch.command(), responder),
-        };
         handler(dispatch, ctx).await?;
         Ok(dispatch)
     }
