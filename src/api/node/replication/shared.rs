@@ -207,8 +207,43 @@ where
         Ok(term)
     }
 
+    /// Highest log index that a strict majority of `subset` has replicated.
+    ///
+    /// Counts the leader's own log tip if it appears in `subset`, and each
+    /// peer's `match_index` from `peer_progress` for the remaining members.
+    /// Peers in `subset` with no progress entry contribute `LogIndex(0)`, which
+    /// prevents a newly-added voter from being silently ignored by the quorum
+    /// computation while it is still catching up.
+    #[inline]
+    fn subset_quorum_index(&self, subset: &[PeerId], last_index: LogIndex) -> Option<LogIndex> {
+        if subset.is_empty() {
+            return None;
+        }
+        let mut acks: Vec<LogIndex> = Vec::with_capacity(subset.len());
+        let self_id = self.config.node_id;
+        for &peer in subset {
+            let match_index = if peer == self_id {
+                last_index
+            } else {
+                self.peer_progress
+                    .get(&peer)
+                    .map(|p| p.match_index)
+                    .unwrap_or(LogIndex(0))
+            };
+            acks.push(match_index);
+        }
+        acks.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        let q = super::super::quorum(subset.len());
+        acks.get(q.saturating_sub(1)).copied()
+    }
+
     /// Check whether a quorum of peers has replicated the latest entries and, if so,
     /// advance `commit_index` to the highest index confirmed by a quorum.
+    ///
+    /// During a joint-consensus transition (`node.joint_peers.is_some()`) the
+    /// commit rule requires majority-of-`old_peers` AND majority-of-`new_peers`
+    /// (Raft §4.3). The effective quorum index is the min of the two — either
+    /// sub-set can veto commit progress.
     pub(crate) fn try_advance_commit_index(&mut self) -> Result<(), RaftError> {
         if self.peer_progress.is_empty() {
             return Ok(());
@@ -217,18 +252,34 @@ where
         if last_index <= self.soft_state.commit_index {
             return Ok(());
         }
-        // Gather: leader self (last_index) + all peer match_indexes.
-        self.scratch_indexes.clear();
-        self.scratch_indexes.push(last_index);
-        for progress in self.peer_progress.values() {
-            self.scratch_indexes.push(progress.match_index);
-        }
-        // Sort descending → quorum-th largest is the safe commit point.
-        self.scratch_indexes.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-        let quorum = super::super::quorum(self.config.peers.len());
-        let Some(&quorum_index) = self.scratch_indexes.get(quorum.saturating_sub(1)) else {
-            return Ok(());
+
+        let quorum_index = match &self.joint_peers {
+            Some((old_peers, new_peers)) => {
+                let Some(old_q) = self.subset_quorum_index(old_peers, last_index) else {
+                    return Ok(());
+                };
+                let Some(new_q) = self.subset_quorum_index(new_peers, last_index) else {
+                    return Ok(());
+                };
+                std::cmp::min(old_q, new_q)
+            }
+            None => {
+                // Gather: leader self (last_index) + all peer match_indexes.
+                self.scratch_indexes.clear();
+                self.scratch_indexes.push(last_index);
+                for progress in self.peer_progress.values() {
+                    self.scratch_indexes.push(progress.match_index);
+                }
+                // Sort descending → quorum-th largest is the safe commit point.
+                self.scratch_indexes.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                let quorum = super::super::quorum(self.config.peers.len());
+                let Some(&q) = self.scratch_indexes.get(quorum.saturating_sub(1)) else {
+                    return Ok(());
+                };
+                q
+            }
         };
+
         if quorum_index <= self.soft_state.commit_index {
             return Ok(());
         }

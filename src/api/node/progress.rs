@@ -67,6 +67,16 @@ impl<V> PeerMap<V> {
     pub(crate) fn values(&self) -> impl Iterator<Item = &V> {
         self.entries.iter().map(|(_, v)| v)
     }
+
+    #[inline]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (PeerId, &V)> {
+        self.entries.iter().map(|(k, v)| (*k, v))
+    }
+
+    #[inline]
+    pub(crate) fn contains_key(&self, key: &PeerId) -> bool {
+        self.entries.iter().any(|(k, _)| k == key)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

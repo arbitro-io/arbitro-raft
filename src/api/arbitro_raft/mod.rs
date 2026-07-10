@@ -59,6 +59,21 @@ where
     pub(crate) inbound_buf: Box<[u8]>,
 }
 
+// User payloads whose first byte matches the config-change magic would be
+// decoded as control entries by the apply path and silently mutate the
+// voter set. Reject them at every user-facing propose entry; internal
+// config-change proposals call `self.node.propose_once` directly and
+// bypass this check.
+#[inline]
+fn reject_reserved_prefix(payload: &[u8]) -> Result<(), RaftError> {
+    if payload.first().copied() == Some(crate::api::node::membership::CONFIG_CHANGE_MAGIC) {
+        return Err(RaftError::InvalidPayload(
+            "payload first byte collides with reserved config-change magic (0xC0)",
+        ));
+    }
+    Ok(())
+}
+
 // --- Public API --------------------------------------------------------------
 
 impl<S, T, SM> ArbitroRaft<S, T, SM>
@@ -135,9 +150,21 @@ where
     pub fn node_id(&self) -> PeerId {
         self.node.node_id()
     }
-    #[inline]
+    /// Stop the run loop and unblock every writer waiting on a commit.
+    ///
+    /// Safe to call more than once — subsequent calls are no-ops. Without
+    /// this, `WriteFuture`s parked on slots for proposals still sitting in
+    /// `client_rx` or `commit_waiters` would poll `SLOT_PENDING` forever
+    /// once the run loop stops ticking.
     pub fn stop(&mut self) {
+        if self.stopped {
+            return;
+        }
         self.stopped = true;
+        while let Ok(proposal) = self.client_rx.try_recv() {
+            self.registry.get(proposal.slot_id).notify_error();
+        }
+        self.fail_commit_waiters();
     }
 
     /// Returns a clonable [`ClientHandle`] for concurrent writes from multiple tasks.
@@ -152,6 +179,7 @@ where
     /// Direct single-entry propose — caller holds `&mut self` (e.g. benchmarks, tests).
     #[inline]
     pub async fn propose_once(&mut self, payload: &[u8]) -> Result<LogIndex, RaftError> {
+        reject_reserved_prefix(payload)?;
         self.node.propose_once(payload).await
     }
 
@@ -161,6 +189,9 @@ where
         &mut self,
         payloads: &[&[u8]],
     ) -> Result<&[LogIndex], RaftError> {
+        for p in payloads {
+            reject_reserved_prefix(p)?;
+        }
         self.node.propose_batch_once(payloads).await
     }
 
@@ -191,7 +222,27 @@ where
                     .map(|leader_id| crate::LeaderHint { leader_id }),
             });
         }
+
+        // Reject empty new_peers up-front — a Final(C_new) with an empty
+        // voter set is unrecoverable (no quorum can ever be formed).
+        if new_peers.is_empty() {
+            return Err(RaftError::InvalidConfig(
+                "config-change new_peers must be non-empty",
+            ));
+        }
+
         let old_peers = self.node.peers().to_vec();
+
+        // Require at least one voter to appear in both old and new sets.
+        // A fully disjoint transition drops availability during the joint
+        // phase to zero on either side and provides no witness carrying
+        // committed history across the cut.
+        let overlap = new_peers.iter().any(|p| old_peers.contains(p));
+        if !overlap {
+            return Err(RaftError::InvalidConfig(
+                "config-change new_peers must overlap current peers",
+            ));
+        }
 
         // Phase 1 — joint entry (C_old_new).
         let joint = ConfigChangeEntry {
@@ -202,10 +253,18 @@ where
         let joint_bytes = joint.encode();
         let _joint_idx = self.node.propose_once(&joint_bytes).await?;
 
-        // Phase 2 — final entry (C_new). `propose_once` only returns
-        // after the entry commits via `gather_quorum_acks`, so we know
-        // the joint entry has been durably replicated before we append
-        // the final one.
+        // Apply the joint entry to THIS node's effective voter set
+        // before appending Final. `propose_once` returns once the entry
+        // commits under the current (old) quorum, but the apply loop
+        // does not run between two awaits on the same task — so without
+        // this explicit apply, `config.peers` would still be the OLD set
+        // when Final is appended and its commit would be decided under
+        // the OLD quorum instead of the joint (union) quorum.
+        self.node.apply_config_change(&joint)?;
+
+        // Phase 2 — final entry (C_new). Commit now proceeds under the
+        // joint voter set (union of old ∪ new), which is the safety
+        // requirement of §4.3.
         let final_entry = ConfigChangeEntry {
             phase: ConfigChangePhase::Final,
             old_peers,
@@ -278,5 +337,16 @@ where
     pub async fn run(&mut self) -> Result<(), RaftError> {
         while self.run_once().await? {}
         Ok(())
+    }
+}
+
+impl<S, T, SM> Drop for ArbitroRaft<S, T, SM>
+where
+    S: RaftStorage,
+    T: RaftTransport,
+    SM: StateMachine,
+{
+    fn drop(&mut self) {
+        self.stop();
     }
 }

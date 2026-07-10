@@ -164,10 +164,15 @@ where
             true
         } else {
             let mut dummy = [0; 8];
-            self.storage
-                .entry_at(prev_log_idx, &mut dummy)?
-                .map(|e| e.term == prev_log_term)
-                .unwrap_or(false)
+            match self.storage.entry_at(prev_log_idx, &mut dummy)? {
+                Some(e) => e.term == prev_log_term,
+                // Entry may have been compacted by a snapshot. It matches iff
+                // it lines up with the snapshot boundary we last installed.
+                None => {
+                    self.cached_last_log.0 == prev_log_idx
+                        && self.cached_last_log.1 == prev_log_term
+                }
+            }
         };
 
         if !prev_ok {
@@ -235,10 +240,15 @@ where
             true
         } else {
             let mut dummy = [0; 8];
-            self.storage
-                .entry_at(prev_log_idx, &mut dummy)?
-                .map(|e| e.term == prev_log_term)
-                .unwrap_or(false)
+            match self.storage.entry_at(prev_log_idx, &mut dummy)? {
+                Some(e) => e.term == prev_log_term,
+                // Entry may have been compacted by a snapshot. It matches iff
+                // it lines up with the snapshot boundary we last installed.
+                None => {
+                    self.cached_last_log.0 == prev_log_idx
+                        && self.cached_last_log.1 == prev_log_term
+                }
+            }
         };
 
         if !prev_ok {

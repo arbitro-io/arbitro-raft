@@ -1,7 +1,7 @@
 // Log compaction after snapshot (B3).
 
 use super::RaftNode;
-use crate::{LogIndex, RaftError, RaftStorage, RaftTransport, SnapshotMeta, StateMachine};
+use crate::{RaftError, RaftStorage, RaftTransport, SnapshotMeta, StateMachine};
 
 /// Take a snapshot of `sm` at the current `last_applied` boundary, persist
 /// it via `storage.save_snapshot`, and truncate all log entries strictly
@@ -23,17 +23,21 @@ where
     if last_applied.0 == 0 {
         return Err(RaftError::Snapshot("cannot compact: last_applied is 0".into()));
     }
-    // Snapshot semantics: the term at last_applied must be known.
-    let mut scratch = [0u8; 8];
-    let entry = node
-        .read_entry_payload_into(last_applied, &mut scratch)?
-        .ok_or_else(|| {
-            RaftError::Snapshot(format!(
-                "cannot compact: log missing entry at last_applied={}",
-                last_applied.0,
-            ))
-        })?;
-    let last_included_term = entry.term;
+
+    // A snapshot already at or beyond last_applied means there is nothing left
+    // to do here. This also covers the post-InstallSnapshot case where
+    // last_applied points past whatever the log has ever held locally, so the
+    // log/term_at path below must not be consulted.
+    if let Some((existing, _bytes)) = node.storage.load_snapshot()? {
+        if existing.last_included_index >= last_applied {
+            return Ok(existing);
+        }
+    }
+
+    // term_at consults the log_metadata arena first and only falls back to the
+    // node's own pre-sized scratch_payload buffer, so it works for entries of
+    // any size (unlike a fixed 8-byte scratch read).
+    let last_included_term = node.term_at(last_applied)?;
     let meta = SnapshotMeta {
         last_included_index: last_applied,
         last_included_term,
@@ -41,6 +45,19 @@ where
 
     let bytes = sm.snapshot()?;
     node.storage.save_snapshot(&meta, &bytes)?;
-    node.storage.truncate_before(last_applied)?;
+
+    // Don't truncate past what the slowest known peer has actually replicated.
+    // maybe_install_snapshot_to_lagging_peer would be the proper remedy for a
+    // peer whose next_index has fallen behind last_applied, but it is async and
+    // this function is not, so instead we cap truncation at the minimum
+    // match_index among such peers to avoid handing them a CorruptLog error on
+    // their next AppendEntries attempt.
+    let mut truncate_up_to = last_applied;
+    for progress in node.peer_progress.values() {
+        if progress.next_index <= last_applied && progress.match_index < truncate_up_to {
+            truncate_up_to = progress.match_index;
+        }
+    }
+    node.storage.truncate_before(truncate_up_to)?;
     Ok(meta)
 }

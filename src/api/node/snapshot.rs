@@ -2,7 +2,7 @@ use std::time::Duration;
 use tracing::info;
 
 use crate::protocol::{InstallSnapshot, InstallSnapshotResp};
-use crate::{InboundRaftMessage, PeerId, RaftError, RaftMessage, Role};
+use crate::{InboundRaftMessage, LogIndex, PeerId, RaftError, RaftMessage, Role};
 
 use super::progress::PendingSnapshot;
 use super::RaftNode;
@@ -31,9 +31,17 @@ where
         let total_len = snapshot.len();
         let mut offset = 0usize;
         let timeout = Duration::from_millis(self.config.timing.heartbeat_ms * 2);
+        // Snapshot the term we started in. handle_inbound below can process a
+        // higher-term RPC and step this node down; we must not keep sending
+        // InstallSnapshot frames as "leader" after that happens.
+        let start_term = self.hard_state.current_term;
 
         loop {
-            let end = (offset + chunk_size).min(total_len);
+            offset = offset.min(total_len);
+            let end = offset
+                .checked_add(chunk_size)
+                .unwrap_or(total_len)
+                .min(total_len);
             let done = end == total_len;
             let chunk_bytes = if total_len == 0 {
                 &[]
@@ -79,7 +87,13 @@ where
                                 current: self.hard_state.current_term,
                             });
                         }
-                        offset = resp.next_offset.get() as usize;
+                        let next_off = resp.next_offset.get() as usize;
+                        if next_off > total_len {
+                            return Err(RaftError::Protocol(
+                                "install snapshot next_offset past total".into(),
+                            ));
+                        }
+                        offset = next_off;
                         if resp.accepted != 0 && (done || offset >= total_len) {
                             info!(
                                 node_id = self.config.node_id.0,
@@ -93,7 +107,20 @@ where
                     }
                     message => {
                         self.handle_inbound(InboundRaftMessage { from, group_id, message })
-                            .await?
+                            .await?;
+                        // handle_inbound may have stepped us down on a higher term.
+                        // Aborting here avoids stamping later chunks with the new
+                        // term while still identifying ourselves as leader.
+                        if !self.is_leader()
+                            || self.hard_state.current_term != start_term
+                        {
+                            return Err(RaftError::NotLeader {
+                                leader_hint: self
+                                    .soft_state
+                                    .leader_id
+                                    .map(|leader_id| crate::LeaderHint { leader_id }),
+                            });
+                        }
                     }
                 }
             }
@@ -114,6 +141,15 @@ where
             last_included_index: crate::LogIndex(msg.last_included_index.get()),
             last_included_term: crate::Term(msg.last_included_term.get()),
         };
+
+        // Wire-length field must agree with the decoded payload slice. The
+        // codec already checks this, but re-validating here defends against a
+        // future codec path that hands us a mismatched pair.
+        if payload.len() as u32 != msg.chunk_len.get() {
+            return Err(RaftError::Protocol(
+                "install snapshot chunk_len mismatch".into(),
+            ));
+        }
 
         // Evict any stalled snapshot transfers before processing new chunks.
         self.pending_snapshots.retain(|_, snap| !snap.is_expired());
@@ -159,6 +195,27 @@ where
             return Ok(());
         }
 
+        let max_snapshot_bytes = self.config.limits.max_snapshot_bytes;
+        if pending.bytes.len().saturating_add(payload.len()) > max_snapshot_bytes {
+            // Buffered bytes plus this chunk would exceed the configured cap.
+            // Drop the transfer so a runaway or hostile leader cannot exhaust
+            // follower memory, and NACK from offset 0 so a legitimate retry
+            // starts a fresh session.
+            self.pending_snapshots.remove(&from);
+            let resp = InstallSnapshotResp {
+                term: self.hard_state.current_term.0.into(),
+                accepted: 0,
+                next_offset: 0.into(),
+                _pad: [0; 7],
+            };
+            self.send_message(from, &RaftMessage::InstallSnapshotResp(&resp))
+                .await;
+            return Err(RaftError::Snapshot(format!(
+                "install snapshot exceeds max_snapshot_bytes ({})",
+                max_snapshot_bytes
+            )));
+        }
+
         pending.bytes.extend_from_slice(payload);
         let next_offset = pending.bytes.len() as u64;
 
@@ -172,6 +229,31 @@ where
             if self.soft_state.commit_index.0 < completed.meta.last_included_index.0 {
                 self.set_commit_index(completed.meta.last_included_index);
             }
+
+            // The Raft §7 rule: once a snapshot is installed, any local log
+            // entry whose index/term disagrees with the snapshot boundary is
+            // from a divergent branch and must be discarded wholesale;
+            // otherwise the snapshot's prefix is safe to drop.
+            let last_idx = completed.meta.last_included_index;
+            let last_term = completed.meta.last_included_term;
+            let mut dummy = [0u8; 8];
+            let boundary_conflict = self
+                .storage
+                .entry_at(last_idx, &mut dummy)?
+                .map(|e| e.term != last_term)
+                .unwrap_or(false);
+            if boundary_conflict {
+                self.storage.truncate_suffix(LogIndex(1))?;
+            } else {
+                self.storage
+                    .truncate_before(LogIndex(last_idx.0.saturating_add(1)))?;
+            }
+            // Re-seat the metadata arena at the new post-snapshot base so
+            // subsequent AppendEntries append at last_included_index + 1.
+            self.log_metadata
+                .clear(LogIndex(last_idx.0.saturating_add(1)));
+            self.cached_last_log = (last_idx, last_term);
+
             // Hand off to the outer apply loop. Source-of-truth is the storage
             // layer (`load_snapshot`) — this call is a discoverable hook point.
             super::snapshot_install::mark_snapshot_installed(self, &completed.meta);

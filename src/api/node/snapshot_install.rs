@@ -1,7 +1,7 @@
 // Snapshot-install leader trigger + SM restore glue (B2).
 
 use super::RaftNode;
-use crate::{PeerId, RaftError, RaftStorage, RaftTransport, SnapshotMeta, StateMachine};
+use crate::{LogIndex, PeerId, RaftError, RaftStorage, RaftTransport, SnapshotMeta, StateMachine};
 
 /// Notification hook invoked from `handle_install_snapshot` when a snapshot
 /// transfer completes and has been persisted via `storage.save_snapshot`.
@@ -80,5 +80,27 @@ where
         node.set_commit_index(meta.last_included_index);
     }
     node.set_last_applied(meta.last_included_index);
+
+    // Same discard rule as the in-band snapshot handler: any local entry that
+    // disagrees with the snapshot boundary is from a divergent branch and
+    // must go, otherwise the prefix is safe to drop. Without this the
+    // restarted follower keeps a stale log that AppendEntries §7 rejects.
+    let last_idx = meta.last_included_index;
+    let last_term = meta.last_included_term;
+    let mut dummy = [0u8; 8];
+    let boundary_conflict = node
+        .storage
+        .entry_at(last_idx, &mut dummy)?
+        .map(|e| e.term != last_term)
+        .unwrap_or(false);
+    if boundary_conflict {
+        node.storage.truncate_suffix(LogIndex(1))?;
+    } else {
+        node.storage
+            .truncate_before(LogIndex(last_idx.0.saturating_add(1)))?;
+    }
+    node.log_metadata
+        .clear(LogIndex(last_idx.0.saturating_add(1)));
+    node.cached_last_log = (last_idx, last_term);
     Ok(true)
 }

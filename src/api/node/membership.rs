@@ -5,7 +5,9 @@
 // are unchanged; membership machinery is entirely a state machine on top of
 // the log.
 
-use crate::{PeerId, RaftError, RaftNode, RaftStorage, RaftTransport};
+use crate::{LogIndex, PeerId, RaftError, RaftNode, RaftStorage, RaftTransport};
+
+use super::progress::PeerProgress;
 
 /// First byte of every config-change entry payload.
 ///
@@ -47,17 +49,18 @@ pub enum ConfigChangePhase {
 /// The reserved leading byte `0xC0` guarantees these entries are
 /// unambiguously distinguishable from any application payload.
 ///
-/// # Quorum caveat
+/// # Quorum rule
 ///
-/// While a `Joint` entry is the effective configuration, the leader
-/// uses the *union* of `old_peers` ∪ `new_peers` as the voter set for
-/// quorum. This is strictly more conservative than the classical
-/// dual-quorum rule (majority-of-old AND majority-of-new) — the union
-/// quorum requires more acks and is therefore safe (any dual-quorum
-/// commit implies a union-quorum commit is possible with additional
-/// acks, and vice-versa the union rule never commits without at least
-/// a majority in one of the sub-sets). Liveness is slightly reduced
-/// during the transition; safety is preserved.
+/// While a `Joint` entry is the effective configuration, commit requires
+/// a majority of `old_peers` AND a majority of `new_peers` independently
+/// (Raft §4.3, dual-quorum). A single-set majority of the union is NOT
+/// sufficient — that admits commits agreed to entirely inside `new_peers`
+/// with zero acks from `old_peers`, which breaks the safety hand-off
+/// between the two configurations.
+///
+/// `config.peers` still holds the union of the two sets for the purpose
+/// of replication targets and broadcast fan-out; the dual-quorum rule
+/// gates commit progression on top of that broadcast set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigChangeEntry {
     pub phase: ConfigChangePhase,
@@ -153,14 +156,22 @@ where
     /// Apply a committed config-change entry to this node's effective
     /// voter set.
     ///
-    /// Joint phase — voters become the union of `old_peers` and
-    /// `new_peers`; quorum math in `try_advance_commit_index` operates
-    /// against this over-approximation, which is safe (see the caveat
-    /// on [`ConfigChangeEntry`]).
+    /// Joint phase — `config.peers` becomes the union of `old_peers` and
+    /// `new_peers` (used for replication fan-out) and `joint_peers` is
+    /// set to `Some((old, new))` so [`try_advance_commit_index`] enforces
+    /// the dual-quorum rule (majority-of-old AND majority-of-new).
     ///
-    /// Final phase — voters become exactly `new_peers`. If this node
-    /// was the leader and is no longer in the voter set, it steps down
-    /// immediately.
+    /// Final phase — `joint_peers` is cleared and `config.peers` becomes
+    /// exactly `new_peers`. If this node was the leader and is no longer
+    /// in the voter set, it steps down immediately.
+    ///
+    /// If this node is the leader, `peer_progress` is reconciled with the
+    /// new voter set: newly added voters get a fresh `PeerProgress`
+    /// anchored at `last_log_index + 1`, and peers that are no longer
+    /// voters are dropped. Existing progress for retained peers is left
+    /// intact so in-flight replication does not restart.
+    ///
+    /// [`try_advance_commit_index`]: super::RaftNode::try_advance_commit_index
     pub(crate) fn apply_config_change(
         &mut self,
         entry: &ConfigChangeEntry,
@@ -177,10 +188,21 @@ where
                     }
                 }
                 self.config.peers = merged;
+                self.joint_peers = Some((entry.old_peers.clone(), entry.new_peers.clone()));
             }
             ConfigChangePhase::Final => {
+                if entry.new_peers.is_empty() {
+                    return Err(RaftError::InvalidConfig(
+                        "config-change Final phase with empty new_peers",
+                    ));
+                }
                 self.config.peers = entry.new_peers.clone();
+                self.joint_peers = None;
             }
+        }
+
+        if self.is_leader() {
+            self.reconcile_leader_progress_with_config();
         }
 
         if self.is_leader() && !self.config.peers.contains(&self.config.node_id) {
@@ -188,6 +210,44 @@ where
             self.step_down(term)?;
         }
         Ok(())
+    }
+
+    /// Bring `peer_progress` into agreement with `config.peers`: insert a
+    /// fresh entry for every voter that has none, and drop entries for
+    /// peers no longer in the voter set. Retained peers keep their
+    /// in-flight progress so replication does not restart from scratch.
+    fn reconcile_leader_progress_with_config(&mut self) {
+        let last_index = self.cached_last_log.0;
+        let self_id = self.config.node_id;
+
+        // Drop entries for peers no longer in config.peers.
+        let stale: Vec<PeerId> = self
+            .peer_progress
+            .iter()
+            .map(|(peer, _)| peer)
+            .filter(|peer| !self.config.peers.contains(peer))
+            .collect();
+        for peer in stale {
+            self.peer_progress.remove(&peer);
+            self.pending_snapshots.remove(&peer);
+            self.scratch_started.remove(&peer);
+        }
+
+        // Insert fresh progress for any voter missing one (leader excluded).
+        for &peer in &self.config.peers {
+            if peer == self_id {
+                continue;
+            }
+            if !self.peer_progress.contains_key(&peer) {
+                self.peer_progress.insert(
+                    peer,
+                    PeerProgress {
+                        next_index: LogIndex(last_index.0 + 1),
+                        match_index: LogIndex(0),
+                    },
+                );
+            }
+        }
     }
 }
 

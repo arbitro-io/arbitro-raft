@@ -26,6 +26,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tracing::warn;
 use zerocopy::IntoBytes;
 
 use crate::api::RaftNode;
@@ -71,6 +72,7 @@ where
 {
     // ── Phase 1: build wires, bucket per destination peer ────────────────
     let mut per_peer: HashMap<PeerId, Vec<FrameOut>> = HashMap::new();
+    let mut group_errors = 0usize;
 
     for (gid, node) in groups {
         if !node.is_leader() {
@@ -90,19 +92,32 @@ where
         for peer in peers {
             // build_heartbeat_wire rechecks is_leader defensively; a group
             // that stepped down mid-iteration returns None and is skipped.
-            match node.build_heartbeat_wire(peer)? {
-                Some(ae) => {
+            // A storage error building this group's wire must not abort
+            // heartbeats for other groups or other peers of this group —
+            // log and move on instead of propagating.
+            match node.build_heartbeat_wire(peer) {
+                Ok(Some(ae)) => {
                     per_peer.entry(peer).or_default().push(FrameOut {
                         group_id: gid,
                         from,
                         ae,
                     });
                 }
-                None => {
+                Ok(None) => {
                     // Not the leader anymore for this group — stop
                     // emitting frames for it entirely (subsequent peers
                     // would also skip, but the check is cheap).
                     break;
+                }
+                Err(e) => {
+                    group_errors += 1;
+                    warn!(
+                        group_id = gid.0,
+                        peer = peer.0,
+                        error = %e,
+                        "failed to build heartbeat wire for group; skipping peer"
+                    );
+                    continue;
                 }
             }
         }
@@ -110,6 +125,7 @@ where
 
     // ── Phase 2: one coalesced send_vectored per peer ────────────────────
     let mut total = 0usize;
+    let mut peer_errors = 0usize;
     for (peer, frames) in per_peer.iter() {
         // Owned storage for headers (32 bytes each) and AppendEntries bodies
         // (48 bytes each). Both are held stable in this scope so the borrows
@@ -134,8 +150,23 @@ where
             slices.push(ae_bodies[i].as_bytes());
         }
 
-        transport.send_vectored(*peer, &slices).await?;
-        total += frames.len();
+        // A single peer's transport error must not skip the remaining
+        // peers — same tolerant semantics as send_heartbeat_once, which
+        // swallows individual send failures via `send_message`.
+        match transport.send_vectored(*peer, &slices).await {
+            Ok(()) => total += frames.len(),
+            Err(e) => {
+                peer_errors += 1;
+                warn!(peer = peer.0, error = %e, "failed to send batched heartbeat to peer");
+            }
+        }
+    }
+
+    if group_errors > 0 || peer_errors > 0 {
+        warn!(
+            group_errors,
+            peer_errors, total, "batched heartbeats completed with partial failures"
+        );
     }
 
     Ok(total)

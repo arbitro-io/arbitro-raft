@@ -34,6 +34,11 @@ pub struct RaftNode<S, T> {
     pub(crate) custom_registry: RaftCustomRegistry,
     pub(crate) pending_custom: HashMap<u64, Box<dyn PendingCustomDispatch + Send + Sync>>,
     pub(crate) peer_progress: PeerMap<PeerProgress>,
+    /// Joint-consensus voter sets active while a `C_old_new` entry is the
+    /// effective configuration. `None` outside a transition. During Joint
+    /// phase, commit requires majority-of-old AND majority-of-new (Raft §4.3);
+    /// `config.peers` still holds the union for broadcast/replication targets.
+    pub(crate) joint_peers: Option<(Vec<PeerId>, Vec<PeerId>)>,
     pub(crate) pending_snapshots: HashMap<PeerId, PendingSnapshot>,
     pub(crate) log_metadata: generational::LogMetadataArena,
 
@@ -132,6 +137,7 @@ where
             custom_registry: RaftCustomRegistry::new(),
             pending_custom: HashMap::with_capacity(1024),
             peer_progress: PeerMap::with_capacity(peer_count),
+            joint_peers: None,
             pending_snapshots: HashMap::with_capacity(peer_count),
             scratch_entries: Vec::with_capacity(1024),
             scratch_indexes: Vec::with_capacity(1024),
@@ -308,7 +314,10 @@ where
         inbound: InboundRaftMessage<'_>,
     ) -> Result<(), RaftError> {
         let from = inbound.from;
-        if self.is_leader() {
+        // Only track contact timestamps for configured members — `from` is
+        // caller-controlled and an unbounded peer would otherwise leak entries
+        // into scratch_started forever.
+        if self.is_leader() && self.config.peers.contains(&from) {
             self.scratch_started.insert(from, std::time::Instant::now());
         }
         match inbound.message {
@@ -359,6 +368,15 @@ where
         self.soft_state.leader_id = None;
         self.peer_progress.clear();
         self.pending_snapshots.clear();
+        // Dispatch handles are leader-scoped by design: any custom dispatch
+        // in flight is aborted at a leader transition, so drop the pending
+        // entries here rather than let them accumulate across step-downs.
+        // TODO: DispatchHandle (src/dispatch/tx/handle.rs) has no Drop impl,
+        // so a handle dropped by the caller without awaiting completion still
+        // leaks its tx_id registration independently of this clear.
+        self.pending_custom.clear();
+        // Stale contact timestamps must not survive a leader transition.
+        self.scratch_started.clear();
         Ok(())
     }
 

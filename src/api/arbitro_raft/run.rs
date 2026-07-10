@@ -71,10 +71,15 @@ where
                 }
             };
             // Reborrow the just-written payload bytes as an immutable
-            // slice, then hand them to the state machine. The buffer
-            // is not touched again until the next iteration.
+            // slice. Config-change entries (0xC0 magic) are consumed by
+            // the membership layer; only application payloads reach the
+            // user state machine.
             let payload = &self.apply_buf[..payload_len];
-            self.state_machine.apply(payload)?;
+            let consumed_by_membership =
+                crate::api::node::membership::apply_if_config_change(&mut self.node, payload)?;
+            if !consumed_by_membership {
+                self.state_machine.apply(payload)?;
+            }
             self.node.set_last_applied(next);
             next = LogIndex(next.0 + 1);
         }
