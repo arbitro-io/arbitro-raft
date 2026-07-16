@@ -237,6 +237,52 @@ where
         acks.get(q.saturating_sub(1)).copied()
     }
 
+    /// Whether `index` currently satisfies the commit quorum of the EFFECTIVE
+    /// configuration: dual-quorum (majority-of-old AND majority-of-new) while a
+    /// joint transition is active, else a simple majority of `config.peers`.
+    ///
+    /// Reuses [`subset_quorum_index`](Self::subset_quorum_index) so the
+    /// synchronous propose path and the async run-loop agree on exactly when an
+    /// entry becomes committable — this is what closes the joint-consensus
+    /// data-loss hole (a Joint entry must not be reported committed on a
+    /// union-only majority).
+    #[inline]
+    pub(crate) fn index_meets_commit_quorum(&self, index: LogIndex) -> bool {
+        let last_index = self.cached_last_log.0;
+        match &self.joint_peers {
+            Some((old_peers, new_peers)) => {
+                let old_ok = self
+                    .subset_quorum_index(old_peers, last_index)
+                    .is_some_and(|q| q >= index);
+                let new_ok = self
+                    .subset_quorum_index(new_peers, last_index)
+                    .is_some_and(|q| q >= index);
+                old_ok && new_ok
+            }
+            None => self
+                .subset_quorum_index(&self.config.peers, last_index)
+                .is_some_and(|q| q >= index),
+        }
+    }
+
+    /// Stop condition for the synchronous propose-time ack gather. Keeps the
+    /// non-joint hot path on the cheap `accepted >= needed` counter and only
+    /// falls back to the (allocating) dual-quorum check while joint — config
+    /// changes are rare, steady-state proposals are not.
+    #[inline]
+    pub(crate) fn propose_commit_reached(
+        &self,
+        needed: usize,
+        accepted: usize,
+        last_index: LogIndex,
+    ) -> bool {
+        if self.joint_peers.is_some() {
+            self.index_meets_commit_quorum(last_index)
+        } else {
+            accepted >= needed
+        }
+    }
+
     /// Check whether a quorum of peers has replicated the latest entries and, if so,
     /// advance `commit_index` to the highest index confirmed by a quorum.
     ///
@@ -245,7 +291,11 @@ where
     /// (Raft §4.3). The effective quorum index is the min of the two — either
     /// sub-set can veto commit progress.
     pub(crate) fn try_advance_commit_index(&mut self) -> Result<(), RaftError> {
-        if self.peer_progress.is_empty() {
+        // A single-node cluster (self is the whole voter set) is its own
+        // quorum and must commit without any peer progress. Only bail early
+        // for a MULTI-node leader whose peers have not yet been initialized —
+        // there we genuinely cannot confirm a quorum. (Fixes C8.)
+        if self.config.peers.len() > 1 && self.peer_progress.is_empty() {
             return Ok(());
         }
         let last_index = self.cached_last_log.0;
@@ -265,15 +315,17 @@ where
             }
             None => {
                 // Gather: leader self (last_index) + all peer match_indexes.
-                self.scratch_indexes.clear();
-                self.scratch_indexes.push(last_index);
+                // Uses `scratch_commit_acks` (NOT `scratch_indexes`) so a
+                // concurrent propose's return slice is never clobbered (G1).
+                self.scratch_commit_acks.clear();
+                self.scratch_commit_acks.push(last_index);
                 for progress in self.peer_progress.values() {
-                    self.scratch_indexes.push(progress.match_index);
+                    self.scratch_commit_acks.push(progress.match_index);
                 }
                 // Sort descending → quorum-th largest is the safe commit point.
-                self.scratch_indexes.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                self.scratch_commit_acks.sort_unstable_by(|a, b| b.0.cmp(&a.0));
                 let quorum = super::super::quorum(self.config.peers.len());
-                let Some(&q) = self.scratch_indexes.get(quorum.saturating_sub(1)) else {
+                let Some(&q) = self.scratch_commit_acks.get(quorum.saturating_sub(1)) else {
                     return Ok(());
                 };
                 q
@@ -329,14 +381,38 @@ where
             node: self,
         };
 
-        while let Some(n) = guard
-            .node
-            .transport
-            .recv_frame_timeout(Duration::ZERO, &mut guard.buf)
-            .await?
-        {
-            let inbound = crate::decode_message(&guard.buf[..n])?;
-            guard.node.handle_inbound(inbound).await?;
+        // This drain runs AFTER the batch is already committed. A decode/handle
+        // failure here must NOT surface as an error to the caller — that would
+        // report a committed write as failed and invite a duplicate submission
+        // (G5). Skip bad frames; only a Fatal-class error stops the node.
+        loop {
+            let recv = match guard
+                .node
+                .transport
+                .recv_frame_timeout(Duration::ZERO, &mut guard.buf)
+                .await
+            {
+                Ok(opt) => opt,
+                Err(e) if e.is_fatal() => return Err(e),
+                Err(e) => {
+                    tracing::warn!(error = %e, "tolerating non-fatal recv while draining post-commit inbound");
+                    break;
+                }
+            };
+            let Some(n) = recv else { break };
+            let inbound = match crate::decode_message(&guard.buf[..n]) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(error = %e, "dropping undecodable frame while draining post-commit inbound");
+                    continue;
+                }
+            };
+            if let Err(e) = guard.node.handle_inbound(inbound).await {
+                if e.is_fatal() {
+                    return Err(e);
+                }
+                tracing::warn!(error = %e, "dropping frame after non-fatal handler error post-commit");
+            }
         }
         Ok(())
     }

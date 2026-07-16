@@ -1,3 +1,3 @@
 mod raft_error;
 
-pub use raft_error::RaftError;
+pub use raft_error::{ErrorClass, RaftError};

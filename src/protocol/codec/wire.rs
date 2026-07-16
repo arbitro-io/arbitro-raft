@@ -7,6 +7,19 @@ pub const RAFT_MAGIC: u32 = 0x5241_4654;
 pub const RAFT_VERSION: u8 = 0x01;
 pub const RAFT_FRAME_HEADER_SIZE: usize = std::mem::size_of::<RaftFrameHeader>();
 
+/// Maximum size of a single wire frame, in bytes. The receiver's `inbound_buf`
+/// is sized to exactly this, so any frame larger than it can never be received
+/// (P1-4). Client payloads are validated against [`MAX_ENTRY_PAYLOAD`] at
+/// propose time so an over-large entry is rejected up front instead of
+/// committing on the leader and then silently failing to replicate.
+pub const MAX_FRAME_SIZE: usize = 64 * 1024;
+
+/// Maximum size of a single client payload (one log entry), in bytes. Leaves
+/// [`MAX_FRAME_SIZE`] minus the frame header, the `AppendEntries` body, and the
+/// per-entry header — a conservative fixed margin so a lone entry always fits a
+/// peer's frame buffer with room to spare.
+pub const MAX_ENTRY_PAYLOAD: usize = MAX_FRAME_SIZE - 512;
+
 pub const KIND_REQUEST_VOTE: u8 = 1;
 pub const KIND_REQUEST_VOTE_RESP: u8 = 2;
 pub const KIND_APPEND_ENTRIES: u8 = 3;

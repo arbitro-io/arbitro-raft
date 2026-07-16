@@ -6,5 +6,5 @@ pub mod transport;
 
 pub use arbitro_raft::{ArbitroRaft, ClientHandle};
 pub use custom_registry::RaftCustomRegistry;
-pub use node::{CommitIndexObserver, RaftNode};
+pub use node::{CommitIndexObserver, RaftMetrics, RaftMetricsSnapshot, RaftNode, RaftStatus};
 pub use registry::RaftGroupRegistry;

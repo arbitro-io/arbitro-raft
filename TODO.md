@@ -1,6 +1,10 @@
 # arbitro-raft — Open Issues & Required Work
 
-## Critical: Election Does Not Converge Over TCP
+> **The living backlog is now [`AUDIT_REPORT.md`](AUDIT_REPORT.md)** (the six-axis
+> master audit + P0→P3 ladder). As of 2026-07-16: **P0 (soundness/safety) is complete
+> and Fable-re-audited**, and **P1 is mostly done** — see the Progress note at the top
+> of that file. The items below are historical (the original TCP-election work); most
+> are resolved and superseded by the audit ladder.
 
 **Status**: Resolved.
 

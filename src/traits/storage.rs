@@ -1,9 +1,41 @@
 use crate::protocol::codec::wire::EntryHeader;
 use crate::{HardState, LogEntry, LogIndex, RaftError, SnapshotMeta, Term};
 
+/// Persistent state backing a Raft node.
+///
+/// # Durability contract (P1-1)
+///
+/// Raft's safety proof assumes the *stable storage* below is truly durable: a
+/// value is on disk **before** the write call returns. Two writes are on the
+/// critical safety path:
+///
+/// * [`save_hard_state`](RaftStorage::save_hard_state) — persists
+///   `current_term` and `voted_for`. It MUST be durable (fsync'd, or an
+///   equivalent barrier) before returning `Ok`. The node calls it before
+///   granting a vote or advancing its term; if it returned `Ok` while the value
+///   was still only in the page cache, a crash + restart could resurrect a node
+///   that "forgot" it already voted in a term — a **double vote → two leaders
+///   in one term → committed-entry divergence**.
+/// * [`append_entries`](RaftStorage::append_entries) — a leader that counts a
+///   follower's ack toward a commit quorum assumes the follower has the entry
+///   durably. An implementation that acks before the entry is durable narrows
+///   the crash window in which a committed entry can be lost.
+///
+/// A purely in-memory implementation trivially satisfies "durable before
+/// return" *within a process* but loses everything on restart; use it only for
+/// tests or caches, never where crash-recovery matters. Implementations are
+/// free to batch/group-commit fsyncs across calls as long as no call returns
+/// `Ok` before its own value is durable.
 pub trait RaftStorage: Send + Sync + 'static {
+    /// Load the durable `HardState` (term + vote). Called once in
+    /// `RaftNode::new`; returning stale state here is the restart-side of the
+    /// double-vote hazard described in the trait docs.
     fn load_hard_state(&self) -> Result<HardState, RaftError>;
+    /// Persist `HardState` durably before returning `Ok` — see the trait-level
+    /// durability contract.
     fn save_hard_state(&self, state: &HardState) -> Result<(), RaftError>;
+    /// Append entries to the log durably before returning `Ok` — see the
+    /// trait-level durability contract.
     fn append_entries(&self, entries: &[LogEntry<'_>]) -> Result<(), RaftError>;
 
     /// OPTIMIZED PATH: Appends entries from a pre-serialized header block and payload refs.

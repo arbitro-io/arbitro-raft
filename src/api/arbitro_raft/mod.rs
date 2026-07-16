@@ -66,6 +66,14 @@ where
 // bypass this check.
 #[inline]
 fn reject_reserved_prefix(payload: &[u8]) -> Result<(), RaftError> {
+    // Frame-size contract (P1-4): reject an over-large payload at propose time.
+    // Without this, a payload that fits the leader but not a peer's fixed
+    // `inbound_buf` would commit locally and then silently never replicate.
+    if payload.len() > crate::protocol::codec::wire::MAX_ENTRY_PAYLOAD {
+        return Err(RaftError::InvalidPayload(
+            "payload exceeds MAX_ENTRY_PAYLOAD and would not fit a peer's frame buffer",
+        ));
+    }
     if payload.first().copied() == Some(crate::api::node::membership::CONFIG_CHANGE_MAGIC) {
         return Err(RaftError::InvalidPayload(
             "payload first byte collides with reserved config-change magic (0xC0)",
@@ -101,7 +109,8 @@ where
             pending_batch: Vec::with_capacity(4096),
             pending_slots: Vec::with_capacity(4096),
             commit_waiters: Vec::with_capacity(4096),
-            inbound_buf: vec![0u8; 64 * 1024].into_boxed_slice(),
+            inbound_buf: vec![0u8; crate::protocol::codec::wire::MAX_FRAME_SIZE]
+                .into_boxed_slice(),
         };
         raft.reset_election_deadline();
         raft.reset_heartbeat_deadline();
@@ -135,6 +144,25 @@ where
     pub fn commit_index(&self) -> LogIndex {
         self.node.commit_index()
     }
+    /// Who this node currently believes leads the cluster (`None` if unknown).
+    /// The getter an operator or a `NotLeader`-redirect path calls to locate
+    /// the leader.
+    #[inline]
+    pub fn leader_id(&self) -> Option<PeerId> {
+        self.node.leader_id()
+    }
+    /// Consistent point-in-time snapshot of this node's consensus state for
+    /// health checks and dashboards — see [`crate::RaftStatus`].
+    #[inline]
+    pub fn status(&self) -> crate::RaftStatus {
+        self.node.status()
+    }
+    /// Clone the node's lifecycle counters ([`crate::RaftMetrics`]). Clone this
+    /// before moving the node into its run task to poll it concurrently.
+    #[inline]
+    pub fn metrics(&self) -> crate::RaftMetrics {
+        self.node.metrics()
+    }
 
     /// Cheaply-clonable read-only observer over the committed log index.
     ///
@@ -161,6 +189,11 @@ where
             return;
         }
         self.stopped = true;
+        // Close the client channel so any late `ClientHandle::write` fails fast
+        // with "raft node stopped" instead of parking its slot forever once the
+        // run loop no longer ticks (PS10). Buffered proposals are still drainable
+        // below.
+        self.client_rx.close();
         while let Ok(proposal) = self.client_rx.try_recv() {
             self.registry.get(proposal.slot_id).notify_error();
         }
@@ -335,8 +368,26 @@ where
     }
 
     pub async fn run(&mut self) -> Result<(), RaftError> {
-        while self.run_once().await? {}
-        Ok(())
+        loop {
+            match self.run_once().await {
+                Ok(true) => continue,
+                Ok(false) => return Ok(()),
+                // A fatal error terminates the loop. It must be logged loudly —
+                // callers commonly `tokio::spawn(raft.run())` and drop the
+                // JoinHandle, so a silent return would leave a dead node the
+                // process never notices.
+                Err(e) => {
+                    tracing::error!(
+                        node_id = self.node.node_id().0,
+                        term = self.node.current_term().0,
+                        class = ?e.class(),
+                        error = %e,
+                        "raft run loop terminated"
+                    );
+                    return Err(e);
+                }
+            }
+        }
     }
 }
 

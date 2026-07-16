@@ -3,13 +3,12 @@
 //! Scenario 1 — grow a 3-node cluster into a 4-node cluster.
 //! Scenario 2 — shrink a 4-node cluster back into a 3-node cluster.
 //!
-//! Both tests are gated with `#[ignore]` because the joint-consensus apply
-//! hook (`apply_if_config_change`) is not currently invoked by
-//! `ArbitroRaft::apply_committed_entries` — the peer set is therefore never
-//! mutated at runtime, so the leader never routes AppendEntries to the new
-//! voter and the assertions below cannot pass in-tree. The tests are kept
-//! green under `cargo check --all-targets` so the scaffolding is ready the
-//! moment the apply hook is wired.
+//! The joint-consensus apply hook (`apply_if_config_change`) is wired into
+//! `ArbitroRaft::apply_committed_entries`, so the peer set is mutated at
+//! runtime and the leader routes AppendEntries to the new voter. Scenario 1
+//! (add) runs and passes. Scenario 2 (remove) is `#[ignore]`d: it exposes
+//! removed-node disruption that this lock-holding harness cannot fully close
+//! without leader-transfer (§4.2.3) — see the attribute on that test.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -378,7 +377,6 @@ async fn await_leader(rafts: &[SharedRaft]) -> usize {
 // Test 1 — add a fourth node via config change.
 // ---------------------------------------------------------------------------
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "joint-quorum apply hook not wired: peers() never updates, node 4 catch-up impossible"]
 async fn test_add_fourth_node_via_config_change() {
     let hub = Arc::new(NetworkHub::new());
     let initial = [1u64, 2, 3];
@@ -430,8 +428,16 @@ async fn test_add_fourth_node_via_config_change() {
         final_idx.0
     );
 
-    // Allow node 4 to catch up via AppendEntries.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Allow node 4 to catch up via AppendEntries — poll (bounded) rather than
+    // assume a fixed sleep suffices for catch-up to complete.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let caught_up = rafts[3].lock().await.node().last_applied() >= final_idx;
+        if caught_up || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // 6a — node 4's state machine applied everything through final_idx.
     {
@@ -478,7 +484,17 @@ async fn test_add_fourth_node_via_config_change() {
 // Test 2 — remove the fourth node via config change.
 // ---------------------------------------------------------------------------
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "joint-quorum apply hook not wired: peers() never shrinks, removed node never steps down"]
+#[ignore = "flaky (~1 in 3): removed-node disruption. The §4.3 auto-resumption \
+(ArbitroRaft::finalize_joint_if_inherited) and the leader-side pre-vote denial \
+(G2) landed and cut the failure rate, but cannot fully close it here because \
+this harness holds the leader's lock across the whole two-entry \
+propose_config_change, starving that node's heartbeat loop; a peer can then \
+time out and win an election mid-transition BEFORE C_new reaches it (so it \
+carries the stale voter set and never self-removes). Robustly closing this \
+needs EITHER leader-transfer-before-removal (Raft §4.2.3) OR a harness that \
+drives the config change through the run loop so heartbeats interleave. Tracked \
+as a P1 item in AUDIT_REPORT. The add-node path \
+(test_add_fourth_node_via_config_change) is un-ignored and passes robustly."]
 async fn test_remove_node_via_config_change() {
     let hub = Arc::new(NetworkHub::new());
     let initial = [1u64, 2, 3, 4];
@@ -515,9 +531,29 @@ async fn test_remove_node_via_config_change() {
         final_idx.0,
     );
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
+    // Wait (bounded) for the removal to converge instead of assuming a fixed
+    // sleep is enough — config-change propagation timing varies run to run.
     let expected: Vec<PeerId> = [1u64, 2, 3].iter().copied().map(PeerId).collect();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let mut ok = true;
+        for i in 0..3 {
+            if rafts[i].lock().await.node().peers() != expected.as_slice() {
+                ok = false;
+            }
+        }
+        {
+            let r = rafts[3].lock().await;
+            if r.node().is_leader() || r.node().peers().contains(&PeerId(4)) {
+                ok = false;
+            }
+        }
+        if ok || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
     for i in 0..3 {
         let r = rafts[i].lock().await;
         assert_eq!(
