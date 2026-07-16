@@ -157,6 +157,12 @@ where
     pub fn status(&self) -> crate::RaftStatus {
         self.node.status()
     }
+    /// Clone the node's lifecycle counters ([`crate::RaftMetrics`]). Clone this
+    /// before moving the node into its run task to poll it concurrently.
+    #[inline]
+    pub fn metrics(&self) -> crate::RaftMetrics {
+        self.node.metrics()
+    }
 
     /// Cheaply-clonable read-only observer over the committed log index.
     ///

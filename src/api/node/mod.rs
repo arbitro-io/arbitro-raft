@@ -75,6 +75,10 @@ pub struct RaftNode<S, T> {
     /// committed boundary without holding the node lock.
     pub(crate) commit_index_pub: Arc<AtomicU64>,
 
+    /// Lifecycle counters, cloned out via [`RaftNode::metrics`] before the node
+    /// moves into its run task. Incremented only on cold paths.
+    pub(crate) metrics: RaftMetrics,
+
     /// Highest log index applied to the state machine.
     ///
     /// Volatile — reset to `LogIndex(0)` on restart. The state
@@ -141,6 +145,91 @@ pub struct RaftStatus {
     pub config_change_in_progress: bool,
 }
 
+/// Cheaply-clonable, thread-safe lifecycle counters for a node.
+///
+/// Clone one via [`RaftNode::metrics`] / [`crate::ArbitroRaft::metrics`] BEFORE
+/// moving the node into its run task, so an operator or another task can poll
+/// the counters while the run loop owns `&mut self` (same pattern as
+/// [`CommitIndexObserver`]). All updates are `Relaxed` — these are counters, not
+/// synchronization — and every incrementer sits on a cold path (elections,
+/// step-downs, config changes, dropped frames), never the steady-state
+/// append/commit hot path.
+#[derive(Debug, Clone, Default)]
+pub struct RaftMetrics {
+    inner: Arc<RaftMetricsInner>,
+}
+
+#[derive(Debug, Default)]
+struct RaftMetricsInner {
+    elections_started: AtomicU64,
+    elections_won: AtomicU64,
+    step_downs: AtomicU64,
+    config_changes_applied: AtomicU64,
+    frames_dropped_nonfatal: AtomicU64,
+}
+
+/// Point-in-time copy of [`RaftMetrics`], returned by [`RaftMetrics::snapshot`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RaftMetricsSnapshot {
+    /// Real elections this node started (post pre-vote).
+    pub elections_started: u64,
+    /// Elections this node won (became leader).
+    pub elections_won: u64,
+    /// Times this node stepped down to a higher term or lost quorum.
+    pub step_downs: u64,
+    /// Config-change entries this node applied (joint or final).
+    pub config_changes_applied: u64,
+    /// Inbound frames dropped after a non-fatal decode/handle/recv error — a
+    /// rising count signals a misbehaving or version-skewed peer.
+    pub frames_dropped_nonfatal: u64,
+}
+
+impl RaftMetrics {
+    /// Read all counters at once. Safe from any thread.
+    #[inline]
+    pub fn snapshot(&self) -> RaftMetricsSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        RaftMetricsSnapshot {
+            elections_started: self.inner.elections_started.load(Relaxed),
+            elections_won: self.inner.elections_won.load(Relaxed),
+            step_downs: self.inner.step_downs.load(Relaxed),
+            config_changes_applied: self.inner.config_changes_applied.load(Relaxed),
+            frames_dropped_nonfatal: self.inner.frames_dropped_nonfatal.load(Relaxed),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn inc_elections_started(&self) {
+        self.inner
+            .elections_started
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[inline]
+    pub(crate) fn inc_elections_won(&self) {
+        self.inner
+            .elections_won
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[inline]
+    pub(crate) fn inc_step_downs(&self) {
+        self.inner
+            .step_downs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[inline]
+    pub(crate) fn inc_config_changes_applied(&self) {
+        self.inner
+            .config_changes_applied
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[inline]
+    pub(crate) fn inc_frames_dropped_nonfatal(&self) {
+        self.inner
+            .frames_dropped_nonfatal
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 // SAFETY: All raw pointers in scratch_vectored are ephemeral and cleared after use.
 unsafe impl<S, T> Send for RaftNode<S, T>
 where
@@ -198,6 +287,7 @@ where
             cached_last_log,
             log_metadata: generational::LogMetadataArena::new(8192),
             commit_index_pub: Arc::new(AtomicU64::new(0)),
+            metrics: RaftMetrics::default(),
             // last_applied is volatile — always 0 on restart, mirrors
             // the invariant that commit_index also re-initializes to 0.
             last_applied: LogIndex(0),
@@ -307,6 +397,13 @@ where
     #[inline]
     pub fn leader_id(&self) -> Option<PeerId> {
         self.soft_state.leader_id
+    }
+
+    /// Clone the node's lifecycle counters ([`RaftMetrics`]). Do this before the
+    /// node moves into its run task so an operator can poll them concurrently.
+    #[inline]
+    pub fn metrics(&self) -> RaftMetrics {
+        self.metrics.clone()
     }
 
     /// Consistent point-in-time snapshot of this node's consensus state — see
@@ -433,6 +530,11 @@ where
     }
 
     pub(crate) fn step_down(&mut self, new_term: Term) -> Result<(), RaftError> {
+        // Count only genuine demotions (Leader/Candidate → Follower), not a
+        // follower simply adopting a higher term.
+        if self.soft_state.role != Role::Follower {
+            self.metrics.inc_step_downs();
+        }
         self.hard_state.current_term = new_term;
         self.hard_state.voted_for = None;
         // Persist before any outbound send

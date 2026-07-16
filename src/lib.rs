@@ -14,7 +14,8 @@ pub use api::node::membership::{
     ConfigChangeEntry, ConfigChangePhase, CONFIG_CHANGE_MAGIC, CONFIG_CHANGE_VERSION,
 };
 pub use api::{
-    ArbitroRaft, ClientHandle, CommitIndexObserver, RaftCustomRegistry, RaftNode, RaftStatus,
+    ArbitroRaft, ClientHandle, CommitIndexObserver, RaftCustomRegistry, RaftMetrics,
+    RaftMetricsSnapshot, RaftNode, RaftStatus,
 };
 pub use config::BootstrapPeer;
 pub use config::{LimitsConfig, NodeConfig, TimingConfig};

@@ -176,6 +176,7 @@ where
         &mut self,
         entry: &ConfigChangeEntry,
     ) -> Result<(), RaftError> {
+        self.metrics.inc_config_changes_applied();
         match entry.phase {
             ConfigChangePhase::Joint => {
                 let mut merged: Vec<PeerId> = Vec::with_capacity(

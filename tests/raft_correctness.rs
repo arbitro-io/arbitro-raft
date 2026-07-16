@@ -534,3 +534,31 @@ async fn oversized_payload_rejected_at_propose() {
         other => panic!("expected InvalidPayload for oversized payload, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Test 11 (P1-2b metrics): counters observe election activity, and a clone
+// taken before the node moves into a task still sees updates.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn metrics_count_election_activity() {
+    let (transport, _out) = TestTransport::new();
+    let node =
+        arbitro_raft::RaftNode::new(config_3node(1), TestStorage::default(), transport).unwrap();
+    let mut raft = arbitro_raft::ArbitroRaft::new(node, arbitro_raft::NoopStateMachine);
+
+    // Clone the metrics handle up front — the pattern an operator uses before
+    // the node is moved into its run task.
+    let metrics = raft.metrics();
+    assert_eq!(metrics.snapshot().elections_started, 0);
+
+    // Starts a real election (no peers grant a vote, so it fails — but the
+    // start is counted).
+    let _ = raft.campaign_once().await;
+
+    assert_eq!(
+        metrics.snapshot().elections_started,
+        1,
+        "the earlier-cloned metrics handle must observe the election start"
+    );
+}

@@ -78,7 +78,18 @@ where
             let consumed_by_membership =
                 crate::api::node::membership::apply_if_config_change(&mut self.node, payload)?;
             if !consumed_by_membership {
-                self.state_machine.apply(payload)?;
+                if let Err(e) = self.state_machine.apply(payload) {
+                    // A diverging state machine is a hard bug — log loudly with
+                    // the offending index before the error stops the node
+                    // (ERR-10 / P1-3), rather than letting it die unexplained.
+                    tracing::error!(
+                        node_id = self.node.node_id().0,
+                        index = next.0,
+                        error = %e,
+                        "state machine apply failed; stopping node"
+                    );
+                    return Err(e);
+                }
             }
             self.node.set_last_applied(next);
             next = LogIndex(next.0 + 1);
@@ -104,6 +115,7 @@ where
                     error = %e,
                     "dropping undecodable inbound frame"
                 );
+                self.node.metrics.inc_frames_dropped_nonfatal();
                 return Ok(());
             }
         };
@@ -116,6 +128,7 @@ where
                     error = %e,
                     "dropping inbound frame after non-fatal handler error"
                 );
+                self.node.metrics.inc_frames_dropped_nonfatal();
                 Ok(())
             }
         }
@@ -145,6 +158,7 @@ where
                     error = %e,
                     "tolerating non-fatal transport recv error"
                 );
+                self.node.metrics.inc_frames_dropped_nonfatal();
                 Ok(None)
             }
         }

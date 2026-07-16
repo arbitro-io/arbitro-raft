@@ -19,6 +19,7 @@ where
         self.soft_state.role = Role::Candidate;
         self.soft_state.is_leader = false;
         self.soft_state.leader_id = None;
+        self.metrics.inc_elections_started();
         // Saturating so an adversarially-large adopted term (a peer can send
         // `u64::MAX`) can never wrap to 0 on the next election — a term-0
         // candidate would re-enter an already-decided term (P1-7). At u64::MAX
@@ -71,6 +72,7 @@ where
         self.soft_state.role = Role::Leader;
         self.soft_state.is_leader = true;
         self.soft_state.leader_id = Some(self.config.node_id);
+        self.metrics.inc_elections_won();
         self.initialize_leader_progress()?;
         info!(
             node_id = self.config.node_id.0,
