@@ -1,15 +1,26 @@
 # arbitro-raft — Master Audit & Path-to-Masterpiece
 
-> **Status of this document.** This replaces the previous `AUDIT_REPORT.md`, whose
-> "38 fixes / 19-of-19 green" executive summary was **aspirational, not demonstrated**:
-> the four safety-critical integration tests are `#[ignore]`d, two of them **fail when
-> force-run**, and none of the five Raft safety properties has a running assertion. This
-> report is a consolidated, adversarial re-audit by six independent Fable passes plus
-> measured ground truth. Treat it as the authoritative backlog for making this crate the
-> trustworthy, extremely-low-latency, world-class core of arbitro.
+> **Status of this document.** A consolidated, adversarial re-audit by six independent
+> Fable passes plus measured ground truth. Treat it as the authoritative backlog for
+> making this crate the trustworthy, extremely-low-latency, world-class core of arbitro.
+>
+> **Progress (2026-07-16):**
+> - **P0 — COMPLETE and Fable-re-audited sound.** All 7 soundness/safety blockers fixed
+>   (see the STATUS block under `### P0`), plus a post-audit wave (G1 regression, G2
+>   stickiness hole, G3/G5 error-tolerance, §4.3 joint auto-resumption) and the
+>   gather-path sibling. The add-node membership test is un-ignored and passes robustly.
+> - **P1 — mostly done.** DONE + green + tested: P1-1 (durability contract + restart
+>   test), P1-2 (leader_id/RaftStatus/RaftMetrics), P1-3 core (fail-loudly), P1-4
+>   (frame-size contract), P1-5 partial (non-member snapshot reject), P1-7 (term + index
+>   overflow), P1-9 PS10 (stop closes channel). OPEN: P1-8 cluster_id (needs a wire-format
+>   decision), the unbounded→bounded channel (a product decision), and the snapshot/oracle
+>   remainder (folds into the P2 DST harness). Per-item status is inline below.
 >
 > Audited at rustc 1.92.0, `arbitro-raft` v0.2.0, ~8.7k LOC src + ~3.4k tests.
-> Ground truth: build green (7 warnings); **27 tests pass, 4 ignored (2 fail on --ignored)**.
+> Ground truth (this branch): build green; full suite passes; `raft_correctness` has 11
+> assertions incl. election-safety, term saturation, index-arena saturation, restart
+> no-double-vote, frame-size reject, and metrics; **1 ignored** (remove-node, pending
+> §4.2.3 leader-transfer) + 2 pre-existing snapshot-fragile.
 
 ## What "masterpiece in every sense" means here (the six axes)
 
