@@ -413,3 +413,70 @@ fn commit_index_observer_reflects_writes() {
     assert_eq!(observer.get(), LogIndex(100));
     assert_eq!(observer2.get(), LogIndex(100));
 }
+
+// ---------------------------------------------------------------------------
+// Test 7 (P1-2): status() + leader_id() report a consistent initial snapshot.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn status_and_leader_id_report_initial_state() {
+    use arbitro_raft::Role;
+    let (transport, _) = TestTransport::new();
+    let node =
+        arbitro_raft::RaftNode::new(config_3node(1), TestStorage::default(), transport).unwrap();
+
+    // A fresh node knows of no leader — this is the getter an operator calls.
+    assert_eq!(node.leader_id(), None);
+
+    let s = node.status();
+    assert_eq!(s.node_id, PeerId(1));
+    assert_eq!(s.term, Term(0));
+    assert_eq!(s.role, Role::Follower);
+    assert_eq!(s.leader_id, None);
+    assert!(!s.is_leader);
+    assert_eq!(s.commit_index, LogIndex(0));
+    assert_eq!(s.last_applied, LogIndex(0));
+    assert_eq!(s.last_log_index, LogIndex(0));
+    assert_eq!(s.voter_count, 3);
+    assert!(!s.config_change_in_progress);
+
+    // Promotion flips role/is_leader; status() reflects it consistently.
+    let mut node = node;
+    node.become_leader_for_benchmark(Term(5));
+    let s2 = node.status();
+    assert!(s2.is_leader);
+    assert_eq!(s2.role, Role::Leader);
+    assert_eq!(s2.term, Term(5));
+}
+
+// ---------------------------------------------------------------------------
+// Test 8 (P1-7): starting an election at u64::MAX term saturates, never wraps.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn campaign_term_saturates_instead_of_wrapping() {
+    // Simulate having adopted an adversarially-large term from a peer.
+    let storage = TestStorage::default();
+    storage
+        .save_hard_state(&HardState {
+            current_term: Term(u64::MAX),
+            voted_for: None,
+        })
+        .unwrap();
+
+    let (transport, _out) = TestTransport::new();
+    let node = arbitro_raft::RaftNode::new(config_3node(1), storage, transport).unwrap();
+    let mut raft = arbitro_raft::ArbitroRaft::new(node, arbitro_raft::NoopStateMachine);
+
+    assert_eq!(raft.status().term, Term(u64::MAX), "seeded term must load");
+
+    // No peer will grant a vote, so this campaign fails — but the term bump
+    // happens first, and it must NOT wrap to 0.
+    let _ = raft.campaign_once().await;
+
+    assert_eq!(
+        raft.status().term,
+        Term(u64::MAX),
+        "term must saturate at u64::MAX, never wrap to 0 (P1-7)"
+    );
+}

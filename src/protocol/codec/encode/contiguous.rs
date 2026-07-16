@@ -12,10 +12,16 @@ pub fn encode_message_to_bytes(from: PeerId, msg: &RaftMessage) -> Result<bytes:
     let total_len = RAFT_FRAME_HEADER_SIZE + body_len;
 
     let mut buf = bytes::BytesMut::with_capacity(total_len);
-    // Safety: we are about to fill the exact total_len bytes.
+    // Safety: `set_len` exposes `total_len` uninitialized bytes; every one of
+    // them is written before `freeze()`. The header block below writes ALL
+    // eight `RaftFrameHeader` fields (including `flags` and `reserved`, which
+    // are set to 0), and each message arm writes exactly `body_len` body bytes
+    // (`body_total_len` is the sum of those writes). No byte is left
+    // uninitialized, so nothing uninitialized is ever read or sent on the wire.
     unsafe { buf.set_len(total_len) };
 
-    // 1. Frame Header
+    // 1. Frame Header — write every field; leaving `flags`/`reserved` unset
+    //    would ship uninitialized heap bytes on the wire (UB + info leak).
     {
         let (h_bytes, _) = buf.split_at_mut(RAFT_FRAME_HEADER_SIZE);
         let (h_ref, _) = Ref::<_, RaftFrameHeader>::from_prefix(h_bytes)
@@ -24,8 +30,10 @@ pub fn encode_message_to_bytes(from: PeerId, msg: &RaftMessage) -> Result<bytes:
         header.magic.set(RAFT_MAGIC);
         header.version = RAFT_VERSION;
         header.kind = kind_of(msg);
+        header.flags.set(0);
         header.from.set(from.0);
         header.body_len.set(body_len as u32);
+        header.reserved.set(0);
         header.group_id.set(0);
     }
 

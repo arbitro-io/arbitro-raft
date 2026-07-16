@@ -64,68 +64,110 @@ where
             node: self,
         };
 
-        while accepted < needed && !guard.node.scratch_pending.is_empty() {
+        while !guard
+            .node
+            .propose_commit_reached(needed, accepted, last_index)
+            && !guard.node.scratch_pending.is_empty()
+        {
             // Burst-drain: consume all immediately-available frames before yielding.
-            while let Some(n) = guard
-                .node
-                .transport
-                .recv_frame_timeout(Duration::ZERO, &mut guard.buf)
-                .await?
-            {
-                let inbound = crate::decode_message(&guard.buf[..n])?;
-                let from = inbound.from;
-                let group_id = inbound.group_id;
-                match inbound.message {
-                    RaftMessage::AppendEntriesResp(resp) => {
-                        guard
-                            .node
-                            .process_append_resp(from, resp, last_index, &mut accepted)
-                            .await?;
+            loop {
+                let n = match guard
+                    .node
+                    .transport
+                    .recv_frame_timeout(Duration::ZERO, &mut guard.buf)
+                    .await
+                {
+                    Ok(Some(n)) => n,
+                    Ok(None) => break,
+                    Err(e) if e.is_fatal() => return Err(e),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "tolerating non-fatal recv during quorum gather");
+                        break;
                     }
-                    message => {
-                        guard
-                            .node
-                            .handle_inbound(InboundRaftMessage { from, group_id, message })
-                            .await?;
+                };
+                // A bad frame from one peer must NOT fail this propose: its entry
+                // is already appended and may still commit, so a spurious error
+                // here would invite a duplicate submission (the pre-commit
+                // sibling of the G5 post-commit drain). Skip it and keep gathering.
+                if let Err(e) = guard
+                    .node
+                    .gather_dispatch_frame(&guard.buf[..n], last_index, &mut accepted)
+                    .await
+                {
+                    if e.is_fatal() {
+                        return Err(e);
                     }
+                    tracing::warn!(error = %e, "dropping frame after non-fatal error during quorum gather");
                 }
-                if accepted >= needed || guard.node.scratch_pending.is_empty() {
+                if guard
+                    .node
+                    .propose_commit_reached(needed, accepted, last_index)
+                    || guard.node.scratch_pending.is_empty()
+                {
                     break;
                 }
             }
-            if accepted >= needed || guard.node.scratch_pending.is_empty() {
+            if guard
+                .node
+                .propose_commit_reached(needed, accepted, last_index)
+                || guard.node.scratch_pending.is_empty()
+            {
                 break;
             }
 
             // Blocking wait: yield only when the queue is actually empty.
-            if let Some(n) = guard
+            let n = match guard
                 .node
                 .transport
                 .recv_frame_timeout(timeout, &mut guard.buf)
-                .await?
+                .await
             {
-                let inbound = crate::decode_message(&guard.buf[..n])?;
-                let from = inbound.from;
-                let group_id = inbound.group_id;
-                match inbound.message {
-                    RaftMessage::AppendEntriesResp(resp) => {
-                        guard
-                            .node
-                            .process_append_resp(from, resp, last_index, &mut accepted)
-                            .await?;
-                    }
-                    message => {
-                        guard
-                            .node
-                            .handle_inbound(InboundRaftMessage { from, group_id, message })
-                            .await?;
-                    }
+                Ok(Some(n)) => n,
+                Ok(None) => break,
+                Err(e) if e.is_fatal() => return Err(e),
+                Err(e) => {
+                    tracing::warn!(error = %e, "tolerating non-fatal recv during quorum gather");
+                    break;
                 }
-            } else {
-                break;
+            };
+            if let Err(e) = guard
+                .node
+                .gather_dispatch_frame(&guard.buf[..n], last_index, &mut accepted)
+                .await
+            {
+                if e.is_fatal() {
+                    return Err(e);
+                }
+                tracing::warn!(error = %e, "dropping frame after non-fatal error during quorum gather");
             }
         }
 
         Ok(accepted)
+    }
+
+    /// Decode one gathered frame and route it: advance replication for a pending
+    /// peer's `AppendEntriesResp`, otherwise hand it to the normal inbound
+    /// handler. A malformed frame surfaces as a (non-fatal) decode `RaftError`
+    /// that the gather loop drops rather than aborting the propose.
+    async fn gather_dispatch_frame(
+        &mut self,
+        buf: &[u8],
+        last_index: LogIndex,
+        accepted: &mut usize,
+    ) -> Result<(), RaftError> {
+        let inbound = crate::decode_message(buf)?;
+        let from = inbound.from;
+        let group_id = inbound.group_id;
+        match inbound.message {
+            RaftMessage::AppendEntriesResp(resp) => {
+                self.process_append_resp(from, resp, last_index, accepted)
+                    .await?;
+            }
+            message => {
+                self.handle_inbound(InboundRaftMessage { from, group_id, message })
+                    .await?;
+            }
+        }
+        Ok(())
     }
 }

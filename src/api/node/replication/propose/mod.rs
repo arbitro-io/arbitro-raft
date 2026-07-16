@@ -48,12 +48,43 @@ where
 
         let needed = super::super::quorum(self.config.peers.len());
         let timeout = Duration::from_millis(self.config.timing.heartbeat_ms * 2);
+        // Term at which this batch was appended. If the leader steps down
+        // mid-gather (a higher term arrives on an ack) this guards the fast path
+        // below from committing on a now-stale ack counter.
+        let propose_term = self.hard_state.current_term;
+        // Gathers acks until the entry meets the EFFECTIVE commit quorum (dual
+        // during a joint transition, simple majority otherwise). `needed` is the
+        // fast-path union count used only when not joint.
         let accepted = self.gather_quorum_acks(needed, last_index, timeout).await?;
 
-        if accepted < needed {
+        // Advance the commit index.
+        //
+        // Non-joint fast path: the gather already proved `needed` distinct members
+        // replicated `last_index`, the entry was appended at `propose_term`, and
+        // the leader has not stepped down (role + term re-check). Committing
+        // `last_index` directly is the classic §5.4.2-safe majority rule; it skips
+        // the quorum re-sort AND leaves `scratch_indexes` (the return slice)
+        // untouched — see G1.
+        //
+        // Joint path: fall back to the full dual-quorum rule (majority-of-old AND
+        // majority-of-new). Never commit `last_index` on a raw union count — that
+        // is the config-change data-loss bug (C2). The joint arm of
+        // `try_advance_commit_index` reads `subset_quorum_index` and likewise never
+        // touches `scratch_indexes`.
+        if self.joint_peers.is_none()
+            && self.is_leader()
+            && self.hard_state.current_term == propose_term
+            && accepted >= needed
+        {
+            if last_index > self.soft_state.commit_index {
+                self.set_commit_index(last_index);
+            }
+        } else {
+            self.try_advance_commit_index()?;
+        }
+        if self.soft_state.commit_index < last_index {
             return Err(RaftError::NoQuorum);
         }
-        self.set_commit_index(last_index);
         self.drain_inbound_ready().await?;
         Ok(&self.scratch_indexes)
     }

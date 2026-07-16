@@ -13,7 +13,9 @@ pub mod validation;
 pub use api::node::membership::{
     ConfigChangeEntry, ConfigChangePhase, CONFIG_CHANGE_MAGIC, CONFIG_CHANGE_VERSION,
 };
-pub use api::{ArbitroRaft, ClientHandle, CommitIndexObserver, RaftCustomRegistry, RaftNode};
+pub use api::{
+    ArbitroRaft, ClientHandle, CommitIndexObserver, RaftCustomRegistry, RaftNode, RaftStatus,
+};
 pub use config::BootstrapPeer;
 pub use config::{LimitsConfig, NodeConfig, TimingConfig};
 pub use dispatch::{
@@ -27,7 +29,7 @@ pub use dispatch::{
     RAFT_DISPATCH_RESPONSE_MAGIC, RAFT_DISPATCH_RESPONSE_VERSION, RAFT_DISPATCH_VERSION,
 };
 pub use entry::{EntryPayload, LogEntry};
-pub use error::RaftError;
+pub use error::{ErrorClass, RaftError};
 pub use protocol::{
     decode_message, encode_append_entries_vectored, encode_message_to_bytes,
     encode_message_vectored, encode_message_vectored_with_group, AppendEntries,

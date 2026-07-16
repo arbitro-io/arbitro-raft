@@ -81,6 +81,13 @@ impl ClientHandle {
     /// Submit `payload` and wait until it is committed by a quorum.
     /// Returns the [`LogIndex`] assigned to the entry.
     pub async fn write(&self, payload: &[u8]) -> Result<LogIndex, RaftError> {
+        // Reject payloads whose first byte collides with the config-change
+        // magic (0xC0): the apply path decodes such entries as control entries
+        // and would silently rewrite the voter set. This is the same guard the
+        // `propose*` entry points enforce; `ClientHandle::write` feeds the same
+        // replication path and must enforce it too.
+        super::reject_reserved_prefix(payload)?;
+
         let id = self
             .registry
             .lease()

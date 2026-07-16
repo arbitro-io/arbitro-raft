@@ -86,6 +86,120 @@ where
         Ok(())
     }
 
+    /// Decode and handle one inbound frame of `n` bytes from `inbound_buf`.
+    ///
+    /// Frame-level problems — an undecodable frame, an unknown message kind, an
+    /// unregistered dispatch command, or an oversized/rejected snapshot from a
+    /// peer — are logged and swallowed: a single bad frame from one peer (or a
+    /// version-skewed node) must never terminate the consensus loop. Only a
+    /// [`ErrorClass::Fatal`](crate::ErrorClass::Fatal) error (local storage
+    /// failure / corrupt log) propagates and stops the node.
+    async fn dispatch_inbound(&mut self, n: usize) -> Result<(), RaftError> {
+        let inbound = match crate::decode_message(&self.inbound_buf[..n]) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    node_id = self.node.node_id().0,
+                    len = n,
+                    error = %e,
+                    "dropping undecodable inbound frame"
+                );
+                return Ok(());
+            }
+        };
+        match self.node.handle_inbound(inbound).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.is_fatal() => Err(e),
+            Err(e) => {
+                tracing::warn!(
+                    node_id = self.node.node_id().0,
+                    error = %e,
+                    "dropping inbound frame after non-fatal handler error"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Receive one inbound frame, tolerating non-fatal transport errors.
+    ///
+    /// A transient recv error — an oversized frame from one peer, a short read,
+    /// a momentarily-broken connection — is logged and reported as "no frame
+    /// this tick" (`Ok(None)`) so a single misbehaving or version-skewed peer
+    /// can never terminate the consensus loop. Only a
+    /// [`ErrorClass::Fatal`](crate::ErrorClass::Fatal) error (local storage /
+    /// corrupt log) propagates. This is the recv-side complement to
+    /// [`dispatch_inbound`](Self::dispatch_inbound) and completes P0-2.
+    async fn recv_inbound(&mut self, timeout: Duration) -> Result<Option<usize>, RaftError> {
+        match self
+            .node
+            .transport()
+            .recv_frame_timeout(timeout, &mut self.inbound_buf)
+            .await
+        {
+            Ok(opt) => Ok(opt),
+            Err(e) if e.is_fatal() => Err(e),
+            Err(e) => {
+                tracing::warn!(
+                    node_id = self.node.node_id().0,
+                    error = %e,
+                    "tolerating non-fatal transport recv error"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Drive an inherited joint configuration to completion (Raft §4.3).
+    ///
+    /// A node can become leader while a membership change is only half-applied —
+    /// it appended `C_old,new` (activating the joint config) and then won an
+    /// election before `C_new` committed. Nothing else re-proposes the final
+    /// entry, so the transition would stall forever. The pathological case is a
+    /// node *being removed* that wins mid-transition: it must finish the removal
+    /// (commit `C_new`, then step down when it applies a config it is not part
+    /// of) rather than sit as a permanent leader under the stale voter set.
+    ///
+    /// This is the smaller, protocol-level alternative to leader-transfer
+    /// (§4.2.3): whoever holds leadership completes the transition. No-op when
+    /// not leader or not in a joint config. Best-effort — if this node steps
+    /// down or loses quorum before `C_new` commits, the next leader runs the
+    /// same finalize on its own election.
+    async fn finalize_joint_if_inherited(&mut self) -> Result<(), RaftError> {
+        if !self.node.is_leader() {
+            return Ok(());
+        }
+        let Some((old_peers, new_peers)) = self.node.joint_peers.clone() else {
+            return Ok(());
+        };
+        tracing::info!(
+            node_id = self.node.node_id().0,
+            "inherited active joint config on election; proposing C_new to finish membership change"
+        );
+        use crate::api::node::membership::{ConfigChangeEntry, ConfigChangePhase};
+        let final_bytes = ConfigChangeEntry {
+            phase: ConfigChangePhase::Final,
+            old_peers,
+            new_peers,
+        }
+        .encode();
+        match self.node.propose_once(&final_bytes).await {
+            Ok(_) => Ok(()),
+            // Lost leadership / quorum before it committed — a later leader
+            // will retry the same finalize. Not an error.
+            Err(RaftError::NotLeader { .. }) | Err(RaftError::NoQuorum) => Ok(()),
+            Err(e) if e.is_fatal() => Err(e),
+            Err(e) => {
+                tracing::warn!(
+                    node_id = self.node.node_id().0,
+                    error = %e,
+                    "joint finalize proposal failed; will retry on next leader"
+                );
+                Ok(())
+            }
+        }
+    }
+
     pub(super) async fn run_leader_once(&mut self) -> Result<(), RaftError> {
         // 1. Drain inbound client proposals → pending_batch + pending_slots.
         //    NOTE: do NOT clear first — items may have been pushed by the idle-path select
@@ -107,14 +221,8 @@ where
 
         // 2. Burst-drain available inbound frames.
         let mut processed = 0;
-        while let Some(n) = self
-            .node
-            .transport()
-            .recv_frame_timeout(Duration::ZERO, &mut self.inbound_buf)
-            .await?
-        {
-            let inbound = crate::decode_message(&self.inbound_buf[..n])?;
-            self.node.handle_inbound(inbound).await?;
+        while let Some(n) = self.recv_inbound(Duration::ZERO).await? {
+            self.dispatch_inbound(n).await?;
             processed += 1;
             if processed >= 128 {
                 break;
@@ -156,9 +264,20 @@ where
         let timeout = self.next_heartbeat_at.saturating_duration_since(now);
         futures::select! {
             frame_result = self.node.transport().recv_frame_timeout(timeout, &mut self.inbound_buf).fuse() => {
-                if let Some(n) = frame_result? {
-                    let inbound = crate::decode_message(&self.inbound_buf[..n])?;
-                    self.node.handle_inbound(inbound).await?;
+                let frame = match frame_result {
+                    Ok(opt) => opt,
+                    Err(e) if e.is_fatal() => return Err(e),
+                    Err(e) => {
+                        tracing::warn!(
+                            node_id = self.node.node_id().0,
+                            error = %e,
+                            "tolerating non-fatal transport recv error"
+                        );
+                        None
+                    }
+                };
+                if let Some(n) = frame {
+                    self.dispatch_inbound(n).await?;
                     self.node.try_advance_commit_index()?;
                     self.drain_commit_waiters();
                     self.apply_committed_entries()?;
@@ -242,14 +361,8 @@ where
 
     pub(super) async fn run_follower_once(&mut self) -> Result<(), RaftError> {
         let mut processed = 0;
-        while let Some(n) = self
-            .node
-            .transport()
-            .recv_frame_timeout(Duration::ZERO, &mut self.inbound_buf)
-            .await?
-        {
-            let inbound = crate::decode_message(&self.inbound_buf[..n])?;
-            self.node.handle_inbound(inbound).await?;
+        while let Some(n) = self.recv_inbound(Duration::ZERO).await? {
+            self.dispatch_inbound(n).await?;
             processed += 1;
             if processed >= 128 {
                 break;
@@ -267,15 +380,9 @@ where
 
         let now = Instant::now();
         let timeout = self.next_election_at.saturating_duration_since(now);
-        match self
-            .node
-            .transport()
-            .recv_frame_timeout(timeout, &mut self.inbound_buf)
-            .await?
-        {
+        match self.recv_inbound(timeout).await? {
             Some(n) => {
-                let inbound = crate::decode_message(&self.inbound_buf[..n])?;
-                self.node.handle_inbound(inbound).await?;
+                self.dispatch_inbound(n).await?;
                 self.apply_committed_entries()?;
                 self.reset_election_deadline();
                 if self.node.is_leader() {
@@ -288,7 +395,17 @@ where
                     match self.node.campaign_pre_vote(&mut self.inbound_buf).await {
                         Ok(success) => success,
                         Err(RaftError::NoQuorum) => false,
-                        Err(err) => return Err(err),
+                        Err(err) if err.is_fatal() => return Err(err),
+                        // A malformed/hostile frame arriving mid-campaign must not
+                        // terminate the node — treat the pre-vote as failed (P0-2).
+                        Err(err) => {
+                            tracing::warn!(
+                                node_id = self.node.node_id().0,
+                                error = %err,
+                                "tolerating non-fatal error during pre-vote campaign"
+                            );
+                            false
+                        }
                     };
 
                 if pre_vote_success {
@@ -300,12 +417,26 @@ where
                                 self.reset_heartbeat_deadline();
                                 self.node.send_heartbeat_once().await?;
                                 self.reset_heartbeat_deadline();
+                                // If we won while a membership change was still
+                                // in its joint phase, drive it to completion so
+                                // the transition can never stall (§4.3).
+                                self.finalize_joint_if_inherited().await?;
                             }
                         }
                         Err(RaftError::NoQuorum) => {
                             self.reset_election_deadline();
                         }
-                        Err(err) => return Err(err),
+                        Err(err) if err.is_fatal() => return Err(err),
+                        // Non-fatal error mid-election: abandon this round and
+                        // retry after the election timeout (P0-2).
+                        Err(err) => {
+                            tracing::warn!(
+                                node_id = self.node.node_id().0,
+                                error = %err,
+                                "tolerating non-fatal error during election campaign"
+                            );
+                            self.reset_election_deadline();
+                        }
                     }
                 } else {
                     self.reset_election_deadline();

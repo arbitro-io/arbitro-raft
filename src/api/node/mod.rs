@@ -49,6 +49,11 @@ pub struct RaftNode<S, T> {
     // Elements are cleared after every call.
     pub(crate) scratch_entries: Vec<LogEntry<'static>>,
     pub(crate) scratch_indexes: Vec<LogIndex>,
+    /// Dedicated working buffer for the commit-quorum gather in
+    /// [`try_advance_commit_index`]. Kept separate from `scratch_indexes` so the
+    /// quorum sort never clobbers the per-entry indexes that `propose_batch_once`
+    /// returns to the caller (regression G1).
+    pub(crate) scratch_commit_acks: Vec<LogIndex>,
     pub(crate) scratch_peers: Vec<PeerId>,
     pub(crate) scratch_quorum_buf: Vec<u8>,
     pub(crate) scratch_vectored: Vec<(*const u8, usize)>,
@@ -77,6 +82,13 @@ pub struct RaftNode<S, T> {
     /// reconciliation via `snapshot`/`restore`. The Raft protocol
     /// guarantees `last_applied <= commit_index` at all times.
     pub(crate) last_applied: LogIndex,
+
+    /// Wall-clock instant of the last accepted `AppendEntries` from a current
+    /// leader. Backs the pre-vote leader-stickiness rule (§4.2.2): a follower
+    /// that has heard from its leader within the minimum election timeout
+    /// rejects pre-votes, so a partitioned or removed node cannot disrupt a
+    /// healthy cluster with a spurious election.
+    pub(crate) last_leader_contact: Option<std::time::Instant>,
 }
 
 /// Read-only, cheaply-clonable view of a Raft node's committed log index.
@@ -95,6 +107,38 @@ impl CommitIndexObserver {
     pub fn get(&self) -> LogIndex {
         LogIndex(self.inner.load(Ordering::Acquire))
     }
+}
+
+/// A cheap, point-in-time snapshot of a node's consensus state, for operators,
+/// health checks, and tests. Produced by [`RaftNode::status`] /
+/// [`crate::ArbitroRaft::status`] under the run-loop's `&mut self`, so every
+/// field reflects the same consistent instant. All fields are `Copy`-cheap;
+/// nothing here allocates or locks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RaftStatus {
+    /// This node's id.
+    pub node_id: PeerId,
+    /// Current term.
+    pub term: Term,
+    /// Current role (Follower / Candidate / Leader).
+    pub role: Role,
+    /// Who this node currently believes leads, or `None` when it does not know
+    /// (start-up, mid-election, or right after a step-down). An operator asks
+    /// this to find the cluster leader.
+    pub leader_id: Option<PeerId>,
+    /// Convenience: `role == Leader`.
+    pub is_leader: bool,
+    /// Highest index known committed (volatile; 0 after restart).
+    pub commit_index: LogIndex,
+    /// Highest index applied to the state machine (volatile; ≤ `commit_index`).
+    pub last_applied: LogIndex,
+    /// Index of the last entry in this node's log.
+    pub last_log_index: LogIndex,
+    /// Number of voters in the effective configuration (the union set while a
+    /// joint transition is active).
+    pub voter_count: usize,
+    /// True while a joint-consensus membership change is in flight on this node.
+    pub config_change_in_progress: bool,
 }
 
 // SAFETY: All raw pointers in scratch_vectored are ephemeral and cleared after use.
@@ -141,6 +185,7 @@ where
             pending_snapshots: HashMap::with_capacity(peer_count),
             scratch_entries: Vec::with_capacity(1024),
             scratch_indexes: Vec::with_capacity(1024),
+            scratch_commit_acks: Vec::with_capacity(peer_count + 1),
             scratch_peers: Vec::with_capacity(peer_count),
             scratch_quorum_buf: vec![0u8; 64 * 1024],
             scratch_vectored: Vec::with_capacity(2048),
@@ -156,6 +201,7 @@ where
             // last_applied is volatile — always 0 on restart, mirrors
             // the invariant that commit_index also re-initializes to 0.
             last_applied: LogIndex(0),
+            last_leader_contact: None,
         })
     }
 
@@ -252,6 +298,34 @@ where
     #[inline]
     pub fn last_applied(&self) -> LogIndex {
         self.last_applied
+    }
+
+    /// Who this node currently believes leads the cluster, or `None` when it
+    /// does not know (start-up, mid-election, just-stepped-down). This is the
+    /// getter an operator or a client-redirect path needs to find the leader;
+    /// combine with [`RaftNode::current_term`] to know which term it belongs to.
+    #[inline]
+    pub fn leader_id(&self) -> Option<PeerId> {
+        self.soft_state.leader_id
+    }
+
+    /// Consistent point-in-time snapshot of this node's consensus state — see
+    /// [`RaftStatus`]. Cheap (no alloc, no lock); intended for health checks,
+    /// operator dashboards, and tests.
+    #[inline]
+    pub fn status(&self) -> RaftStatus {
+        RaftStatus {
+            node_id: self.config.node_id,
+            term: self.hard_state.current_term,
+            role: self.soft_state.role,
+            leader_id: self.soft_state.leader_id,
+            is_leader: self.soft_state.role == Role::Leader,
+            commit_index: self.soft_state.commit_index,
+            last_applied: self.last_applied,
+            last_log_index: self.cached_last_log.0,
+            voter_count: self.config.peers.len(),
+            config_change_in_progress: self.joint_peers.is_some(),
+        }
     }
 
     /// Advance the applied cursor. Callers MUST guarantee

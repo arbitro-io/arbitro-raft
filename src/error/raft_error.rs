@@ -39,6 +39,54 @@ impl Display for RaftError {
     }
 }
 
+/// Severity class of a [`RaftError`] — lets the run loop and callers react
+/// correctly instead of treating every error identically (which is how a
+/// single bad peer frame used to terminate the whole consensus loop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// A transient peer/network condition — safe to drop the frame or retry.
+    Transient,
+    /// This node is not the leader; the caller should redirect to the hint.
+    NotLeaderRedirect,
+    /// A malformed or unexpected inbound frame — drop it, keep serving.
+    BadFrame,
+    /// This node's own durable state is broken (storage/log corruption). The
+    /// run loop MUST halt rather than risk a safety violation.
+    Fatal,
+}
+
+impl RaftError {
+    /// Classify this error for run-loop and caller decision-making.
+    pub fn class(&self) -> ErrorClass {
+        match self {
+            // Local durable state is broken — halting is the safe response.
+            Self::Storage(_) | Self::CorruptLog(_) | Self::Io(_) => ErrorClass::Fatal,
+            // Redirect the client to the current leader.
+            Self::NotLeader { .. } => ErrorClass::NotLeaderRedirect,
+            // The inbound frame / dispatch command / snapshot is bad or from a
+            // version-skewed peer — drop it, never die on one peer's input.
+            Self::Protocol(_)
+            | Self::Dispatch(_)
+            | Self::Snapshot(_)
+            | Self::InvalidPayload(_)
+            | Self::InvalidConfig(_)
+            | Self::PeerUnknown(_) => ErrorClass::BadFrame,
+            // Peer/network hiccup or a benign control-flow signal.
+            Self::NoQuorum | Self::TermChanged { .. } | Self::Transport(_) => {
+                ErrorClass::Transient
+            }
+        }
+    }
+
+    /// Whether this error must terminate the consensus run loop. Only
+    /// [`ErrorClass::Fatal`] errors qualify; all others are logged and
+    /// tolerated so one bad frame cannot kill the node.
+    #[inline]
+    pub fn is_fatal(&self) -> bool {
+        matches!(self.class(), ErrorClass::Fatal)
+    }
+}
+
 impl std::error::Error for RaftError {}
 
 impl From<std::io::Error> for RaftError {

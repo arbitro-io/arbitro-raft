@@ -1,6 +1,5 @@
 use super::super::RaftNode;
 use crate::{PeerId, RaftError, RaftMessage};
-use tracing::info;
 
 impl<S, T> RaftNode<S, T>
 where
@@ -44,6 +43,8 @@ where
             });
         }
 
+        self.ensure_leader_progress_initialized()?;
+
         self.scratch_peers.clear();
         for peer in self
             .config
@@ -55,21 +56,39 @@ where
             self.scratch_peers.push(peer);
         }
 
+        let last_log = self.cached_last_log.0;
         let mut sent = 0usize;
         for i in 0..self.scratch_peers.len() {
             let peer = self.scratch_peers[i];
+
+            // If the peer is behind, replicate its backlog instead of a bare
+            // heartbeat. Plain heartbeats carry no entries, so without this a
+            // lagging follower — e.g. a freshly added voter, or one recovering
+            // after a partition — would never catch up between client proposals
+            // (PS11). `send_append_attempt` ships entries from the peer's
+            // next_index; the ack advances its progress on the next tick.
+            let behind = self
+                .peer_progress
+                .get(&peer)
+                .is_some_and(|p| p.next_index <= last_log);
+            if behind {
+                if self.send_append_attempt(peer, 0).await?.is_some() {
+                    sent += 1;
+                }
+                continue;
+            }
+
             let req = match self.build_heartbeat_wire(peer)? {
                 Some(req) => req,
                 None => continue,
             };
-
-            // Heartbeat uses the same vectored path but with empty entries
+            // Caught-up peer: bare heartbeat (empty entries) on the vectored path.
             let msg = RaftMessage::AppendEntriesVectored(&req, &[]);
             if self.send_message(peer, &msg).await {
                 sent += 1;
             }
         }
-        info!(
+        tracing::trace!(
             node_id = self.config.node_id.0,
             term = self.hard_state.current_term.0,
             sent,

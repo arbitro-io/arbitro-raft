@@ -10,11 +10,20 @@ where
     T: crate::RaftTransport,
 {
     pub async fn campaign_once(&mut self, inbound_buf: &mut [u8]) -> Result<bool, RaftError> {
+        // Self-membership guard (see `campaign_pre_vote`): a non-voter must not
+        // seek leadership even if the pre-vote path is bypassed.
+        if !self.config.peers.contains(&self.config.node_id) {
+            return Ok(false);
+        }
         let started = super::trace_enabled().then(Instant::now);
         self.soft_state.role = Role::Candidate;
         self.soft_state.is_leader = false;
         self.soft_state.leader_id = None;
-        self.hard_state.current_term = Term(self.hard_state.current_term.0 + 1);
+        // Saturating so an adversarially-large adopted term (a peer can send
+        // `u64::MAX`) can never wrap to 0 on the next election — a term-0
+        // candidate would re-enter an already-decided term (P1-7). At u64::MAX
+        // the node simply stops advancing, which is safe (it can still follow).
+        self.hard_state.current_term = Term(self.hard_state.current_term.0.saturating_add(1));
         self.hard_state.voted_for = Some(self.config.node_id);
         self.storage.save_hard_state(&self.hard_state)?;
         let term = self.hard_state.current_term;
@@ -50,6 +59,13 @@ where
             .collect_votes(term, votes_needed, possible_votes, inbound_buf)
             .await?
         {
+            return Ok(false);
+        }
+        // Defense in depth (Election Safety): only assume leadership if we are
+        // still the candidate for the exact term we campaigned in. collect_votes
+        // already guarantees this, but the crown must never be claimed on a
+        // stale term even if that guard were ever weakened.
+        if self.soft_state.role != Role::Candidate || self.hard_state.current_term != term {
             return Ok(false);
         }
         self.soft_state.role = Role::Leader;
@@ -151,10 +167,34 @@ where
             for slot in msg_slots.iter().take(messages_count) {
                 let inbound = slot.unwrap();
                 if !matches!(inbound.message, RaftMessage::RequestVoteResp(_)) {
-                    self.handle_inbound(inbound).await?;
+                    if let Err(e) = self.handle_inbound(inbound).await {
+                        if e.is_fatal() {
+                            return Err(e);
+                        }
+                        tracing::warn!(
+                            node_id = self.config.node_id.0,
+                            error = %e,
+                            "dropping frame after non-fatal handler error during campaign"
+                        );
+                    }
                 }
             }
+
+            // Handling a request (an AppendEntries or RequestVote at a higher
+            // term) may have stepped us down and adopted a new term. If we are
+            // no longer a candidate for THIS term, abandon the campaign — the
+            // votes accumulated so far were cast for the old term, and counting
+            // them to `votes_needed` would crown us leader of a term we never
+            // won (an Election-Safety violation).
+            if self.soft_state.role != Role::Candidate
+                || self.hard_state.current_term != term
+            {
+                return Ok(false);
+            }
         }
+        // Loop exit condition already guarantees role/term were unchanged since
+        // the last check above (the `while` body ran to completion), so the
+        // accumulated `votes` are all for `term`.
         Ok(votes >= votes_needed)
     }
 
@@ -222,7 +262,15 @@ where
     }
 
     pub async fn campaign_pre_vote(&mut self, inbound_buf: &mut [u8]) -> Result<bool, RaftError> {
-        let pre_vote_term = Term(self.hard_state.current_term.0 + 1);
+        // A node that is not a voter in its own configuration — e.g. one just
+        // removed by a committed config change — must never campaign. A removed
+        // server starting elections can disrupt or even seize a cluster it no
+        // longer belongs to (Raft §4.2.2 / self-membership).
+        if !self.config.peers.contains(&self.config.node_id) {
+            return Ok(false);
+        }
+        // Saturating (P1-7): the hypothetical next term must not wrap to 0.
+        let pre_vote_term = Term(self.hard_state.current_term.0.saturating_add(1));
         let votes_needed = super::quorum(self.config.peers.len());
 
         info!(
@@ -320,6 +368,14 @@ where
                     self.handle_inbound(inbound).await?;
                 }
             }
+
+            // A concurrent higher-term message handled above may have advanced
+            // our term via step-down. If our term has reached the pre-vote term
+            // (start term + 1), the cluster has moved on — abandon the pre-vote
+            // rather than proceed to a disruptive real election.
+            if self.hard_state.current_term.0 >= pre_vote_term.0 {
+                return Ok(false);
+            }
         }
 
         Ok(votes >= votes_needed)
@@ -338,7 +394,23 @@ where
         let candidate_up_to_date = msg_log_term.0 > last_log_term.0
             || (msg_log_term == last_log_term && msg_log_idx >= last_log_index);
 
-        let can_grant = msg_term.0 >= self.hard_state.current_term.0 && candidate_up_to_date;
+        // Leader-stickiness (§4.2.2): deny the pre-vote while a leader is active.
+        // A leader is active if EITHER we are the leader ourselves — a leader
+        // never stamps `last_leader_contact` for itself, so this arm is what
+        // stops a leader from granting a challenger's pre-vote and handing away
+        // its own term (G2) — OR we accepted an AppendEntries from a current
+        // leader within the minimum election timeout. This prevents a
+        // partitioned node, or one just removed by a config change and still
+        // campaigning, from disrupting a healthy cluster and seizing leadership
+        // under a stale configuration.
+        let leader_active = self.is_leader()
+            || self.last_leader_contact.is_some_and(|t| {
+                t.elapsed()
+                    < std::time::Duration::from_millis(self.config.timing.election_min_ms.max(1))
+            });
+
+        let can_grant =
+            !leader_active && msg_term.0 >= self.hard_state.current_term.0 && candidate_up_to_date;
 
         let resp_msg = RequestVoteResp {
             term: self.hard_state.current_term.0.into(),
@@ -369,42 +441,52 @@ where
         msg_slots: &mut [Option<InboundRaftMessage<'a>>; 16],
     ) -> Result<usize, RaftError> {
         let mut messages_count = 0;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(0);
-        }
-
         let mut rest_buf = inbound_buf;
 
-        // 1. Wait for first frame
-        if let Some(n) = self
-            .transport
-            .recv_frame_timeout(remaining, rest_buf)
-            .await?
-        {
+        // Block for the first frame until `deadline`, then ZERO-poll the rest.
+        // A frame we cannot decode is skipped (not fatal), and a non-fatal recv
+        // error ends the drain for this tick — a single bad or version-skewed
+        // peer must never terminate a campaign (P0-2). Only a Fatal-class error
+        // (local storage / corrupt log) propagates.
+        while messages_count < 16 && !rest_buf.is_empty() {
+            let timeout = if messages_count == 0 {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                remaining
+            } else {
+                Duration::ZERO
+            };
+
+            let recv = match self.transport.recv_frame_timeout(timeout, rest_buf).await {
+                Ok(opt) => opt,
+                Err(e) if e.is_fatal() => return Err(e),
+                Err(e) => {
+                    tracing::warn!(
+                        node_id = self.config.node_id.0,
+                        error = %e,
+                        "tolerating non-fatal recv while draining campaign frames"
+                    );
+                    break;
+                }
+            };
+            let Some(n) = recv else { break };
+
             let (frame_buf, next_buf) = rest_buf.split_at_mut(n);
             rest_buf = next_buf;
-            let inbound = crate::decode_message(frame_buf)?;
-            msg_slots[messages_count] = Some(inbound);
-            messages_count += 1;
-        } else {
-            return Ok(0);
-        }
-
-        // 2. Drain remaining available frames
-        while messages_count < 16 && !rest_buf.is_empty() {
-            if let Some(n) = self
-                .transport
-                .recv_frame_timeout(Duration::ZERO, rest_buf)
-                .await?
-            {
-                let (frame_buf, next_buf) = rest_buf.split_at_mut(n);
-                rest_buf = next_buf;
-                let inbound = crate::decode_message(frame_buf)?;
-                msg_slots[messages_count] = Some(inbound);
-                messages_count += 1;
-            } else {
-                break;
+            match crate::decode_message(frame_buf) {
+                Ok(inbound) => {
+                    msg_slots[messages_count] = Some(inbound);
+                    messages_count += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        node_id = self.config.node_id.0,
+                        error = %e,
+                        "dropping undecodable frame while draining campaign frames"
+                    );
+                }
             }
         }
 

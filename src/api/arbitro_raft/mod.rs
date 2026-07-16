@@ -135,6 +135,19 @@ where
     pub fn commit_index(&self) -> LogIndex {
         self.node.commit_index()
     }
+    /// Who this node currently believes leads the cluster (`None` if unknown).
+    /// The getter an operator or a `NotLeader`-redirect path calls to locate
+    /// the leader.
+    #[inline]
+    pub fn leader_id(&self) -> Option<PeerId> {
+        self.node.leader_id()
+    }
+    /// Consistent point-in-time snapshot of this node's consensus state for
+    /// health checks and dashboards — see [`crate::RaftStatus`].
+    #[inline]
+    pub fn status(&self) -> crate::RaftStatus {
+        self.node.status()
+    }
 
     /// Cheaply-clonable read-only observer over the committed log index.
     ///
@@ -335,8 +348,26 @@ where
     }
 
     pub async fn run(&mut self) -> Result<(), RaftError> {
-        while self.run_once().await? {}
-        Ok(())
+        loop {
+            match self.run_once().await {
+                Ok(true) => continue,
+                Ok(false) => return Ok(()),
+                // A fatal error terminates the loop. It must be logged loudly —
+                // callers commonly `tokio::spawn(raft.run())` and drop the
+                // JoinHandle, so a silent return would leave a dead node the
+                // process never notices.
+                Err(e) => {
+                    tracing::error!(
+                        node_id = self.node.node_id().0,
+                        term = self.node.current_term().0,
+                        class = ?e.class(),
+                        error = %e,
+                        "raft run loop terminated"
+                    );
+                    return Err(e);
+                }
+            }
+        }
     }
 }
 
