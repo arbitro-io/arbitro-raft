@@ -151,6 +151,20 @@ where
             ));
         }
 
+        // Reject snapshots from a non-member (PS6 / P1-5): a spoofed `from`
+        // could otherwise force us to allocate an unbounded pending-snapshot
+        // buffer (multi-GiB) for a peer we will never converse with. A real
+        // snapshot always arrives from a current voter (the leader).
+        if !self.config.peers.contains(&from) {
+            tracing::warn!(
+                node_id = self.config.node_id.0,
+                from = from.0,
+                "ignoring InstallSnapshot from a non-member peer"
+            );
+            self.metrics.inc_frames_dropped_nonfatal();
+            return Ok(());
+        }
+
         // Evict any stalled snapshot transfers before processing new chunks.
         self.pending_snapshots.retain(|_, snap| !snap.is_expired());
 
