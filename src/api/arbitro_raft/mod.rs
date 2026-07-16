@@ -66,6 +66,14 @@ where
 // bypass this check.
 #[inline]
 fn reject_reserved_prefix(payload: &[u8]) -> Result<(), RaftError> {
+    // Frame-size contract (P1-4): reject an over-large payload at propose time.
+    // Without this, a payload that fits the leader but not a peer's fixed
+    // `inbound_buf` would commit locally and then silently never replicate.
+    if payload.len() > crate::protocol::codec::wire::MAX_ENTRY_PAYLOAD {
+        return Err(RaftError::InvalidPayload(
+            "payload exceeds MAX_ENTRY_PAYLOAD and would not fit a peer's frame buffer",
+        ));
+    }
     if payload.first().copied() == Some(crate::api::node::membership::CONFIG_CHANGE_MAGIC) {
         return Err(RaftError::InvalidPayload(
             "payload first byte collides with reserved config-change magic (0xC0)",
@@ -101,7 +109,8 @@ where
             pending_batch: Vec::with_capacity(4096),
             pending_slots: Vec::with_capacity(4096),
             commit_waiters: Vec::with_capacity(4096),
-            inbound_buf: vec![0u8; 64 * 1024].into_boxed_slice(),
+            inbound_buf: vec![0u8; crate::protocol::codec::wire::MAX_FRAME_SIZE]
+                .into_boxed_slice(),
         };
         raft.reset_election_deadline();
         raft.reset_heartbeat_deadline();
@@ -174,6 +183,11 @@ where
             return;
         }
         self.stopped = true;
+        // Close the client channel so any late `ClientHandle::write` fails fast
+        // with "raft node stopped" instead of parking its slot forever once the
+        // run loop no longer ticks (PS10). Buffered proposals are still drainable
+        // below.
+        self.client_rx.close();
         while let Ok(proposal) = self.client_rx.try_recv() {
             self.registry.get(proposal.slot_id).notify_error();
         }

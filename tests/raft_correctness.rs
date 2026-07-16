@@ -480,3 +480,57 @@ async fn campaign_term_saturates_instead_of_wrapping() {
         "term must saturate at u64::MAX, never wrap to 0 (P1-7)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test 9 (P1-1 durability): hard_state survives a restart, so a crashed node
+// cannot double-vote in a term it already voted in.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hard_state_survives_restart_no_double_vote() {
+    // A node voted for peer 2 in term 5, then crashed. On restart the durable
+    // hard_state must return so the node knows it already voted in term 5 —
+    // this is what prevents a double vote (two leaders in one term) after a
+    // crash. save_hard_state's durability is the contract; here we prove the
+    // load side recovers term AND voted_for.
+    let storage = TestStorage::default();
+    storage
+        .save_hard_state(&HardState {
+            current_term: Term(5),
+            voted_for: Some(PeerId(2)),
+        })
+        .unwrap();
+
+    // "Restart": a brand-new node instance over the same durable storage.
+    let (transport, _) = TestTransport::new();
+    let node =
+        arbitro_raft::RaftNode::new(config_3node(1), storage, transport).unwrap();
+
+    assert_eq!(node.current_term(), Term(5), "term must survive restart");
+    assert_eq!(
+        node.hard_state().voted_for,
+        Some(PeerId(2)),
+        "the recorded vote must survive restart so the node cannot double-vote in term 5"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 10 (P1-4 frame-size): an over-large payload is rejected at propose time,
+// not committed locally and then silently un-replicable.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn oversized_payload_rejected_at_propose() {
+    let (transport, _out) = TestTransport::new();
+    let node =
+        arbitro_raft::RaftNode::new(config_3node(1), TestStorage::default(), transport).unwrap();
+    let mut raft = arbitro_raft::ArbitroRaft::new(node, arbitro_raft::NoopStateMachine);
+
+    // Well past MAX_ENTRY_PAYLOAD (64 KiB - 512). The size guard runs before the
+    // leader check, so we get the size rejection, not NotLeader.
+    let huge = vec![0u8; 128 * 1024];
+    match raft.propose_once(&huge).await {
+        Err(arbitro_raft::RaftError::InvalidPayload(_)) => {}
+        other => panic!("expected InvalidPayload for oversized payload, got {other:?}"),
+    }
+}
