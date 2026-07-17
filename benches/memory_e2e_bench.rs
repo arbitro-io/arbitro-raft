@@ -1,15 +1,23 @@
-// ARBITRO RAFT — IN-MEMORY CONSENSUS BENCHMARK
+// ARBITRO RAFT — LEADER-PATH CPU-COST BENCHMARK (NOT a round-trip benchmark)
 //
-// Measures pure consensus overhead: no real network, no disk IO.
-// Transport simulates 2 real follower state machines (prev_log check,
-// conflict truncation, entry append) — equivalent to OpenRaft's MemLogStore.
+// HONESTY LABEL (K1 audit): the follower here is INLINE-SYNCHRONOUS —
+// `send_vectored` / `send_frame_owned` call `handle_sim_inbound` directly on
+// the caller's thread, so the follower's ack is already queued before the
+// leader's send future even resolves. There are NO tokio task wakeups, NO
+// cross-task scheduling, NO transport latency of any kind. The numbers below
+// are therefore the LEADER'S PROTOCOL CPU COST per commit (encode + decode +
+// follower log logic + quorum accounting), NOT in-memory consensus round-trip
+// latency. Do not quote these numbers as "in-memory consensus speed".
 //
-// Design principles vs the previous version:
-//   1. Uses propose_once / propose_batch_once — real backpressure, blocks until quorum.
-//   2. Leader is created once per benchmark run (inside iter_custom), not per sample.
-//   3. No yield_now() spin loop — propose_once returns on commit, no polling needed.
-//   4. Batch scenarios simulate N concurrent clients by proposing N entries in one round.
-//   5. Empty-payload baseline for direct comparison with openraft's minimal benchmark.
+// For the honest in-memory round-trip (real tokio follower tasks, real
+// scheduler hops, wait-for-commit), use `raft_transport_bench` with the
+// `inmem/` filter instead.
+//
+// What this bench still does correctly:
+//   1. Uses propose_once / propose_batch_once — blocks until quorum commit.
+//   2. Real wire codec both directions (encode_message_vectored / decode_message).
+//   3. Real follower log logic (prev_log check, conflict truncation, append).
+//   4. Empty-payload baseline for protocol-overhead comparison.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

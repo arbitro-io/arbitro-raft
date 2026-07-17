@@ -30,8 +30,8 @@
 | I — API & contracts | 11 | 2 |
 | J — Readability & polish | 7 | 1 |
 | K — Benchmark honesty | 4 | 1 |
-| L — arbitro-server cluster integration | 6 | 4 |
-| **Total** | **59** | **70** |
+| L — arbitro-server cluster integration | 8 | 4 |
+| **Total** | **61** | **70** |
 
 ---
 
@@ -269,6 +269,10 @@ between the crate and the server. All paths `server:` = `arbitro/crates/arbitro-
 - **L8 · Share-nothing deployment of raft in the server** — Why: TODAY'S deployment is the measured slow shape — a single group on the shared work-stealing runtime (group migrates cores → cache thrash + cross-thread wakeups); the per-propose cost is runtime hot-path, not raft logic. Adopt H8's blueprint: pin raft (and future per-partition groups) to a dedicated core/runtime, align with the server's existing shard/worker layout. Evidence: `server:server.rs` spawn of `raft.run()`; H8. Status: OPEN · Effort: L · Depends: H7, H8.
 - **L9 · `ClusterState::client()` panics in Standalone** — Why: a `panic!("not in clustered mode")` on a reachable accessor is a foot-gun in mixed standalone/clustered code paths — return `Option`/`Result`. Evidence: `server:cluster/mod.rs:38-44`. Status: OPEN · Effort: S · Depends: —
 - **L10 · Graceful cluster shutdown in the server** — Why: wire A12's drain (transfer leadership, flush waiters) into the server's shutdown watch so a rolling restart never eats an election timeout per node. Evidence: `server:cluster/apply_loop.rs` shutdown watch exists; no leadership handoff anywhere. Status: DONE (2026-07-17) — the server's raft `tokio::select!` shutdown arm now, on the shutdown watch firing, drops the `run()` future (releasing the `&mut` borrow) and calls `raft.drain()` under a 5 s `tokio::time::timeout` (drain's own handoff window is bounded at 2× election timeout); Ok/Err/timeout all proceed to a clean stop (`Drop::stop()` unparks all commit waiters regardless), and the `run()`-completed arm returns without draining so a fatal exit never attempts a handoff — shutdown can never hang. Evidence: `server:server.rs:568-600`. Build green `cluster`+`cluster-tls`, suite 71/0. · Effort: M · Depends: A1, A12.
+- **L11 · Single-node cluster never self-elects a leader** *(found 2026-07-17 by the first real-process cluster smoke)* — Why: booting one `arbitro-server` with `ARBITRO_CLUSTER_PEERS="1@…"` (single voter) boots cleanly but never becomes leader — `raft propose … timed out (node may not be leader)` forever, zero election log lines. Classic single-voter edge: the sole voter must count its own vote and win immediately without waiting for network RequestVoteResp. Does NOT affect ≥3-node clusters (proven working). Root cause not yet isolated (arbitro-raft `campaign_once` self-win vs server wiring). Evidence: real-process smoke, node boots + serves reads, all writes time out; no `become leader` path fires. Status: OPEN · Effort: S · Depends: —
+- **L12 · First `create-stream` during the election settle window returns `InternalError`** *(found 2026-07-17, same smoke)* — Why: a write issued in the ~first second after boot (before election completes) surfaces as `Broker { InternalError }` (the propose times out) rather than a retryable `NotLeader`/`Unavailable`; a subsequent retry succeeds. Client/server should map the pre-leader propose-timeout to a retryable status (and/or the client should retry the election window). No data loss. Status: OPEN · Effort: S · Depends: —
+
+> **Real-process 3-node cluster smoke — PASSES (2026-07-17).** Three separate `arbitro-server --features cluster` processes over real localhost TCP: election converges, a stream created on one node replicates to the other two with an identical id (real committed Raft entry, not independent), and a **leader kill triggers re-election** — the two survivors keep serving, a new stream commits + replicates between them, and the pre-kill stream survives. This is the first end-to-end proof outside the in-process harness. Drivers: `arbitro-server` + `arbitroctl` (create-stream/list-streams). Two edge findings logged as L11/L12.
 
 ---
 
