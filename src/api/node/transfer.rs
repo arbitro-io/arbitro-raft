@@ -77,12 +77,7 @@ where
         inbound_buf: &mut [u8],
     ) -> Result<(), RaftError> {
         if !self.is_leader() {
-            return Err(RaftError::NotLeader {
-                leader_hint: self
-                    .soft_state
-                    .leader_id
-                    .map(|l| crate::LeaderHint { leader_id: l }),
-            });
+            return Err(self.not_leader_error());
         }
         // Transferring to ourselves is a no-op: we already lead.
         if target == self.config.node_id {
@@ -113,12 +108,7 @@ where
         loop {
             // Deposed (or term moved) while catching up → abort as NotLeader.
             if !self.is_leader() || self.hard_state.current_term != transfer_term {
-                return Err(RaftError::NotLeader {
-                    leader_hint: self
-                        .soft_state
-                        .leader_id
-                        .map(|l| crate::LeaderHint { leader_id: l }),
-                });
+                return Err(self.not_leader_error());
             }
             let last_log = self.cached_last_log.0;
             let caught_up = self
@@ -181,16 +171,8 @@ where
                 // empty one is impossible, but skipping is strictly safer
                 // than panicking (B13).
                 let Some(inbound) = *slot else { continue };
-                if let Err(e) = self.handle_inbound(inbound).await {
-                    if e.is_fatal() {
-                        return Err(e);
-                    }
-                    warn!(
-                        node_id = self.config.node_id.0,
-                        error = %e,
-                        "dropping frame after non-fatal handler error during leadership transfer"
-                    );
-                }
+                self.handle_inbound_tolerant(inbound, "leadership transfer")
+                    .await?;
             }
         }
 
@@ -223,6 +205,22 @@ where
             term = transfer_term.0,
             "leadership transfer: target caught up, TimeoutNow sent"
         );
+        Ok(())
+    }
+
+    /// §4.2.3 transfer-freeze guard (dup-F3): while a leadership handoff is
+    /// in flight, new client work (proposals, reads) is rejected with a
+    /// redirect hint at the INCOMING leader — the transfer target — so the
+    /// sanctioned node cannot fall behind again mid-handoff.
+    #[inline]
+    pub(crate) fn check_transfer_freeze(&mut self) -> Result<(), RaftError> {
+        if self.leadership_transfer_in_progress() {
+            return Err(RaftError::NotLeader {
+                leader_hint: self
+                    .pending_transfer
+                    .map(|t| crate::LeaderHint { leader_id: t.target }),
+            });
+        }
         Ok(())
     }
 

@@ -28,23 +28,12 @@ where
         payloads: &[&[u8]],
     ) -> Result<&[LogIndex], RaftError> {
         if !self.is_leader() {
-            return Err(RaftError::NotLeader {
-                leader_hint: self
-                    .soft_state
-                    .leader_id
-                    .map(|l| crate::LeaderHint { leader_id: l }),
-            });
+            return Err(self.not_leader_error());
         }
         // §4.2.3 leadership-transfer freeze: after TimeoutNow is sent, new
         // proposals are rejected (redirect hint = the incoming leader) so the
         // sanctioned target cannot fall behind again mid-handoff.
-        if self.leadership_transfer_in_progress() {
-            return Err(RaftError::NotLeader {
-                leader_hint: self
-                    .pending_transfer
-                    .map(|t| crate::LeaderHint { leader_id: t.target }),
-            });
-        }
+        self.check_transfer_freeze()?;
         if payloads.is_empty() {
             return Ok(&[]);
         }
@@ -88,7 +77,7 @@ where
         // Joint path: fall back to the full dual-quorum rule (majority-of-old AND
         // majority-of-new). Never commit `last_index` on a raw union count — that
         // is the config-change data-loss bug (C2). The joint arm of
-        // `try_advance_commit_index` reads `subset_quorum_index` and likewise never
+        // `try_advance_commit_index` reads `subset_quorum_index_into` and likewise never
         // touches `scratch_indexes`.
         if self.joint_peers.is_none()
             && self.is_leader()
@@ -114,21 +103,10 @@ where
         payloads: &[&[u8]],
     ) -> Result<(LogIndex, usize), RaftError> {
         if !self.is_leader() {
-            return Err(RaftError::NotLeader {
-                leader_hint: self
-                    .soft_state
-                    .leader_id
-                    .map(|l| crate::LeaderHint { leader_id: l }),
-            });
+            return Err(self.not_leader_error());
         }
         // §4.2.3 leadership-transfer freeze — see `propose_batch_once`.
-        if self.leadership_transfer_in_progress() {
-            return Err(RaftError::NotLeader {
-                leader_hint: self
-                    .pending_transfer
-                    .map(|t| crate::LeaderHint { leader_id: t.target }),
-            });
-        }
+        self.check_transfer_freeze()?;
         if payloads.is_empty() {
             return Ok((LogIndex(0), 0));
         }

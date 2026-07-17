@@ -19,12 +19,7 @@ where
         snapshot: &[u8],
     ) -> Result<(), RaftError> {
         if !self.is_leader() {
-            return Err(RaftError::NotLeader {
-                leader_hint: self
-                    .soft_state
-                    .leader_id
-                    .map(|leader_id| crate::LeaderHint { leader_id }),
-            });
+            return Err(self.not_leader_error());
         }
 
         let chunk_size = self.config.limits.snapshot_chunk_bytes.max(1);
@@ -150,12 +145,7 @@ where
                         if !self.is_leader()
                             || self.hard_state.current_term != start_term
                         {
-                            return Err(RaftError::NotLeader {
-                                leader_hint: self
-                                    .soft_state
-                                    .leader_id
-                                    .map(|leader_id| crate::LeaderHint { leader_id }),
-                            });
+                            return Err(self.not_leader_error());
                         }
                     }
                 }

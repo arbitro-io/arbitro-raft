@@ -469,14 +469,10 @@ where
     ) -> Result<LogIndex, RaftError> {
         use crate::api::node::membership::{ConfigChangeEntry, ConfigChangePhase};
 
+        // dup-F4: the redirect hint is `leader_id` (who we believe leads),
+        // NOT `voted_for` — a follower's vote is not necessarily the leader.
         if !self.node.is_leader() {
-            return Err(RaftError::NotLeader {
-                leader_hint: self
-                    .node
-                    .hard_state()
-                    .voted_for
-                    .map(|leader_id| crate::LeaderHint { leader_id }),
-            });
+            return Err(self.node.not_leader_error());
         }
 
         // A10 / OPS-3: reject overlapping membership changes. The §4.3 joint
@@ -677,12 +673,7 @@ where
         use crate::api::node::membership::{ConfigChangeEntry, ConfigChangePhase};
 
         if !self.node.is_leader() {
-            return Err(RaftError::NotLeader {
-                leader_hint: self
-                    .node
-                    .leader_id()
-                    .map(|leader_id| crate::LeaderHint { leader_id }),
-            });
+            return Err(self.node.not_leader_error());
         }
         // A10 one-change-at-a-time, conservatively extended: while a joint
         // voter transition is active the effective configuration is already
@@ -765,12 +756,7 @@ where
     /// is not yet caught up, or while another config change is in flight.
     pub async fn promote_learner(&mut self, peer: PeerId) -> Result<LogIndex, RaftError> {
         if !self.node.is_leader() {
-            return Err(RaftError::NotLeader {
-                leader_hint: self
-                    .node
-                    .leader_id()
-                    .map(|leader_id| crate::LeaderHint { leader_id }),
-            });
+            return Err(self.node.not_leader_error());
         }
         if !self.node.learners().contains(&peer) {
             return Err(RaftError::InvalidConfig(

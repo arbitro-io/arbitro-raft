@@ -12,7 +12,7 @@ mod election;
 mod generational;
 mod progress;
 mod read_index;
-mod replication;
+pub(crate) mod replication;
 mod scratch;
 mod snapshot;
 mod leader_balance;
@@ -77,8 +77,12 @@ pub struct RaftNode<S, T> {
     /// layout-assuming transmute is involved anymore (US5).
     pub(crate) scratch_vectored: scratch::SliceScratch,
     pub(crate) scratch_pending: PeerMap<AppendAttemptState>,
-    #[allow(dead_code)] // reserved for per-peer attempt timing instrumentation
-    pub(crate) scratch_started: HashMap<PeerId, std::time::Instant>,
+    /// Check-quorum contact map (A8 / PS8): wall-clock instant of the last
+    /// CURRENT-term frame received from each VOTER while this node leads.
+    /// Stamped by `handle_inbound`, read by `check_quorum_active`, cleared on
+    /// step-down and on leader-progress (re)initialization. Learners are
+    /// never stamped — their liveness must not keep the quorum lease alive.
+    pub(crate) last_voter_contact: HashMap<PeerId, std::time::Instant>,
     pub(crate) scratch_outbound: Vec<u8>,
     pub(crate) scratch_payload: Vec<u8>,
     /// Capacity dock for `Vec<&[u8]>` payload-view lists (seeded replication
@@ -428,7 +432,7 @@ where
             scratch_quorum_buf: vec![0u8; 64 * 1024],
             scratch_vectored: scratch::SliceScratch::with_capacity(2048),
             scratch_pending: PeerMap::with_capacity(peer_count),
-            scratch_started: HashMap::with_capacity(peer_count),
+            last_voter_contact: HashMap::with_capacity(peer_count),
             scratch_outbound: vec![0; 1024 * 1024], // 1MB pre-allocated scratch for outbound encoding
             scratch_payload: vec![0; 16 * 1024 * 1024], // 16MB pre-allocated scratch for storage reads
             scratch_payload_refs: scratch::SliceScratch::with_capacity(1024),
@@ -529,12 +533,7 @@ where
     /// [`promote_learner`]: crate::ArbitroRaft::promote_learner
     pub fn learner_caught_up(&self, peer: PeerId) -> Result<bool, RaftError> {
         if !self.is_leader() {
-            return Err(RaftError::NotLeader {
-                leader_hint: self
-                    .soft_state
-                    .leader_id
-                    .map(|l| crate::LeaderHint { leader_id: l }),
-            });
+            return Err(self.not_leader_error());
         }
         if !self.config.learners.contains(&peer) {
             return Err(RaftError::PeerUnknown(peer));
@@ -559,6 +558,21 @@ where
     #[inline]
     pub fn is_leader(&self) -> bool {
         self.soft_state.role == Role::Leader
+    }
+
+    /// Standard `NotLeader` error carrying the current redirect hint
+    /// (`soft_state.leader_id` — who this node currently believes leads).
+    /// dup-F4: the ONE construction site for the generic not-leader
+    /// rejection; paths that redirect somewhere more specific (the §4.2.3
+    /// transfer target) build their own hint deliberately.
+    #[inline]
+    pub(crate) fn not_leader_error(&self) -> RaftError {
+        RaftError::NotLeader {
+            leader_hint: self
+                .soft_state
+                .leader_id
+                .map(|leader_id| crate::LeaderHint { leader_id }),
+        }
     }
 
     #[inline]
@@ -719,7 +733,7 @@ where
         let from = inbound.from;
         // Only track contact timestamps for configured members — `from` is
         // caller-controlled and an unbounded peer would otherwise leak entries
-        // into scratch_started forever.
+        // into last_voter_contact forever.
         //
         // A8 / PS8: additionally, only frames carrying the leader's CURRENT
         // term count as quorum-lease contact. A stale-term frame (a deposed
@@ -733,7 +747,7 @@ where
             && self.config.peers.contains(&from)
             && message_term(&inbound.message) == Some(self.hard_state.current_term)
         {
-            self.scratch_started.insert(from, std::time::Instant::now());
+            self.last_voter_contact.insert(from, std::time::Instant::now());
         }
         match inbound.message {
             RaftMessage::AppendEntries(msg, payload) => {
@@ -772,6 +786,31 @@ where
                 Err(RaftError::Protocol("unexpected vectored inbound".into()))
             }
         }
+    }
+
+    /// Dispatch one drained inbound frame, tolerating non-fatal handler
+    /// errors (dup-F5): a Fatal-class error (local storage / corrupt log)
+    /// propagates; anything else is logged and the frame dropped, so a
+    /// single bad or version-skewed peer can never abort the surrounding
+    /// gather loop (B13 / P0-2). `context` names the loop for the log line.
+    #[inline]
+    pub(crate) async fn handle_inbound_tolerant(
+        &mut self,
+        inbound: InboundRaftMessage<'_>,
+        context: &'static str,
+    ) -> Result<(), RaftError> {
+        if let Err(e) = self.handle_inbound(inbound).await {
+            if e.is_fatal() {
+                return Err(e);
+            }
+            tracing::warn!(
+                node_id = self.config.node_id.0,
+                error = %e,
+                context,
+                "dropping frame after non-fatal handler error"
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn step_down(&mut self, new_term: Term) -> Result<(), RaftError> {
@@ -820,7 +859,7 @@ where
         }
         self.pending_custom.clear();
         // Stale contact timestamps must not survive a leader transition.
-        self.scratch_started.clear();
+        self.last_voter_contact.clear();
         // A step-down resolves any in-flight §4.2.3 transfer window — either
         // the target's higher term arrived (transfer succeeded) or leadership
         // was lost some other way; in both cases the freeze must not survive.
@@ -936,6 +975,13 @@ where
     /// excluded on both sides: the loop below walks `config.peers` only,
     /// and `handle_inbound` never stamps a learner's contact.
     ///
+    /// dup-F1: the majority decision is [`RaftNode::voter_majority`] — the
+    /// SAME joint-aware predicate elections, ReadIndex confirmation, and
+    /// pre-vote use. During a §4.3 joint transition the lease therefore
+    /// requires a majority of C_old AND a majority of C_new independently;
+    /// a union-only majority must not keep a leader alive that could not
+    /// commit or be re-elected under the same contact set.
+    ///
     /// Exposed (hidden from docs) purely so correctness tests can assert the
     /// contact-filter behavior without spinning up a full cluster; production
     /// callers must let the run loop drive it.
@@ -943,17 +989,22 @@ where
     pub fn check_quorum_active(&mut self) -> bool {
         let timeout = self.election_timeout();
         let now = std::time::Instant::now();
-        let mut active_count = 1usize; // self is always active
 
+        // Gather recently-heard-from voter IDENTITIES (not a counter) into
+        // the reusable scratch — the joint arm of `voter_majority` needs to
+        // know WHICH side each contact belongs to. No allocation: the
+        // scratch vec is capacity-docked on the node.
+        self.scratch_peers.clear();
+        self.scratch_peers.push(self.config.node_id); // self is always active
         for &peer in &self.config.peers {
             if peer != self.config.node_id {
-                if let Some(&last_contact) = self.scratch_started.get(&peer) {
+                if let Some(&last_contact) = self.last_voter_contact.get(&peer) {
                     if now.saturating_duration_since(last_contact) < timeout {
-                        active_count += 1;
+                        self.scratch_peers.push(peer);
                     }
                 }
             }
         }
-        active_count >= quorum(self.config.peers.len())
+        self.voter_majority(&self.scratch_peers)
     }
 }

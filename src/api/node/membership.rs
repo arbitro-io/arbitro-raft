@@ -338,7 +338,7 @@ where
         for peer in stale {
             self.peer_progress.remove(&peer);
             self.pending_snapshots.remove(&peer);
-            self.scratch_started.remove(&peer);
+            self.last_voter_contact.remove(&peer);
         }
 
         // Insert fresh progress for any member missing one (leader excluded).

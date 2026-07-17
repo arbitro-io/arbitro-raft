@@ -153,7 +153,7 @@ where
 
     pub(crate) fn initialize_leader_progress(&mut self) -> Result<(), RaftError> {
         self.peer_progress.clear();
-        self.scratch_started.clear();
+        self.last_voter_contact.clear();
         let last_index = self.cached_last_log.0;
         for peer in self
             .config
@@ -170,7 +170,7 @@ where
                     match_index: LogIndex(0),
                 },
             );
-            self.scratch_started.insert(peer, std::time::Instant::now());
+            self.last_voter_contact.insert(peer, std::time::Instant::now());
         }
         // A13: learners get replication progress like followers, but NO
         // check-quorum contact stamp — a learner's liveness must never help
@@ -239,71 +239,58 @@ where
         Ok(term)
     }
 
-    /// Highest log index that a strict majority of `subset` has replicated.
-    ///
-    /// Counts the leader's own log tip if it appears in `subset`, and each
-    /// peer's `match_index` from `peer_progress` for the remaining members.
-    /// Peers in `subset` with no progress entry contribute `LogIndex(0)`, which
-    /// prevents a newly-added voter from being silently ignored by the quorum
-    /// computation while it is still catching up.
-    #[inline]
-    fn subset_quorum_index(&self, subset: &[PeerId], last_index: LogIndex) -> Option<LogIndex> {
-        if subset.is_empty() {
-            return None;
-        }
-        let mut acks: Vec<LogIndex> = Vec::with_capacity(subset.len());
-        let self_id = self.config.node_id;
-        for &peer in subset {
-            let match_index = if peer == self_id {
-                last_index
-            } else {
-                self.peer_progress
-                    .get(&peer)
-                    .map(|p| p.match_index)
-                    .unwrap_or(LogIndex(0))
-            };
-            acks.push(match_index);
-        }
-        acks.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-        let q = super::super::quorum(subset.len());
-        acks.get(q.saturating_sub(1)).copied()
-    }
-
     /// Whether `index` currently satisfies the commit quorum of the EFFECTIVE
     /// configuration: dual-quorum (majority-of-old AND majority-of-new) while a
     /// joint transition is active, else a simple majority of `config.peers`.
     ///
-    /// Reuses [`subset_quorum_index`](Self::subset_quorum_index) so the
+    /// Routes every arm through [`subset_quorum_index_into`] so the
     /// synchronous propose path and the async run-loop agree on exactly when an
     /// entry becomes committable — this is what closes the joint-consensus
     /// data-loss hole (a Joint entry must not be reported committed on a
-    /// union-only majority).
+    /// union-only majority). `&mut self` only for the `scratch_commit_acks`
+    /// working buffer (no allocation on any path).
     #[inline]
-    pub(crate) fn index_meets_commit_quorum(&self, index: LogIndex) -> bool {
+    pub(crate) fn index_meets_commit_quorum(&mut self, index: LogIndex) -> bool {
         let last_index = self.cached_last_log.0;
+        let self_id = self.config.node_id;
         match &self.joint_peers {
             Some((old_peers, new_peers)) => {
-                let old_ok = self
-                    .subset_quorum_index(old_peers, last_index)
-                    .is_some_and(|q| q >= index);
-                let new_ok = self
-                    .subset_quorum_index(new_peers, last_index)
-                    .is_some_and(|q| q >= index);
+                let old_ok = subset_quorum_index_into(
+                    &mut self.scratch_commit_acks,
+                    &self.peer_progress,
+                    self_id,
+                    old_peers,
+                    last_index,
+                )
+                .is_some_and(|q| q >= index);
+                let new_ok = subset_quorum_index_into(
+                    &mut self.scratch_commit_acks,
+                    &self.peer_progress,
+                    self_id,
+                    new_peers,
+                    last_index,
+                )
+                .is_some_and(|q| q >= index);
                 old_ok && new_ok
             }
-            None => self
-                .subset_quorum_index(&self.config.peers, last_index)
-                .is_some_and(|q| q >= index),
+            None => subset_quorum_index_into(
+                &mut self.scratch_commit_acks,
+                &self.peer_progress,
+                self_id,
+                &self.config.peers,
+                last_index,
+            )
+            .is_some_and(|q| q >= index),
         }
     }
 
     /// Stop condition for the synchronous propose-time ack gather. Keeps the
     /// non-joint hot path on the cheap `accepted >= needed` counter and only
-    /// falls back to the (allocating) dual-quorum check while joint — config
+    /// falls back to the full dual-quorum check while joint — config
     /// changes are rare, steady-state proposals are not.
     #[inline]
     pub(crate) fn propose_commit_reached(
-        &self,
+        &mut self,
         needed: usize,
         accepted: usize,
         last_index: LogIndex,
@@ -335,45 +322,46 @@ where
             return Ok(());
         }
 
+        // Every arm goes through `subset_quorum_index_into` (dup-F2) so the
+        // propose-time predicate (`index_meets_commit_quorum`) and this
+        // run-loop advance can never disagree on the commit rule. The gather
+        // uses `scratch_commit_acks` (NOT `scratch_indexes`) so a concurrent
+        // propose's return slice is never clobbered (G1). A13: the gather is
+        // by VOTER identity — learners keep progress entries for replication,
+        // but a learner's ack must never advance the commit index; a voter
+        // with no progress entry contributes `LogIndex(0)` so a freshly-added
+        // voter is never silently skipped.
+        let self_id = self.config.node_id;
         let quorum_index = match &self.joint_peers {
             Some((old_peers, new_peers)) => {
-                let Some(old_q) = self.subset_quorum_index(old_peers, last_index) else {
+                let Some(old_q) = subset_quorum_index_into(
+                    &mut self.scratch_commit_acks,
+                    &self.peer_progress,
+                    self_id,
+                    old_peers,
+                    last_index,
+                ) else {
                     return Ok(());
                 };
-                let Some(new_q) = self.subset_quorum_index(new_peers, last_index) else {
+                let Some(new_q) = subset_quorum_index_into(
+                    &mut self.scratch_commit_acks,
+                    &self.peer_progress,
+                    self_id,
+                    new_peers,
+                    last_index,
+                ) else {
                     return Ok(());
                 };
                 std::cmp::min(old_q, new_q)
             }
             None => {
-                // Gather: leader self (last_index) + each VOTER's match_index.
-                // Uses `scratch_commit_acks` (NOT `scratch_indexes`) so a
-                // concurrent propose's return slice is never clobbered (G1).
-                //
-                // A13: gather by voter identity, not by iterating
-                // `peer_progress` — learners keep progress entries there for
-                // replication, and a learner's ack must never advance the
-                // commit index. A voter with no progress entry contributes
-                // `LogIndex(0)` (same rule as `subset_quorum_index`), so a
-                // freshly-added voter is never silently skipped either.
-                self.scratch_commit_acks.clear();
-                self.scratch_commit_acks.push(last_index);
-                let self_id = self.config.node_id;
-                for &peer in &self.config.peers {
-                    if peer == self_id {
-                        continue;
-                    }
-                    let matched = self
-                        .peer_progress
-                        .get(&peer)
-                        .map(|p| p.match_index)
-                        .unwrap_or(LogIndex(0));
-                    self.scratch_commit_acks.push(matched);
-                }
-                // Sort descending → quorum-th largest is the safe commit point.
-                self.scratch_commit_acks.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-                let quorum = super::super::quorum(self.config.peers.len());
-                let Some(&q) = self.scratch_commit_acks.get(quorum.saturating_sub(1)) else {
+                let Some(q) = subset_quorum_index_into(
+                    &mut self.scratch_commit_acks,
+                    &self.peer_progress,
+                    self_id,
+                    &self.config.peers,
+                    last_index,
+                ) else {
                     return Ok(());
                 };
                 q
@@ -457,13 +445,55 @@ where
                     continue;
                 }
             };
-            if let Err(e) = guard.node.handle_inbound(inbound).await {
-                if e.is_fatal() {
-                    return Err(e);
-                }
-                tracing::warn!(error = %e, "dropping frame after non-fatal handler error post-commit");
-            }
+            guard
+                .node
+                .handle_inbound_tolerant(inbound, "post-commit drain")
+                .await?;
         }
         Ok(())
     }
+}
+
+/// Highest log index that a strict majority of `subset` has replicated —
+/// the ONE quorum-index computation (dup-F2) behind both the propose-time
+/// predicate (`index_meets_commit_quorum`) and the run-loop commit advance
+/// (`try_advance_commit_index`); the commit rule must never disagree
+/// between them.
+///
+/// Counts the leader's own log tip (`last_index`) only if `self_id` appears
+/// in `subset`, and each other member's `match_index` from `peer_progress`.
+/// Members of `subset` with no progress entry contribute `LogIndex(0)`,
+/// which prevents a newly-added voter from being silently ignored by the
+/// quorum computation while it is still catching up.
+///
+/// `acks` is a caller-provided working buffer (cleared here, contents
+/// meaningless afterward) so NO call site allocates — the node threads
+/// `scratch_commit_acks` through.
+#[inline]
+fn subset_quorum_index_into(
+    acks: &mut Vec<LogIndex>,
+    peer_progress: &super::super::PeerMap<super::super::PeerProgress>,
+    self_id: PeerId,
+    subset: &[PeerId],
+    last_index: LogIndex,
+) -> Option<LogIndex> {
+    if subset.is_empty() {
+        return None;
+    }
+    acks.clear();
+    for &peer in subset {
+        let match_index = if peer == self_id {
+            last_index
+        } else {
+            peer_progress
+                .get(&peer)
+                .map(|p| p.match_index)
+                .unwrap_or(LogIndex(0))
+        };
+        acks.push(match_index);
+    }
+    // Sort descending → quorum-th largest is the safe commit point.
+    acks.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    let q = super::super::quorum(subset.len());
+    acks.get(q.saturating_sub(1)).copied()
 }

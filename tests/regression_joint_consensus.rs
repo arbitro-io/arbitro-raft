@@ -28,8 +28,9 @@
 //! // index, active joint config) — the state a real recovery would read.
 
 use arbitro_raft::{
-    AppendEntriesResp, ArbitroRaft, ConfigChangeEntry, ConfigChangePhase, LogIndex,
-    NoopStateMachine, PeerId, RaftError, RaftMessage, RaftNode, Term,
+    AppendEntriesResp, ArbitroRaft, ConfigChangeEntry, ConfigChangePhase, GroupId,
+    InboundRaftMessage, LogIndex, NoopStateMachine, PeerId, RaftError, RaftMessage, RaftNode,
+    Term,
 };
 
 #[path = "support/a7_harness.rs"]
@@ -295,4 +296,144 @@ async fn c3_step_down_after_joint_commit_preserves_committed_entry() {
         NEW.iter().copied().map(PeerId).collect::<Vec<_>>()
     );
 
+}
+
+// ---------------------------------------------------------------------------
+// Pin 4 (dup-F1) — the check-quorum lease obeys the SAME joint dual-majority
+// rule as commit/election/read-index: during an active joint transition,
+// contact from a union majority that is NOT a dual majority must not keep
+// the leader's quorum lease alive.
+//
+// Contact pattern constructed: {leader(1), 4, 5} —
+//   * majority of the union (5 voters): 3 of 5  ✓
+//   * majority of C_new {1,2,3,4,5}:    3 of 5  ✓
+//   * majority of C_old {1,2,3}:        1 of 3  ✗  → lease must drop.
+//
+// Discriminating reversion: put `check_quorum_active` back on the plain
+// union-majority contact counter (the pre-dup-F1 code) — {1,4,5} = 3 of 5
+// then satisfies it and the first PIN assertion fails.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn dup_f1_check_quorum_lease_requires_dual_majority_during_joint() {
+    let (mut raft, _tx, _joint_idx) = enter_joint_phase().await;
+
+    // Age out every contact stamped at leader-progress init (election
+    // timeout = 300ms in `make_config`), so the only live contacts are the
+    // ones this test injects.
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    assert!(
+        !raft.node_mut().check_quorum_active(),
+        "scenario integrity: aged-out contacts must drop the lease"
+    );
+
+    // Current-term contact from the ENTIRE new side (4 and 5).
+    let contact = AppendEntriesResp {
+        term: 5u64.into(),
+        match_index: 0u64.into(),
+        success: 1,
+        _pad: [0; 7],
+    };
+    for from in [4u64, 5] {
+        raft.node_mut()
+            .handle_inbound(InboundRaftMessage {
+                from: PeerId(from),
+                group_id: GroupId(0),
+                message: RaftMessage::AppendEntriesResp(&contact),
+            })
+            .await
+            .expect("inject contact frame");
+    }
+    assert!(
+        !raft.node_mut().check_quorum_active(),
+        "THE PIN (dup-F1): during a joint transition, a union-majority \
+         contact set {{1,4,5}} without a majority of C_old must NOT keep \
+         the check-quorum lease alive"
+    );
+
+    // Positive control — one old-side contact (peer 2) completes the dual
+    // rule: old {1,2} = 2 of 3 ✓, new {1,2,4,5} = 4 of 5 ✓ → lease alive.
+    raft.node_mut()
+        .handle_inbound(InboundRaftMessage {
+            from: PeerId(2),
+            group_id: GroupId(0),
+            message: RaftMessage::AppendEntriesResp(&contact),
+        })
+        .await
+        .expect("inject old-side contact frame");
+    assert!(
+        raft.node_mut().check_quorum_active(),
+        "positive control: a dual-majority contact set must keep the lease"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Pin 5 (dup-F1) — pre-vote obeys the SAME joint dual-majority rule as the
+// real election: during an active joint transition, grants from a union
+// majority that is NOT a dual majority must not clear the pre-vote gate
+// (the subsequent real election would reject the same voter set, so passing
+// pre-vote on it would only produce a doomed, disruptive term bump).
+//
+// Discriminating reversion: put `campaign_pre_vote` back on the plain
+// `votes >= votes_needed` union counter (the pre-dup-F1 code) — grants from
+// {4,5} plus self = 3 of 5 then satisfy it and the first PIN assertion
+// fails.
+// ---------------------------------------------------------------------------
+
+fn pre_vote_grant_frame(from: u64, term: u64) -> Vec<u8> {
+    let resp = arbitro_raft::RequestVoteResp {
+        term: term.into(),
+        vote_granted: 1,
+        _pad: [0; 7],
+    };
+    arbitro_raft::encode_message_to_bytes(PeerId(from), &RaftMessage::PreVoteResp(&resp))
+        .expect("encode pre-vote grant")
+        .to_vec()
+}
+
+#[tokio::test]
+async fn dup_f1_pre_vote_requires_dual_majority_during_joint() {
+    let (mut raft, tx, _joint_idx) = enter_joint_phase().await;
+
+    // Depose mid-joint: the joint config stays active (pinned by C3 above);
+    // the node is now a follower of term 99 with the union as `peers`.
+    tx.send(higher_term_frame(2, 99)).unwrap();
+    raft.run_once().await.expect("run_once");
+    assert!(!raft.node().is_leader(), "the higher term must depose the leader");
+    assert!(
+        raft.status().config_change_in_progress,
+        "scenario integrity: the joint config must still be active"
+    );
+
+    let mut buf = vec![0u8; 64 * 1024];
+
+    // Grants from the ENTIRE new side (4 and 5): with self that is {1,4,5}
+    // — a union majority (3 of 5) but only 1 of 3 in C_old.
+    tx.send(pre_vote_grant_frame(4, 99)).unwrap();
+    tx.send(pre_vote_grant_frame(5, 99)).unwrap();
+    let won = raft
+        .node_mut()
+        .campaign_pre_vote(&mut buf)
+        .await
+        .expect("campaign_pre_vote");
+    assert!(
+        !won,
+        "THE PIN (dup-F1): during a joint transition, pre-vote grants from a \
+         union majority without a majority of C_old must NOT clear the gate"
+    );
+
+    // Positive control — grants from {2,4,5}: old {1,2} = 2 of 3 ✓,
+    // new {1,2,4,5} = 4 of 5 ✓ → the gate clears.
+    tx.send(pre_vote_grant_frame(2, 99)).unwrap();
+    tx.send(pre_vote_grant_frame(4, 99)).unwrap();
+    tx.send(pre_vote_grant_frame(5, 99)).unwrap();
+    let won = raft
+        .node_mut()
+        .campaign_pre_vote(&mut buf)
+        .await
+        .expect("campaign_pre_vote (positive control)");
+    assert!(
+        won,
+        "positive control: a dual-majority grant set must clear pre-vote"
+    );
 }

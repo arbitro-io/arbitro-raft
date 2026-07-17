@@ -14,13 +14,6 @@ pub(crate) struct PeerMap<V> {
 }
 
 impl<V> PeerMap<V> {
-    #[allow(dead_code)]
-    pub(crate) fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             entries: Vec::with_capacity(capacity),
@@ -61,15 +54,6 @@ impl<V> PeerMap<V> {
         if let Some(pos) = self.entries.iter().position(|(k, _)| k == key) {
             self.entries.swap_remove(pos);
         }
-    }
-
-    // Kept for API completeness; the last caller (the commit-quorum gather)
-    // now iterates by VOTER identity so learner progress is never read
-    // there (A13).
-    #[allow(dead_code)]
-    #[inline]
-    pub(crate) fn values(&self) -> impl Iterator<Item = &V> {
-        self.entries.iter().map(|(_, v)| v)
     }
 
     #[inline]

@@ -28,10 +28,10 @@
 | G — Performance & throughput | 4 | 1 |
 | H — Multi-raft & share-nothing deployment | 9 | 0 |
 | I — API & contracts | 12 | 1 |
-| J — Readability & polish | 8 | 0 |
+| J — Readability & polish | 7 | 1 |
 | K — Benchmark honesty | 4 | 1 |
 | L — arbitro-server cluster integration | 8 | 2 |
-| **Total** | **63** | **66** |
+| **Total** | **62** | **67** |
 
 ---
 
@@ -233,7 +233,7 @@ map — still tokio, deployed share-nothing.
 ## WS-J — Readability & polish
 
 - **J1 · Dead-code purge (RD1)** — Why: orphan `protocol/view.rs` (doesn't compile; still referenced in README), unused `iter_entries_mut`/`SlotId` conversions, stale `#[allow(dead_code)]` (`node/mod.rs:61`), `_MultiplexedRecvPlaceholder` (dies with H2), dead `Clock` (comes ALIVE with F3 — purge whichever half remains). Note `leader_balance`/`log_compaction` are cured by *wiring* (C2), not deleting. Status: OPEN · Effort: S · Depends: sequence after C2/F3/H2.
-- **J2 · Kill the `#[path]` double-compile (MO1)** — Why: `heartbeat_batch.rs` compiles TWICE via `#[path]` re-include (clippy `duplicate_mod`); one-line fix (`pub(crate) mod replication`). Evidence: `src/api/registry/heartbeats.rs:13`. Status: OPEN · Effort: S · Depends: —
+- **J2 · Kill the `#[path]` double-compile (MO1)** — Why: `heartbeat_batch.rs` compiles TWICE via `#[path]` re-include (clippy `duplicate_mod`); one-line fix (`pub(crate) mod replication`). Evidence: `src/api/registry/heartbeats.rs:13`. Status: DONE (2026-07-17, dedup pass) — `mod replication` → `pub(crate) mod replication` in `node/mod.rs`; `registry/heartbeats.rs` now imports `crate::api::node::replication::heartbeat_batch` instead of re-including it via `#[path]`, so it compiles once. · Effort: S · Depends: —
 - **J3 · Deduplicate the 5 hottest files (RD3)** — Why: `handle_append_entries` vs `_seeded` ~90% identical (every P0-7-class fix must be applied twice — B12 proves the hazard), vote broadcast+collection ×2, `gather_quorum_acks` arms, `BufferGuard` ×2, snapshot boundary logic ×2, `NotLeader` construction ×6, peer-filter loop ×6. Status: OPEN · Effort: M · Depends: best after A/B fixes land (don't dedupe unfixed code).
 - **J4 · Naming, magic numbers, comment hygiene (RD2/RD5/RD6)** — Why: `scratch_started` (actually check-quorum contact), two meanings of `election_timeout()`, `election_state` (a PRNG), undefined "Seeded" jargon; magic `128`/`16`/`64*1024`×5/`16 MiB`×2/hardcoded `24`; contradictory safety comments; **Spanish in code/comments (violates the repo English-only rule)**; marketing tone ("MAGIC ZEROCOPY" — `storage.rs:59`); shipped sprint artifacts ("(B2)", "(B3)" — `log_compaction.rs:1`). Status: OPEN · Effort: S · Depends: —
 - **J5 · README truth pass (RD8)** — Why: verified still shipping the pre-honest brochure: "sub-microsecond consensus latency", "**548.84 ns**" Tier-1, "38.13 µs" TCP, the misplaced "12.58 M ops/s" memory number in the TCP table (`README.md:3-46`), "Total Zero-Copy / Zero-Allocation" (false as stated — G4), AFIT headline while `async-trait` is still a dep, examples that don't compile, architecture section referencing the orphan `view.rs`. Replace numbers with K4's honest table. Status: OPEN · Effort: S · Depends: K4.

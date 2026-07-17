@@ -107,12 +107,7 @@ where
 
     pub async fn send_heartbeat_once(&mut self) -> Result<(), RaftError> {
         if !self.is_leader() {
-            return Err(RaftError::NotLeader {
-                leader_hint: self
-                    .soft_state
-                    .leader_id
-                    .map(|l| crate::LeaderHint { leader_id: l }),
-            });
+            return Err(self.not_leader_error());
         }
 
         self.ensure_leader_progress_initialized()?;

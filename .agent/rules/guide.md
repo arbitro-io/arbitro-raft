@@ -104,7 +104,11 @@ Scratchpads:
 - `scratch_indexes: Vec<LogIndex>`
 - `scratch_peers: Vec<PeerId>`
 - `scratch_pending: HashMap<PeerId, AppendAttemptState>`
-- `scratch_started: HashMap<PeerId, Instant>`
+
+Not a scratchpad (long-lived state, despite living next to them):
+
+- `last_voter_contact: HashMap<PeerId, Instant>` — the check-quorum contact
+  map (A8/PS8); cleared on step-down, never before reuse
 
 Always call `.clear()` before reuse.
 

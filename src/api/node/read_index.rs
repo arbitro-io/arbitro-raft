@@ -88,13 +88,7 @@ where
         }
         // §4.2.3 transfer freeze: reads redirect exactly like proposals —
         // the incoming leader is about to own the linearization order.
-        if self.leadership_transfer_in_progress() {
-            return Err(RaftError::NotLeader {
-                leader_hint: self
-                    .pending_transfer
-                    .map(|t| crate::LeaderHint { leader_id: t.target }),
-            });
-        }
+        self.check_transfer_freeze()?;
 
         let confirm_term = self.hard_state.current_term;
 
@@ -176,7 +170,7 @@ where
         // identity (not a counter) for the joint-config dual majority.
         let mut acks: Vec<PeerId> = Vec::with_capacity(self.config.peers.len());
         acks.push(self.config.node_id); // the leader counts itself
-        if self.confirm_quorum_reached(&acks) {
+        if self.voter_majority(&acks) {
             return Ok(()); // single-node cluster: self IS the majority
         }
 
@@ -192,7 +186,7 @@ where
             if !self.is_leader() || self.hard_state.current_term != confirm_term {
                 return Err(self.not_leader_error());
             }
-            if self.confirm_quorum_reached(&acks) {
+            if self.voter_majority(&acks) {
                 return Ok(());
             }
             let now = Instant::now();
@@ -251,42 +245,10 @@ where
                 // Normal handling: advances peer progress, steps us down on a
                 // higher term (caught by the loop-top check). A non-fatal
                 // handler error drops the frame, never the confirmation.
-                if let Err(e) = self.handle_inbound(inbound).await {
-                    if e.is_fatal() {
-                        return Err(e);
-                    }
-                    warn!(
-                        node_id = self.config.node_id.0,
-                        error = %e,
-                        "dropping frame after non-fatal handler error during read-index confirmation"
-                    );
-                }
+                self.handle_inbound_tolerant(inbound, "read-index confirmation")
+                    .await?;
             }
         }
     }
 
-    /// Whether `acks` satisfies the confirmation quorum of the EFFECTIVE
-    /// configuration: dual majority while a joint transition is active
-    /// (Raft §4.3), else a simple majority of `config.peers`.
-    #[inline]
-    fn confirm_quorum_reached(&self, acks: &[PeerId]) -> bool {
-        match &self.joint_peers {
-            Some((old_peers, new_peers)) => {
-                super::election::subset_vote_majority(old_peers, acks)
-                    && super::election::subset_vote_majority(new_peers, acks)
-            }
-            None => acks.len() >= super::quorum(self.config.peers.len()),
-        }
-    }
-
-    /// Standard `NotLeader` error with the current redirect hint.
-    #[inline]
-    fn not_leader_error(&self) -> RaftError {
-        RaftError::NotLeader {
-            leader_hint: self
-                .soft_state
-                .leader_id
-                .map(|l| crate::LeaderHint { leader_id: l }),
-        }
-    }
 }

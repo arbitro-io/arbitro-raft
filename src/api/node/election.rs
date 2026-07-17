@@ -123,21 +123,28 @@ where
         }
         Ok(possible_votes)
     }
-    /// Whether the votes in `granted` win the election under the EFFECTIVE
-    /// configuration (A4, audit P1). Raft §4.3 applies joint consensus to
-    /// elections exactly as to commits: while a `C_old,new` transition is
-    /// active a candidate needs a majority of C_old AND a majority of C_new
-    /// independently — a majority of the union alone can crown a leader that
-    /// lacks entries committed under the majority of the side it skipped,
-    /// violating Leader Completeness. Outside a transition this is the plain
-    /// majority (`votes_needed`) of `config.peers`.
-    fn election_quorum_reached(&self, granted: &[crate::PeerId], votes_needed: usize) -> bool {
+    /// The joint-aware "majority of voters" predicate (dup-F1): whether the
+    /// voters in `granted` form a majority of the EFFECTIVE configuration
+    /// (A4, audit P1). Raft §4.3 applies joint consensus to every quorum
+    /// decision identically: while a `C_old,new` transition is active a
+    /// majority of C_old AND a majority of C_new are required independently —
+    /// a majority of the union alone can crown a leader (or confirm a read,
+    /// or keep a quorum lease) that lacks the majority of the side it
+    /// skipped, violating Leader Completeness. Outside a transition this is
+    /// the plain majority of `config.peers`.
+    ///
+    /// This is THE shared predicate for elections (`collect_votes`),
+    /// pre-vote (`campaign_pre_vote`), ReadIndex quorum confirmation
+    /// (`confirm_leadership_quorum`), and the check-quorum lease
+    /// (`check_quorum_active`) — they must never disagree.
+    #[inline]
+    pub(crate) fn voter_majority(&self, granted: &[crate::PeerId]) -> bool {
         match &self.joint_peers {
             Some((old_peers, new_peers)) => {
                 subset_vote_majority(old_peers, granted)
                     && subset_vote_majority(new_peers, granted)
             }
-            None => granted.len() >= votes_needed,
+            None => granted.len() >= super::quorum(self.config.peers.len()),
         }
     }
 
@@ -156,7 +163,7 @@ where
         self.scratch_responders.clear();
         let deadline = Instant::now() + self.election_timeout();
 
-        while !self.election_quorum_reached(&granted, votes_needed)
+        while !self.voter_majority(&granted)
             && self.scratch_responders.len() < possible_votes
         {
             let mut msg_slots = [None; 16];
@@ -205,7 +212,7 @@ where
                 }
             }
 
-            if self.election_quorum_reached(&granted, votes_needed) {
+            if self.voter_majority(&granted) {
                 return Ok(true);
             }
 
@@ -216,16 +223,7 @@ where
                 // skipping is strictly safer than panicking (B13).
                 let Some(inbound) = *slot else { continue };
                 if !matches!(inbound.message, RaftMessage::RequestVoteResp(_)) {
-                    if let Err(e) = self.handle_inbound(inbound).await {
-                        if e.is_fatal() {
-                            return Err(e);
-                        }
-                        tracing::warn!(
-                            node_id = self.config.node_id.0,
-                            error = %e,
-                            "dropping frame after non-fatal handler error during campaign"
-                        );
-                    }
+                    self.handle_inbound_tolerant(inbound, "campaign").await?;
                 }
             }
 
@@ -244,7 +242,7 @@ where
         // Loop exit condition already guarantees role/term were unchanged since
         // the last check above (the `while` body ran to completion), so the
         // accumulated `granted` votes are all for `term`.
-        Ok(self.election_quorum_reached(&granted, votes_needed))
+        Ok(self.voter_majority(&granted))
     }
 
     pub(crate) async fn handle_request_vote(
@@ -362,14 +360,20 @@ where
             return Ok(false);
         }
 
-        let mut votes = 1usize;
+        // Voters that granted the pre-vote, self included. Tracked by identity
+        // (not a plain counter) so the §4.3 joint dual-majority rule applies
+        // to pre-vote exactly as to real elections (dup-F1): a union-only
+        // majority during a joint transition must not clear the pre-vote gate
+        // when the subsequent real election would reject the same voter set.
+        let mut granted: Vec<crate::PeerId> = Vec::with_capacity(self.config.peers.len());
+        granted.push(self.config.node_id);
         self.scratch_responders.clear();
         // Absolute deadline: processing non-response messages (concurrent
         // PreVote requests) must not extend the collection window, otherwise
         // split-vote persists indefinitely with 3+ simultaneous campaigns.
         let deadline = Instant::now() + self.election_timeout();
 
-        while votes < votes_needed && self.scratch_responders.len() < possible_votes {
+        while !self.voter_majority(&granted) && self.scratch_responders.len() < possible_votes {
             let mut msg_slots = [None; 16];
             let messages_count = self
                 .drain_inbound_frames(deadline, inbound_buf, &mut msg_slots)
@@ -405,11 +409,11 @@ where
                         && resp.vote_granted != 0
                         && self.config.peers.contains(&from)
                     {
-                        votes += 1;
+                        granted.push(from);
                         debug!(
                             node_id = self.config.node_id.0,
                             voter = from.0,
-                            votes,
+                            votes = granted.len(),
                             needed = votes_needed,
                             "pre-vote granted"
                         );
@@ -417,7 +421,7 @@ where
                 }
             }
 
-            if votes >= votes_needed {
+            if self.voter_majority(&granted) {
                 return Ok(true);
             }
 
@@ -441,7 +445,7 @@ where
             }
         }
 
-        Ok(votes >= votes_needed)
+        Ok(self.voter_majority(&granted))
     }
 
     pub(crate) async fn handle_pre_vote(

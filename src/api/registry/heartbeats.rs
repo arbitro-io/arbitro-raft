@@ -2,16 +2,11 @@
 //! registry: [`RaftGroupRegistry::tick_heartbeats`].
 //!
 //! `send_batched_heartbeats` lives at
-//! `crate::api::node::replication::heartbeat_batch`, but `node::replication`
-//! is a private module owned by `src/api/node/mod.rs` (out of scope for this
-//! file), so its contents are not path-reachable from `api::registry` today.
-//! Rather than reach into that off-limits file, the implementation is
-//! included directly here via `#[path]` — a plain, legal Rust mechanism that
-//! keeps this change fully contained to this file. Once `node::replication`
-//! is made `pub(crate)`, this inline inclusion can be deleted in favor of a
-//! normal `use crate::api::node::replication::heartbeat_batch::...` import.
-#[path = "../node/replication/heartbeat_batch.rs"]
-mod heartbeat_batch_inline;
+//! `crate::api::node::replication::heartbeat_batch`; `node::replication` is
+//! `pub(crate)`, so the one compiled copy is imported directly (dup-J2 —
+//! this file previously re-included the source via `#[path]`, compiling it
+//! twice).
+use crate::api::node::replication::heartbeat_batch as heartbeat_batch_inline;
 
 use std::sync::Arc;
 
