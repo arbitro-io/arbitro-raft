@@ -197,6 +197,37 @@ pub(crate) struct DispatchShared<R> {
     pub(crate) inner: Arc<Mutex<DispatchState<R>>>,
 }
 
+impl<R> DispatchShared<R> {
+    /// Poison-tolerant lock — the B9 dispatch-layer poison policy.
+    ///
+    /// If a previous holder panicked while holding the mutex, recover the
+    /// guard with [`PoisonError::into_inner`] instead of cascading the panic
+    /// through every subsequent `lock().unwrap()` (which would kill the whole
+    /// dispatch layer for one panicked waiter/responder).
+    ///
+    /// Recovery is sound here because every critical section over
+    /// [`DispatchState`] mutates through single-step writes only:
+    /// * assign one `slot.state` (a move of an already-built value),
+    /// * assign `completion` (single `Option` field),
+    /// * push to / drain `wakers` (a `Vec` — `Drain`'s drop clears the tail
+    ///   even if a `waker.wake()` panics mid-drain).
+    ///
+    /// There is no multi-field invariant a mid-section panic can leave torn:
+    /// clones/decodes that may panic (`R::clone`, waker impls) all run either
+    /// before the write or after the state is already consistent. The worst
+    /// post-panic outcome is a waiter that was not woken by the panicking
+    /// waker — a liveness bug in THAT waker, not corrupted dispatch state —
+    /// and `completion` still reads correctly for every other observer.
+    ///
+    /// Every lock of `inner` in the dispatch layer MUST go through this
+    /// helper; do not call `inner.lock().unwrap()` directly.
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, DispatchState<R>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 impl<R> Clone for DispatchShared<R> {
     fn clone(&self) -> Self {
         Self {

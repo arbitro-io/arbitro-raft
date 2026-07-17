@@ -1,0 +1,120 @@
+name: CI
+
+# F10 — CI pipeline for arbitro-raft (standalone repo, no path deps).
+#
+# Gate policy (validated locally on rustc 1.92.0, 2026-07-17):
+#   required:      test (build + full suite, single-threaded), clippy (-W),
+#                  miri (wire codec + scratch arena — the hot-path unsafe)
+#   informational: fmt (pre-existing drift), ignored-tests (ratchet; 0 today)
+#
+# NOTE: do NOT set a global `RUSTFLAGS: -D warnings` (as sibling `arbitro`
+# does) — the lib currently carries 6 dead-code warnings owned by
+# MASTER_TODO J1; a global -D would fail every job. Ratchet once J1 lands.
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:     [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Build + full test suite ────────────────────────────────────────────
+  # The suite REQUIRES --test-threads=1 (timing-sensitive multi-node
+  # scenarios share ports/clocks; parallel runs interfere).
+  test:
+    name: build + test (1.92, single-threaded)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # Pin: no rust-toolchain.toml / rust-version in Cargo.toml yet
+          # (MSRV pin tracked in MASTER_TODO J6); audit baseline is 1.92.
+          toolchain: 1.92.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked
+      - name: Test (single-threaded)
+        run: cargo test --locked -- --test-threads=1
+
+  # ── Clippy ─────────────────────────────────────────────────────────────
+  # -W clippy::all (warn, not deny): `-D warnings` currently fails on
+  # pre-existing dead code (iter_entries_mut, extra_pre_vote_delay, ...)
+  # plus ptr_arg/useless_vec.
+  # TODO(J1): after the dead-code purge, ratchet to `-D warnings`.
+  clippy:
+    name: clippy (-W clippy::all)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -W clippy::all
+
+  # ── rustfmt (informational) ────────────────────────────────────────────
+  # Non-blocking: the tree has pre-existing formatting drift (benches and
+  # parts of src/). Fixing it means touching code — out of scope for F10.
+  # TODO(WS-J polish): run `cargo fmt`, then drop continue-on-error.
+  fmt:
+    name: rustfmt (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+          components: rustfmt
+      - run: cargo fmt --check
+
+  # ── Miri over the hot-path unsafe (B1's insurance) ────────────────────
+  # Targeted + fast (both finish in seconds locally): the wire codec
+  # (tests/raft_wire.rs — zerocopy views over untrusted peer bytes) and
+  # the scratch slot arena (src/api/node/scratch.rs lib tests). Both are
+  # deterministic (no real-time/tokio timers), so this job is REQUIRED.
+  miri:
+    name: miri (wire codec + scratch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - name: Miri — wire codec
+        run: cargo miri test --test raft_wire
+      - name: Miri — scratch arena
+        run: cargo miri test --lib scratch
+
+  # ── Ignored-tests ratchet (informational) ──────────────────────────────
+  # Keeps the #[ignore] graveyard visible. Currently 0 ignored tests
+  # (C3 un-ignored the snapshot ones; A2 the remove-node one) — this job
+  # exists so any NEW ignore shows up in CI output instead of vanishing.
+  ignored-tests:
+    name: ignored tests (report)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -- --ignored --test-threads=1
+
+  # ── arbitro-server cluster feature: NOT HERE ───────────────────────────
+  # arbitro-server lives in the sibling `arbitro` repo (separate git root);
+  # its CI already has a `cluster-build` job (arbitro/.github/workflows/
+  # ci.yml) that checks out arbitro-raft alongside it. No job needed here.

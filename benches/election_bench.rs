@@ -357,6 +357,7 @@ async fn spawn_node(
         node_id: my_id,
         cluster_id: ClusterId(1),
         peers: all_peers.clone(),
+        learners: Vec::new(),
         bootstrap_peers: addrs
             .iter()
             .map(|(&id, &addr)| BootstrapPeer { id, addr })

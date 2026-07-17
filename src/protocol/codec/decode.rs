@@ -4,10 +4,10 @@ use crate::{InboundRaftMessage, PeerId, RaftError, RaftMessage};
 
 use super::wire::{
     AppendEntries, AppendEntriesResp, EntryHeader, InstallSnapshot, InstallSnapshotResp,
-    RaftFrameHeader, RequestVote, RequestVoteResp, KIND_APPEND_ENTRIES, KIND_APPEND_ENTRIES_RESP,
-    KIND_APPEND_ENTRIES_SEEDED, KIND_CUSTOM, KIND_CUSTOM_RESPONSE, KIND_INSTALL_SNAPSHOT,
-    KIND_INSTALL_SNAPSHOT_RESP, KIND_PRE_VOTE, KIND_PRE_VOTE_RESP, KIND_REQUEST_VOTE,
-    KIND_REQUEST_VOTE_RESP, RAFT_MAGIC, RAFT_VERSION,
+    RaftFrameHeader, RequestVote, RequestVoteResp, TimeoutNow, KIND_APPEND_ENTRIES,
+    KIND_APPEND_ENTRIES_RESP, KIND_APPEND_ENTRIES_SEEDED, KIND_CUSTOM, KIND_CUSTOM_RESPONSE,
+    KIND_INSTALL_SNAPSHOT, KIND_INSTALL_SNAPSHOT_RESP, KIND_PRE_VOTE, KIND_PRE_VOTE_RESP,
+    KIND_REQUEST_VOTE, KIND_REQUEST_VOTE_RESP, KIND_TIMEOUT_NOW, RAFT_MAGIC, RAFT_VERSION,
 };
 
 // ── Shared parse helper ───────────────────────────────────────────────────────
@@ -179,6 +179,13 @@ pub fn decode_message<'a>(frame: &'a [u8]) -> Result<InboundRaftMessage<'a>, Raf
                 ));
             }
             RaftMessage::InstallSnapshotResp(wire)
+        }
+        KIND_TIMEOUT_NOW => {
+            let (wire, body_rest) = parse_prefix::<TimeoutNow>(body, "timeout now body")?;
+            if !body_rest.is_empty() {
+                return Err(RaftError::Protocol("timeout now trailing bytes".into()));
+            }
+            RaftMessage::TimeoutNow(wire)
         }
         KIND_CUSTOM => RaftMessage::Custom(body),
         KIND_CUSTOM_RESPONSE => RaftMessage::CustomResponse(body),

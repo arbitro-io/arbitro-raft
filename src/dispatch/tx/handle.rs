@@ -19,21 +19,21 @@ pub struct DispatchHandle<R> {
 
 impl<R: Clone> DispatchHandle<R> {
     pub fn tx_id(&self) -> u64 {
-        self.shared.inner.lock().unwrap().tx_id
+        self.shared.lock().tx_id
     }
 
     pub fn command(&self) -> u8 {
-        self.shared.inner.lock().unwrap().command
+        self.shared.lock().command
     }
 
     pub fn is_ready(&self) -> bool {
-        let mut guard = self.shared.inner.lock().unwrap();
+        let mut guard = self.shared.lock();
         guard.check_timeout();
         guard.completion.is_some()
     }
 
     pub fn try_result(&self) -> Option<Result<DispatchResult<R>, RaftError>> {
-        let mut guard = self.shared.inner.lock().unwrap();
+        let mut guard = self.shared.lock();
         guard.check_timeout();
         guard.completion.as_ref().map(|c| match c {
             DispatchCompletion::Succeeded(r) => Ok(r.clone()),
@@ -42,11 +42,11 @@ impl<R: Clone> DispatchHandle<R> {
     }
 
     pub async fn wait(&self) -> Result<DispatchResult<R>, RaftError> {
-        let deadline: Option<Instant> = self.shared.inner.lock().unwrap().deadline();
+        let deadline: Option<Instant> = self.shared.lock().deadline();
         let mut timeout_sleep: Option<Pin<Box<Sleep>>> = None;
 
         poll_fn(move |cx| {
-            let mut guard = self.shared.inner.lock().unwrap();
+            let mut guard = self.shared.lock();
             match &guard.completion {
                 Some(DispatchCompletion::Succeeded(r)) => return Poll::Ready(Ok(r.clone())),
                 Some(DispatchCompletion::Failed(f)) => {
@@ -103,7 +103,7 @@ impl<R: Clone> DispatchTx<R> {
         peer: PeerId,
         next_state: impl FnOnce(&DispatchPeerState<R>) -> Result<DispatchPeerState<R>, RaftError>,
     ) -> Result<(), RaftError> {
-        let mut guard = self.shared.inner.lock().unwrap();
+        let mut guard = self.shared.lock();
         if guard.completion.is_some() {
             return Ok(());
         }
@@ -155,6 +155,19 @@ impl<R: Clone> DispatchTx<R> {
 
     pub fn disconnect(&self, peer: PeerId) -> Result<(), RaftError> {
         self.update_peer_state(peer, |_| Ok(DispatchPeerState::Disconnected))
+    }
+
+    /// Resolve the WHOLE transaction with `failure`, waking every parked
+    /// waiter. A no-op when a completion already exists (first resolution
+    /// wins, same rule as the per-peer paths). Used by the node on
+    /// leadership loss so `step_down` never strands a waiter (A5 / C7).
+    pub(crate) fn abort(&self, failure: DispatchFailure) {
+        let mut guard = self.shared.lock();
+        if guard.completion.is_some() {
+            return;
+        }
+        guard.completion = Some(DispatchCompletion::Failed(failure));
+        guard.wake_all();
     }
 }
 

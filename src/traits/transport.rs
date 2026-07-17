@@ -17,6 +17,32 @@ use crate::{PeerId, RaftError};
 /// **Recv:** The transport reads raw bytes from the wire and returns them via
 /// `recv_frame`. `RaftNode` decodes them with `decode_message_view` and
 /// dispatches to the appropriate handler.
+///
+/// # Security contract (production transports)
+///
+/// The Raft node **trusts the transport** for peer authentication. The wire
+/// frame carries a claimed sender id (`RaftFrameHeader.from`), and the node
+/// uses it directly: votes are granted to it, append/snapshot acks are
+/// credited to `PeerId(from)`, and membership checks only verify that the
+/// *claimed* id is a member. The node cannot detect impersonation on its own,
+/// so a production transport MUST:
+///
+/// 1. **Confidentiality + mutual peer authentication.** Consensus traffic
+///    must run over a mutually-authenticated, encrypted channel (e.g. mTLS
+///    with a cluster CA, or an equivalent authenticated transport). An
+///    unauthenticated plaintext transport lets any process that can reach
+///    the port vote, replicate, and forge quorums.
+/// 2. **Identity binding (anti-spoofing).** Bind each connection to the
+///    authenticated identity's `PeerId` (e.g. derived from the peer
+///    certificate's SAN/CN) and **reject any received frame whose header
+///    `from` field does not equal the connection's authenticated `PeerId`**.
+///    Rejected frames must be dropped before they reach `recv_frame` /
+///    `recv_frame_timeout`; counting them for observability is recommended.
+///    Without this binding, any authenticated peer can still impersonate any
+///    other member and forge acknowledgements toward a false quorum.
+///
+/// In-process/test transports (loopback channels, benches) are exempt: they
+/// are only reachable from the test harness itself.
 pub trait RaftTransport: Send + Sync {
     /// Send a Raft message split into multiple slices (Vectored I/O).
     ///

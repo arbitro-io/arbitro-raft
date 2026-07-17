@@ -63,6 +63,10 @@ impl<V> PeerMap<V> {
         }
     }
 
+    // Kept for API completeness; the last caller (the commit-quorum gather)
+    // now iterates by VOTER identity so learner progress is never read
+    // there (A13).
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn values(&self) -> impl Iterator<Item = &V> {
         self.entries.iter().map(|(_, v)| v)
@@ -99,34 +103,53 @@ pub(crate) enum AppendAdvance {
     Ignored,
 }
 
-/// Stalled snapshot transfers are evicted after this duration.
-pub(crate) const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(60);
-
 #[derive(Debug, Clone)]
 pub(crate) struct PendingSnapshot {
     pub(crate) meta: SnapshotMeta,
     pub(crate) bytes: Vec<u8>,
     /// Wall-clock deadline after which this transfer is evicted as stalled.
+    /// Refreshed on every accepted chunk (progress), so only a transfer that
+    /// makes NO progress for the configured window is evicted (C4 / P1-5).
     pub(crate) deadline: Instant,
 }
 
 impl PendingSnapshot {
-    pub(crate) fn new(meta: SnapshotMeta) -> Self {
+    pub(crate) fn new(meta: SnapshotMeta, stall_timeout: Duration) -> Self {
         Self {
             meta,
             bytes: Vec::new(),
-            deadline: Instant::now() + SNAPSHOT_DEADLINE,
+            deadline: Instant::now() + stall_timeout, // F3
         }
     }
 
     /// Reset the transfer (new snapshot or re-start) and refresh the deadline.
-    pub(crate) fn reset(&mut self, meta: SnapshotMeta) {
+    pub(crate) fn reset(&mut self, meta: SnapshotMeta, stall_timeout: Duration) {
         self.meta = meta;
         self.bytes.clear();
-        self.deadline = Instant::now() + SNAPSHOT_DEADLINE;
+        self.touch(stall_timeout);
+    }
+
+    /// Record progress: push the stall deadline forward.
+    pub(crate) fn touch(&mut self, stall_timeout: Duration) {
+        self.deadline = Instant::now() + stall_timeout; // F3
     }
 
     pub(crate) fn is_expired(&self) -> bool {
-        Instant::now() > self.deadline
+        Instant::now() > self.deadline // F3
     }
+}
+
+/// Leader-side per-peer snapshot-install attempt tracking (PS7 / C4).
+///
+/// A follower that keeps rejecting or re-requesting a snapshot must not be
+/// able to drive an unbounded re-stream loop: after
+/// `limits.snapshot_max_attempts_per_peer` consecutive failed attempts the
+/// leader refuses further installs to that peer until
+/// `limits.snapshot_attempt_cooldown_ms` elapses, then resets and retries.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SnapshotAttempts {
+    /// Consecutive failed install attempts since the last success/reset.
+    pub(crate) attempts: u32,
+    /// While `Some(t)` and `now < t`, installs to this peer are refused.
+    pub(crate) cooldown_until: Option<Instant>,
 }

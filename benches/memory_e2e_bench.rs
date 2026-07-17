@@ -142,11 +142,11 @@ impl RaftStorage for SeededMemStorage {
         }))
     }
 
-    fn for_each_payload(
-        &self,
+    fn for_each_payload<'a>(
+        &'a self,
         from: LogIndex,
         to: LogIndex,
-        callback: &mut dyn FnMut(&[u8]),
+        callback: &mut dyn FnMut(&'a [u8]),
     ) -> Result<(), RaftError> {
         let offsets = self.payload_offsets.lock().unwrap();
         let data = self.data.lock().unwrap();
@@ -158,7 +158,12 @@ impl RaftStorage for SeededMemStorage {
 
         for i in start..end {
             let (off, len) = offsets[i];
-            callback(&data[off..off + len]);
+            // SAFETY: Benchmark-only stable pointer trick, same as
+            // `read_entry_headers` above — the data buffer only grows and is
+            // never truncated while the node borrows the storage.
+            let payload =
+                unsafe { std::mem::transmute::<&[u8], &'a [u8]>(&data[off..off + len]) };
+            callback(payload);
         }
         Ok(())
     }
@@ -456,11 +461,11 @@ impl RaftStorage for MemStorage {
     ) -> Result<Option<&[EntryHeader]>, RaftError> {
         Ok(None)
     }
-    fn for_each_payload(
-        &self,
+    fn for_each_payload<'a>(
+        &'a self,
         _from: LogIndex,
         _to: LogIndex,
-        _callback: &mut dyn FnMut(&[u8]),
+        _callback: &mut dyn FnMut(&'a [u8]),
     ) -> Result<(), RaftError> {
         Ok(())
     }
@@ -754,6 +759,7 @@ fn make_config(node_id: PeerId) -> NodeConfig {
         node_id,
         cluster_id: ClusterId(1),
         peers: vec![PeerId(1), PeerId(2), PeerId(3)],
+        learners: Vec::new(),
         bootstrap_peers: vec![
             BootstrapPeer {
                 id: PeerId(1),

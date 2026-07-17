@@ -35,8 +35,23 @@ where
         // higher-term RPC and step this node down; we must not keep sending
         // InstallSnapshot frames as "leader" after that happens.
         let start_term = self.hard_state.current_term;
+        // PS7 in-call guard: bound the number of response rounds that make no
+        // forward progress (e.g. a follower NACK-ing from offset 0 forever),
+        // so a hostile or wedged peer cannot drive an unbounded re-stream loop
+        // inside a single install.
+        let max_no_progress = self.config.limits.snapshot_max_attempts_per_peer.max(1);
+        let mut no_progress_rounds: u32 = 0;
+        // OPS-2 chunked yielding: a large install must not starve heartbeats
+        // to the OTHER followers — interleave bare heartbeats at the normal
+        // heartbeat cadence so no spurious election fires mid-install.
+        let heartbeat_interval = Duration::from_millis(self.config.timing.heartbeat_ms.max(1));
+        let mut last_heartbeat = std::time::Instant::now(); // F3
 
         loop {
+            if last_heartbeat.elapsed() >= heartbeat_interval {
+                self.send_bare_heartbeats_except(peer).await;
+                last_heartbeat = std::time::Instant::now(); // F3
+            }
             offset = offset.min(total_len);
             let end = offset
                 .checked_add(chunk_size)
@@ -93,8 +108,7 @@ where
                                 "install snapshot next_offset past total".into(),
                             ));
                         }
-                        offset = next_off;
-                        if resp.accepted != 0 && (done || offset >= total_len) {
+                        if resp.accepted != 0 && (done || next_off >= total_len) {
                             info!(
                                 node_id = self.config.node_id.0,
                                 peer = peer.0,
@@ -103,6 +117,28 @@ where
                             );
                             return Ok(());
                         }
+                        // PS7: a response that does not advance the transfer
+                        // (rewind or same offset without completion) burns one
+                        // no-progress round; the cap turns an endless follower-
+                        // driven re-stream loop into a bounded, retryable error.
+                        if resp.accepted != 0 && next_off > offset {
+                            no_progress_rounds = 0;
+                        } else {
+                            no_progress_rounds += 1;
+                            if no_progress_rounds >= max_no_progress {
+                                tracing::warn!(
+                                    node_id = self.config.node_id.0,
+                                    peer = peer.0,
+                                    rounds = no_progress_rounds,
+                                    "aborting snapshot install: peer made no progress"
+                                );
+                                return Err(RaftError::Snapshot(
+                                    "install snapshot aborted: no-progress round cap exceeded"
+                                        .into(),
+                                ));
+                            }
+                        }
+                        offset = next_off;
                         break;
                     }
                     message => {
@@ -166,7 +202,9 @@ where
         }
 
         // Evict any stalled snapshot transfers before processing new chunks.
-        self.pending_snapshots.retain(|_, snap| !snap.is_expired());
+        // The run loop also sweeps on every tick (timer-based, C4/P1-5); this
+        // call only keeps the handler correct when driven standalone.
+        self.evict_stalled_snapshots();
 
         if msg_term.0 < self.hard_state.current_term.0 {
             let resp = InstallSnapshotResp {
@@ -187,13 +225,15 @@ where
         self.soft_state.is_leader = false;
         self.soft_state.leader_id = Some(leader_id);
 
+        let stall_timeout =
+            Duration::from_millis(self.config.limits.snapshot_stall_timeout_ms);
         let pending = self
             .pending_snapshots
             .entry(from)
-            .or_insert_with(|| PendingSnapshot::new(meta.clone()));
+            .or_insert_with(|| PendingSnapshot::new(meta.clone(), stall_timeout));
 
         if msg_offset == 0 || pending.meta != meta {
-            pending.reset(meta.clone());
+            pending.reset(meta.clone(), stall_timeout);
         }
 
         if pending.bytes.len() as u64 != msg_offset {
@@ -231,6 +271,9 @@ where
         }
 
         pending.bytes.extend_from_slice(payload);
+        // Accepted chunk = progress: refresh the stall deadline so a slow but
+        // advancing transfer is never evicted mid-flight.
+        pending.touch(stall_timeout);
         let next_offset = pending.bytes.len() as u64;
 
         if msg_done {
@@ -250,11 +293,12 @@ where
             // otherwise the snapshot's prefix is safe to drop.
             let last_idx = completed.meta.last_included_index;
             let last_term = completed.meta.last_included_term;
-            let mut dummy = [0u8; 8];
+            // B10: term-only probe — no payload read, no undersized-buffer
+            // reliance.
             let boundary_conflict = self
                 .storage
-                .entry_at(last_idx, &mut dummy)?
-                .map(|e| e.term != last_term)
+                .term_at(last_idx)?
+                .map(|t| t != last_term)
                 .unwrap_or(false);
             if boundary_conflict {
                 self.storage.truncate_suffix(LogIndex(1))?;
@@ -267,6 +311,9 @@ where
             self.log_metadata
                 .clear(LogIndex(last_idx.0.saturating_add(1)));
             self.cached_last_log = (last_idx, last_term);
+            // §7: remember the boundary — its entry just left the log but
+            // its term must stay answerable (prev_log checks, term_at).
+            self.snapshot_boundary = (last_idx, last_term);
 
             // Hand off to the outer apply loop. Source-of-truth is the storage
             // layer (`load_snapshot`) — this call is a discoverable hook point.

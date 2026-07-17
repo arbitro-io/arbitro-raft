@@ -4,6 +4,12 @@ use crate::{PeerId, RaftError};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DispatchFailure {
     Timeout,
+    /// The dispatching node lost leadership (stepped down) while the
+    /// transaction was still in flight. In-flight custom dispatches are
+    /// leader-epoch-scoped: on step-down every pending waiter is resolved
+    /// with this deterministic failure instead of parking forever
+    /// (A5 / C7 / ERR-7). Surfaces to `wait()` as [`RaftError::NotLeader`].
+    LostLeadership,
     Impossible(String),
     Failed(String),
 }
@@ -12,6 +18,7 @@ impl From<DispatchFailure> for RaftError {
     fn from(value: DispatchFailure) -> Self {
         match value {
             DispatchFailure::Timeout => RaftError::Dispatch("dispatch timed out".into()),
+            DispatchFailure::LostLeadership => RaftError::NotLeader { leader_hint: None },
             DispatchFailure::Impossible(msg) | DispatchFailure::Failed(msg) => {
                 RaftError::Dispatch(msg)
             }

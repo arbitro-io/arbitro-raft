@@ -5,8 +5,13 @@ pub fn validate_node_config(cfg: &NodeConfig) -> Result<(), RaftError> {
     if cfg.peers.is_empty() {
         return Err(RaftError::InvalidConfig("peers must not be empty"));
     }
-    if !cfg.peers.contains(&cfg.node_id) {
-        return Err(RaftError::InvalidConfig("peers must include node_id"));
+    // A13: a node boots either as a VOTER (its id is in `peers`) or as a
+    // LEARNER (its id is in `learners`). A node in neither set is a
+    // misconfiguration — it could never participate in the cluster.
+    if !cfg.peers.contains(&cfg.node_id) && !cfg.learners.contains(&cfg.node_id) {
+        return Err(RaftError::InvalidConfig(
+            "node_id must appear in peers (voter) or learners (non-voting member)",
+        ));
     }
     if cfg.bootstrap_peers.is_empty() {
         return Err(RaftError::InvalidConfig(
@@ -29,6 +34,23 @@ pub fn validate_node_config(cfg: &NodeConfig) -> Result<(), RaftError> {
         if !seen.insert(peer) {
             return Err(RaftError::InvalidConfig(
                 "peers must not contain duplicates",
+            ));
+        }
+    }
+
+    // A13: learners must be duplicate-free and disjoint from the voter set —
+    // a peer present in both would be fanned out to twice and, worse, could
+    // blur the voter/learner boundary the quorum math depends on.
+    let mut seen_learners = HashSet::with_capacity(cfg.learners.len());
+    for learner in &cfg.learners {
+        if !seen_learners.insert(learner) {
+            return Err(RaftError::InvalidConfig(
+                "learners must not contain duplicates",
+            ));
+        }
+        if cfg.peers.contains(learner) {
+            return Err(RaftError::InvalidConfig(
+                "learners must be disjoint from peers",
             ));
         }
     }

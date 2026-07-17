@@ -7,7 +7,7 @@ use crate::{LogIndex, PeerId, RaftError, RaftStorage, RaftTransport, SnapshotMet
 /// transfer completes and has been persisted via `storage.save_snapshot`.
 ///
 /// Today the outer apply loop discovers a freshly-installed snapshot by
-/// calling `storage.load_snapshot()` and comparing its meta against
+/// calling `storage.load_snapshot_meta()` and comparing it against
 /// `node.last_applied()`. This function is intentionally a no-op so the
 /// wiring is discoverable and future sprints can flip to an in-memory
 /// dirty flag without changing `snapshot.rs`.
@@ -35,15 +35,97 @@ where
     let Some((next_index, _match_index)) = node.peer_progress(peer) else {
         return Ok(false);
     };
-    let Some((meta, bytes)) = node.storage.load_snapshot()? else {
+    // C5/P4: probe the snapshot META only for the bail checks — this helper
+    // runs on heartbeat-driven escalation probes, so the common "peer does
+    // not need a snapshot" outcome must not pay an O(snapshot) payload read.
+    let Some(meta) = node.storage.load_snapshot_meta()? else {
         return Ok(false);
     };
     // Peer can still be caught up via AppendEntries — no snapshot needed.
     if next_index.0 > meta.last_included_index.0 {
         return Ok(false);
     }
-    node.install_snapshot_once(peer, meta, &bytes).await?;
-    Ok(true)
+
+    // PS7 per-peer attempt cap: a follower that keeps failing (or gaming)
+    // installs must not drive an unbounded re-stream loop. After
+    // `limits.snapshot_max_attempts_per_peer` consecutive failures the peer
+    // is refused for `limits.snapshot_attempt_cooldown_ms`, then the counter
+    // resets and installs are allowed again.
+    let max_attempts = node.config.limits.snapshot_max_attempts_per_peer.max(1);
+    let cooldown =
+        std::time::Duration::from_millis(node.config.limits.snapshot_attempt_cooldown_ms);
+    let now = std::time::Instant::now(); // F3
+    {
+        let state = node.snapshot_attempts.entry(peer).or_default();
+        if let Some(until) = state.cooldown_until {
+            if now < until {
+                node.metrics.inc_snapshot_installs_refused();
+                tracing::debug!(
+                    node_id = node.config.node_id.0,
+                    peer = peer.0,
+                    "refusing snapshot install: peer in attempt-cap cooldown"
+                );
+                return Ok(false);
+            }
+            // Cooldown elapsed — forgive and start a fresh attempt budget.
+            state.attempts = 0;
+            state.cooldown_until = None;
+        }
+        if state.attempts >= max_attempts {
+            state.cooldown_until = Some(now + cooldown);
+            node.metrics.inc_snapshot_installs_refused();
+            tracing::warn!(
+                node_id = node.config.node_id.0,
+                peer = peer.0,
+                attempts = state.attempts,
+                cooldown_ms = node.config.limits.snapshot_attempt_cooldown_ms,
+                "snapshot install attempt cap reached; backing off peer"
+            );
+            return Ok(false);
+        }
+        // Count the attempt up front; a success below clears the entry.
+        state.attempts += 1;
+    }
+
+    // C5/P4: an install is actually going to be attempted — only NOW pay the
+    // full snapshot payload read. The run loop is single-threaded, so the
+    // snapshot cannot change between the meta probe above and this load.
+    let Some((meta, bytes)) = node.storage.load_snapshot()? else {
+        return Ok(false);
+    };
+
+    let boundary = meta.last_included_index;
+    match node.install_snapshot_once(peer, meta, &bytes).await {
+        Ok(()) => {
+            // Successful install — reset the peer's attempt budget.
+            node.snapshot_attempts.remove(&peer);
+            // Raft §7 hand-off (C3): the follower's state now matches the
+            // leader through the snapshot boundary, so re-anchor its progress
+            // there. Without this the leader keeps probing compacted indexes
+            // below the boundary — the probe read fails, the C3 trigger fires
+            // again, and the same snapshot is re-streamed until the C4
+            // attempt cap kicks in. With it, the next heartbeat tick resumes
+            // plain AppendEntries at `boundary + 1` (A9 takes over the tail),
+            // and the advanced `match_index` is what un-clamps C2's
+            // conservative compaction horizon. Both values are capped by the
+            // leader's own last log (same rationale as the `next_index_cap`
+            // clamp in `replication/handler.rs`) so a snapshot whose boundary
+            // is ahead of the log can never inflate progress past the tip.
+            let last_log = node.cached_last_log.0;
+            let matched = LogIndex(boundary.0.min(last_log.0));
+            let next = LogIndex(boundary.0.saturating_add(1).min(last_log.0.saturating_add(1)));
+            if let Some(progress) = node.peer_progress.get_mut(&peer) {
+                if matched > progress.match_index {
+                    progress.match_index = matched;
+                }
+                if next > progress.next_index {
+                    progress.next_index = next;
+                }
+            }
+            Ok(true)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// If the on-disk snapshot is more recent than the state machine's
@@ -64,12 +146,22 @@ where
     T: RaftTransport,
     SM: StateMachine,
 {
-    let Some((meta, bytes)) = node.storage.load_snapshot()? else {
+    // C5/P4: probe the snapshot META only for the idempotence bail. This
+    // helper runs at the top of EVERY apply batch, and once any snapshot
+    // exists the overwhelmingly common steady-state outcome is "already
+    // applied" — which must not pay an O(snapshot) payload read per batch.
+    let Some(meta) = node.storage.load_snapshot_meta()? else {
         return Ok(false);
     };
     if meta.last_included_index.0 <= node.last_applied().0 {
         return Ok(false);
     }
+    // A restore is actually warranted — only NOW load the full snapshot
+    // bytes. Single-threaded run loop: the snapshot cannot change between
+    // the meta probe and this load.
+    let Some((meta, bytes)) = node.storage.load_snapshot()? else {
+        return Ok(false);
+    };
     sm.restore(&bytes)?;
     // `set_last_applied` debug-asserts `idx <= commit_index`; the
     // snapshot-install handler already advanced commit_index, but a
@@ -87,11 +179,11 @@ where
     // restarted follower keeps a stale log that AppendEntries §7 rejects.
     let last_idx = meta.last_included_index;
     let last_term = meta.last_included_term;
-    let mut dummy = [0u8; 8];
+    // B10: term-only probe — no payload read, no undersized-buffer reliance.
     let boundary_conflict = node
         .storage
-        .entry_at(last_idx, &mut dummy)?
-        .map(|e| e.term != last_term)
+        .term_at(last_idx)?
+        .map(|t| t != last_term)
         .unwrap_or(false);
     if boundary_conflict {
         node.storage.truncate_suffix(LogIndex(1))?;
@@ -102,5 +194,12 @@ where
     node.log_metadata
         .clear(LogIndex(last_idx.0.saturating_add(1)));
     node.cached_last_log = (last_idx, last_term);
+    // §7: the boundary entry was just discarded from the log — remember its
+    // (index, term) so prev_log/term_at reads at the boundary keep working.
+    node.snapshot_boundary = (last_idx, last_term);
+    // The snapshot replaced everything applied so far — the compaction debt
+    // it represented is settled (C2).
+    node.compaction_debt_entries = 0;
+    node.compaction_debt_bytes = 0;
     Ok(true)
 }

@@ -69,37 +69,39 @@ where
     S: crate::RaftStorage,
     T: crate::RaftTransport,
 {
-    pub(super) fn append_propose_entries(
+    /// Build the propose batch into `entries` (a dock-recycled local vec
+    /// owned by the caller — see `propose_batch_once`) and append it to
+    /// storage. The entries borrow `payloads` directly; the borrow checker
+    /// verifies the lifetime, so no 'static laundering is needed (US3).
+    pub(super) fn append_propose_entries<'a>(
         &mut self,
-        payloads: &[&[u8]],
+        payloads: &[&'a [u8]],
+        entries: &mut Vec<LogEntry<'a>>,
     ) -> Result<LogIndex, RaftError> {
         let last_log_index = self.cached_last_log.0;
-        self.scratch_entries.clear();
         self.scratch_indexes.clear();
-        let mut next_raw = last_log_index.0 + 1;
+        // B8 arithmetic policy: saturate at index boundaries (never wrap), use
+        // checked math where an out-of-range value means broken protocol state.
+        let mut next_raw = last_log_index.0.saturating_add(1);
         for payload in payloads {
             let next_index = LogIndex(next_raw);
-            let entry = LogEntry {
+            entries.push(LogEntry {
                 term: self.hard_state.current_term,
                 index: next_index,
                 payload: EntryPayload(payload),
-            };
-            // Safety: scratch_entries in the struct is Vec<LogEntry<'static>>.
-            // Transmute to 'static for preallocated storage. Safe because we clear it after use.
-            let entry_static =
-                unsafe { std::mem::transmute::<LogEntry<'_>, LogEntry<'static>>(entry) };
-            self.scratch_entries.push(entry_static);
+            });
             self.scratch_indexes.push(next_index);
             next_raw += 1;
         }
-        let last_index = *self.scratch_indexes.last().unwrap();
-
-        // Safety: ensure storage sees the entries with a valid ephemeral lifetime
-        let entries_ref = unsafe {
-            std::mem::transmute::<&[LogEntry<'static>], &[LogEntry<'_>]>(&self.scratch_entries)
+        // B7: an empty batch must not panic on `.last()` — reject it as an
+        // invalid payload. (`propose_batch_once` guards this today, but this
+        // path must stay panic-free on its own.)
+        let Some(&last_index) = self.scratch_indexes.last() else {
+            return Err(RaftError::InvalidPayload("empty payload batch"));
         };
-        self.storage.append_entries(entries_ref)?;
-        for entry in entries_ref {
+
+        self.storage.append_entries(entries)?;
+        for entry in entries.iter() {
             self.log_metadata.append(entry.index, entry.term);
         }
 
@@ -107,12 +109,21 @@ where
         Ok(last_index)
     }
 
-    pub(super) async fn send_initial_appends(&mut self) -> Result<(), RaftError> {
+    /// Fan the freshly-appended batch out to every peer. `entries` is the
+    /// same caller-owned vec `append_propose_entries` filled.
+    pub(super) async fn send_initial_appends(
+        &mut self,
+        entries: &[LogEntry<'_>],
+    ) -> Result<(), RaftError> {
+        // A13: fan out to voters AND learners — learners replicate like
+        // followers; their acks are excluded on the counting side
+        // (`process_append_resp` / `try_advance_commit_index`).
         self.scratch_peers.clear();
         for peer in self
             .config
             .peers
             .iter()
+            .chain(self.config.learners.iter())
             .copied()
             .filter(|p| *p != self.config.node_id)
         {
@@ -125,14 +136,26 @@ where
 
         // 1. Prepare the message once
         let (last_log_index, _) = self.storage.last_log_position()?;
-        // Entries were already appended to local log and are in scratch_entries
-        let entries_ref = unsafe {
-            std::mem::transmute::<&[LogEntry<'static>], &[LogEntry<'_>]>(
-                self.scratch_entries.as_slice(),
-            )
-        };
+        // Entries were already appended to the local log by
+        // `append_propose_entries` and arrive here as a caller-owned slice.
+        let entries_ref = entries;
 
-        let prev_log_index = LogIndex(last_log_index.0 - entries_ref.len() as u64);
+        // B8 / P4: checked, not unchecked — `last_log_position()` reporting a
+        // tip smaller than the batch we just appended means the storage's log
+        // accounting is broken. Wrapping here would fabricate a near-u64::MAX
+        // prev_log_index on the wire; surface it as log corruption instead.
+        let prev_log_index = LogIndex(
+            last_log_index
+                .0
+                .checked_sub(entries_ref.len() as u64)
+                .ok_or_else(|| {
+                    RaftError::CorruptLog(
+                        "last_log_position smaller than just-appended batch \
+                         (prev_log_index underflow)"
+                            .into(),
+                    )
+                })?,
+        );
         let prev_log_term = self.term_at(prev_log_index)?;
 
         let req = crate::protocol::AppendEntries {
@@ -142,7 +165,8 @@ where
             prev_log_term: prev_log_term.0.into(),
             leader_commit: self.soft_state.commit_index.0.into(),
             entry_count: (entries_ref.len() as u32).into(),
-            _pad: 0.into(),
+            // A11: ReadIndex probe token (echoed by the follower).
+            _pad: self.read_probe_seq.into(),
         };
         let msg = RaftMessage::AppendEntriesVectored(&req, entries_ref);
 
@@ -151,16 +175,19 @@ where
 
         if should_use_vectored(entries_ref) {
             // --- Vectored fan-out ---
-            self.scratch_vectored.clear();
-            // SAFETY: scratch_vectored is stored as Vec<(*const u8, usize)> but
-            // the encoder and transport treat it as Vec<&[u8]>. Same pattern as
-            // `send_message`. Cleared before we return, so no borrow escapes.
-            let iovs: &mut Vec<&[u8]> = unsafe {
-                std::mem::transmute::<&mut Vec<(*const u8, usize)>, &mut Vec<&[u8]>>(
-                    &mut self.scratch_vectored,
-                )
-            };
-            encode_message_vectored(self.config.node_id, &msg, &mut self.scratch_outbound, iovs)?;
+            // Dock-recycled LOCAL iovec list: every slice it holds borrows
+            // either `scratch_outbound` (headers) or the caller's payloads —
+            // lifetimes the compiler verifies (US3/US5).
+            let mut iovs = self.scratch_vectored.take();
+            if let Err(e) = encode_message_vectored(
+                self.config.node_id,
+                &msg,
+                &mut self.scratch_outbound,
+                &mut iovs,
+            ) {
+                self.scratch_vectored.put(iovs);
+                return Err(e);
+            }
 
             // Shared slice view — all peers send the exact same bytes.
             let slices: &[&[u8]] = iovs.as_slice();
@@ -183,8 +210,7 @@ where
                 }
             }
 
-            // Release the 'static transmute borrow before we return.
-            self.scratch_vectored.clear();
+            self.scratch_vectored.put(iovs);
         } else {
             // --- Contiguous fan-out ---
             let frame = encode_message_to_bytes(self.config.node_id, &msg)?;

@@ -35,16 +35,35 @@ where
                     .map(|l| crate::LeaderHint { leader_id: l }),
             });
         }
+        // §4.2.3 leadership-transfer freeze: after TimeoutNow is sent, new
+        // proposals are rejected (redirect hint = the incoming leader) so the
+        // sanctioned target cannot fall behind again mid-handoff.
+        if self.leadership_transfer_in_progress() {
+            return Err(RaftError::NotLeader {
+                leader_hint: self
+                    .pending_transfer
+                    .map(|t| crate::LeaderHint { leader_id: t.target }),
+            });
+        }
         if payloads.is_empty() {
             return Ok(&[]);
         }
         // Progress must be initialized BEFORE append so that next_index covers
         // the entries we are about to write.
         self.ensure_leader_progress_initialized()?;
-        let last_index = self.append_propose_entries(payloads)?;
-        let res = self.send_initial_appends().await;
-        self.scratch_entries.clear();
-        res?;
+        // Dock-recycled LOCAL batch: the entries borrow `payloads` (the
+        // caller's data) under normal borrow checking — no 'static
+        // laundering, nothing parked in `self` across the fan-out (US3).
+        // Every path below re-docks the (cleared) allocation.
+        let mut entries = self.scratch_entries.take();
+        let append_res = self.append_propose_entries(payloads, &mut entries);
+        let send_res = match append_res {
+            Ok(_) => self.send_initial_appends(&entries).await,
+            Err(_) => Ok(()),
+        };
+        self.scratch_entries.put(entries);
+        let last_index = append_res?;
+        send_res?;
 
         let needed = super::super::quorum(self.config.peers.len());
         let timeout = Duration::from_millis(self.config.timing.heartbeat_ms * 2);
@@ -102,39 +121,56 @@ where
                     .map(|l| crate::LeaderHint { leader_id: l }),
             });
         }
+        // §4.2.3 leadership-transfer freeze — see `propose_batch_once`.
+        if self.leadership_transfer_in_progress() {
+            return Err(RaftError::NotLeader {
+                leader_hint: self
+                    .pending_transfer
+                    .map(|t| crate::LeaderHint { leader_id: t.target }),
+            });
+        }
         if payloads.is_empty() {
             return Ok((LogIndex(0), 0));
         }
         self.ensure_leader_progress_initialized()?;
 
-        let (prev_log_index, prev_log_term) = self.cached_last_log;
-        let first_index = LogIndex(prev_log_index.0 + 1);
+        // Dock-recycled LOCAL batch: entries borrow `payloads` under normal
+        // borrow checking — no 'static laundering (US3). The inner fn may
+        // `?` freely; the allocation is re-docked on every path.
+        let mut entries = self.scratch_entries.take();
+        let res = self.replicate_batch_inner(payloads, &mut entries).await;
+        self.scratch_entries.put(entries);
+        res
+    }
 
-        self.scratch_entries.clear();
+    /// Body of [`replicate_batch_async`] with the batch vec threaded through
+    /// as a parameter so every early `?` return still re-docks it.
+    async fn replicate_batch_inner<'a>(
+        &mut self,
+        payloads: &[&'a [u8]],
+        entries: &mut Vec<LogEntry<'a>>,
+    ) -> Result<(LogIndex, usize), RaftError> {
+        let (prev_log_index, prev_log_term) = self.cached_last_log;
+        // B8 arithmetic policy: saturating at the index boundary — never wrap.
+        let first_index = LogIndex(prev_log_index.0.saturating_add(1));
+
         let mut next_raw = first_index.0;
         for payload in payloads {
-            let entry = LogEntry {
+            entries.push(LogEntry {
                 term: self.hard_state.current_term,
                 index: LogIndex(next_raw),
                 payload: EntryPayload(payload),
-            };
-            // Safety: transmute to 'static for scratchpad storage.
-            let entry_static =
-                unsafe { std::mem::transmute::<LogEntry<'_>, LogEntry<'static>>(entry) };
-            self.scratch_entries.push(entry_static);
+            });
             next_raw += 1;
         }
 
-        // Safety: storage call
-        let entries_ref = unsafe {
-            std::mem::transmute::<&[LogEntry<'static>], &[LogEntry<'_>]>(&self.scratch_entries)
-        };
+        let entries_ref: &[LogEntry<'a>] = entries;
         self.storage.append_entries(entries_ref)?;
         for entry in entries_ref {
             self.log_metadata.append(entry.index, entry.term);
         }
 
-        if let Some(last) = self.scratch_entries.last() {
+        if let Some(last) = entries_ref.last() {
             self.cached_last_log = (last.index, last.term);
         }
 
@@ -146,16 +182,20 @@ where
             prev_log_term: prev_log_term.0.into(),
             leader_commit: self.soft_state.commit_index.0.into(),
             entry_count: (entries_ref.len() as u32).into(),
-            _pad: 0.into(),
+            // A11: ReadIndex probe token (echoed by the follower).
+            _pad: self.read_probe_seq.into(),
         };
         let msg = RaftMessage::AppendEntriesVectored(&req, entries_ref);
 
         // Collect peers once so the hot branches below don't repeat the filter.
+        // A13: learners are replication targets too (fire-and-forget path —
+        // no quorum is gathered here, so no counting-side gate is needed).
         self.scratch_peers.clear();
         for peer in self
             .config
             .peers
             .iter()
+            .chain(self.config.learners.iter())
             .copied()
             .filter(|p| *p != self.config.node_id)
         {
@@ -164,15 +204,17 @@ where
 
         if should_use_vectored(entries_ref) {
             // --- Vectored fan-out (bulk replication path) ---
-            self.scratch_vectored.clear();
-            // SAFETY: see `send_initial_appends` — scratch_vectored is cleared
-            // before returning, no borrow escapes self.
-            let iovs: &mut Vec<&[u8]> = unsafe {
-                std::mem::transmute::<&mut Vec<(*const u8, usize)>, &mut Vec<&[u8]>>(
-                    &mut self.scratch_vectored,
-                )
-            };
-            encode_message_vectored(self.config.node_id, &msg, &mut self.scratch_outbound, iovs)?;
+            // Dock-recycled LOCAL iovec list — see `send_initial_appends`.
+            let mut iovs = self.scratch_vectored.take();
+            if let Err(e) = encode_message_vectored(
+                self.config.node_id,
+                &msg,
+                &mut self.scratch_outbound,
+                &mut iovs,
+            ) {
+                self.scratch_vectored.put(iovs);
+                return Err(e);
+            }
 
             let slices: &[&[u8]] = iovs.as_slice();
             let transport = &self.transport;
@@ -188,7 +230,7 @@ where
                 }
             }
 
-            self.scratch_vectored.clear();
+            self.scratch_vectored.put(iovs);
         } else {
             // --- Contiguous fan-out (control-plane / small-entry path) ---
             let frame = encode_message_to_bytes(self.config.node_id, &msg)?;
@@ -206,8 +248,6 @@ where
                 }
             }
         }
-
-        self.scratch_entries.clear();
 
         Ok((first_index, payloads.len()))
     }

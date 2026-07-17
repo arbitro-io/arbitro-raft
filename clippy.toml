@@ -1,0 +1,5 @@
+# B13 panic policy: unwrap/expect are linted in non-test code (see the crate
+# docs in src/lib.rs). Tests may unwrap freely — a test failing loudly is the
+# point.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

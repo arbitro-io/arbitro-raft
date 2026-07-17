@@ -115,6 +115,11 @@ impl<'a, P, R> DispatchBuilder<'a, P, R> {
         static NEXT_TX_ID: AtomicU64 = AtomicU64::new(1);
 
         let body = self.spec.encode_params(&self.params)?;
+        // B6: checked — a body that does not fit the u32 wire field must fail
+        // the build, never be silently truncated into a corrupt frame.
+        let body_len = u32::try_from(body.len()).map_err(|_| {
+            RaftError::Dispatch("dispatch body length exceeds u32 wire field".into())
+        })?;
         let tx_id = NEXT_TX_ID.fetch_add(1, Ordering::Relaxed);
         let header = DispatchFrameHeader {
             magic: U32::new(RAFT_DISPATCH_MAGIC),
@@ -127,7 +132,7 @@ impl<'a, P, R> DispatchBuilder<'a, P, R> {
             _pad: [0; 2],
             tx_id: U64::new(tx_id),
             timeout_ms: U32::new(self.options.timeout.as_millis().min(u32::MAX as u128) as u32),
-            body_len: U32::new(body.len() as u32),
+            body_len: U32::new(body_len),
         };
 
         let mut out = Vec::with_capacity(std::mem::size_of::<DispatchFrameHeader>() + body.len());

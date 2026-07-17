@@ -9,8 +9,11 @@ where
     S: crate::RaftStorage,
     T: crate::RaftTransport,
 {
-    /// Prepare entry metadata and read payloads from storage.
-    pub(crate) fn build_append_for_peer(
+    /// Compute the `(prev_log_index, prev_log_term, next_index)` triple for
+    /// an append to `peer`. Pure metadata — the actual backlog read happens
+    /// at the call site with split field borrows, so the entries can borrow
+    /// `scratch_payload` without any lifetime laundering (US3).
+    pub(crate) fn append_prev_for_peer(
         &mut self,
         peer: PeerId,
     ) -> Result<(LogIndex, Term, LogIndex), RaftError> {
@@ -21,35 +24,7 @@ where
             .ok_or(RaftError::PeerUnknown(peer))?;
         let prev_log_index = LogIndex(progress.next_index.0.saturating_sub(1));
         let prev_log_term = self.term_at(prev_log_index)?;
-        self.scratch_entries.clear();
-
-        // Pass a dummy buffer or reuse scratch_outbound if storage needs it for temporary read
-
-        // Safety: scratch_entries in the struct is Vec<LogEntry<'static>>.
-        // We transmute it to Vec<LogEntry<'_>> for the duration of the storage call.
-        let scratch_ref = unsafe {
-            std::mem::transmute::<&mut Vec<crate::LogEntry<'static>>, &mut Vec<crate::LogEntry<'_>>>(
-                &mut self.scratch_entries,
-            )
-        };
-
-        self.storage.read_entries(
-            progress.next_index,
-            LogIndex(u64::MAX),
-            scratch_ref,
-            &mut self.scratch_payload,
-        )?;
-
-        self.scratch_entries
-            .truncate(self.config.limits.append_batch_entries.max(1));
-
-        let last_idx = self
-            .scratch_entries
-            .last()
-            .map(|e| e.index)
-            .unwrap_or(prev_log_index);
-
-        Ok((prev_log_index, prev_log_term, last_idx))
+        Ok((prev_log_index, prev_log_term, progress.next_index))
     }
 
     pub(crate) async fn send_append_attempt(
@@ -57,17 +32,11 @@ where
         peer: PeerId,
         _attempt: u64,
     ) -> Result<Option<LogIndex>, RaftError> {
-        let progress = self
-            .peer_progress
-            .get(&peer)
-            .copied()
-            .ok_or(RaftError::PeerUnknown(peer))?;
-        let next_index = progress.next_index;
+        // All `&mut self` metadata work happens BEFORE any storage view is
+        // taken, so the borrows below never cross a `&mut self` reborrow.
+        let (prev_idx, prev_term, next_index) = self.append_prev_for_peer(peer)?;
 
         // ── 1. Attempt MAGIC ZEROCOPY Path ─────────────────────────────────────
-        let prev_idx = LogIndex(next_index.0.saturating_sub(1));
-        let prev_term = self.term_at(prev_idx)?;
-
         if let Ok(Some(headers)) = self
             .storage
             .read_entry_headers(next_index, LogIndex(u64::MAX))
@@ -79,19 +48,22 @@ where
                 headers
             };
 
-            if !headers.is_empty() {
-                let last_idx = LogIndex(headers.last().unwrap().index.get());
-
-                // Collect payloads using scratchpad (Zero-Alloc)
-                self.scratch_payload_refs.clear();
+            if let Some(last_header) = headers.last() {
+                let last_idx = LogIndex(last_header.index.get());
                 let to_idx = LogIndex(next_index.0 + headers.len() as u64 - 1);
 
-                let scratch_ptr = &mut self.scratch_payload_refs;
-                self.storage
-                    .for_each_payload(next_index, to_idx, &mut |p| {
-                        // SAFETY: Pointers are ephemeral and cleared after send_message
-                        scratch_ptr.push(unsafe { std::mem::transmute::<&[u8], &'static [u8]>(p) });
-                    })?;
+                // Collect payload views into a dock-recycled LOCAL vec. The
+                // slices borrow `self.storage` (see the `for_each_payload`
+                // contract); the borrow checker verifies them — nothing is
+                // laundered to 'static or parked in `self` (US3).
+                let mut payload_refs = self.scratch_payload_refs.take();
+                if let Err(e) = self
+                    .storage
+                    .for_each_payload(next_index, to_idx, &mut |p| payload_refs.push(p))
+                {
+                    self.scratch_payload_refs.put(payload_refs);
+                    return Err(e);
+                }
 
                 let req = crate::protocol::AppendEntries {
                     term: self.hard_state.current_term.0.into(),
@@ -100,38 +72,52 @@ where
                     prev_log_term: prev_term.0.into(),
                     leader_commit: self.soft_state.commit_index.0.into(),
                     entry_count: (headers.len() as u32).into(),
-                    _pad: 0.into(),
-                };
-
-                // SAFETY: We transmute the lifetimes of the slices to allow send_message(&mut self).
-                // This is safe because we .await the send_message call before potentially reusing
-                // the scratchpads or dropping the storage refs.
-                let (headers_bytes, payloads_ref) = unsafe {
-                    (
-                        std::mem::transmute::<&[u8], &'static [u8]>(headers.as_bytes()),
-                        std::mem::transmute::<&[&[u8]], &'static [&'static [u8]]>(
-                            &self.scratch_payload_refs,
-                        ),
-                    )
+                    // A11: ReadIndex probe token (echoed by the follower).
+                    _pad: self.read_probe_seq.into(),
                 };
 
                 let msg = RaftMessage::AppendEntriesSeededVectored {
                     ae: &req,
-                    headers: headers_bytes,
-                    payloads: payloads_ref,
+                    headers: headers.as_bytes(),
+                    payloads: &payload_refs,
                 };
 
-                if self.send_message(peer, &msg).await {
-                    self.scratch_payload_refs.clear();
-                    return Ok(Some(last_idx));
-                }
-                self.scratch_payload_refs.clear();
-                return Ok(None);
+                // The message borrows `self.storage`, so it cannot go through
+                // `send_message(&mut self)`; the free function takes only the
+                // disjoint fields it needs (transport, outbound buffer, iovec
+                // dock) under normal split-borrow checking.
+                let mut iovs = self.scratch_vectored.take();
+                let sent = super::super::send_message_vectored(
+                    &self.transport,
+                    self.config.node_id,
+                    &mut self.scratch_outbound,
+                    &mut iovs,
+                    peer,
+                    &msg,
+                )
+                .await;
+                self.scratch_vectored.put(iovs);
+                self.scratch_payload_refs.put(payload_refs);
+                return Ok(if sent { Some(last_idx) } else { None });
             }
         }
 
         // ── 2. Fallback to ERGONOMIC Path ──────────────────────────────────────
-        let (prev_idx, prev_term, last_idx) = self.build_append_for_peer(peer)?;
+        // Read the backlog into a dock-recycled LOCAL vec whose entries
+        // borrow `scratch_payload` — a split field borrow the compiler
+        // checks, replacing the old transmute-into-`self.scratch_entries`.
+        let mut entries = self.scratch_entries.take();
+        if let Err(e) = self.storage.read_entries(
+            next_index,
+            LogIndex(u64::MAX),
+            &mut entries,
+            &mut self.scratch_payload,
+        ) {
+            self.scratch_entries.put(entries);
+            return Err(e);
+        }
+        entries.truncate(self.config.limits.append_batch_entries.max(1));
+        let last_idx = entries.last().map(|e| e.index).unwrap_or(prev_idx);
 
         // Create AppendEntries metadata on stack
         let req = crate::protocol::AppendEntries {
@@ -140,20 +126,24 @@ where
             prev_log_index: prev_idx.0.into(),
             prev_log_term: prev_term.0.into(),
             leader_commit: self.soft_state.commit_index.0.into(),
-            entry_count: (self.scratch_entries.len() as u32).into(),
-            _pad: 0.into(),
+            entry_count: (entries.len() as u32).into(),
+            // A11: ReadIndex probe token (echoed by the follower).
+            _pad: self.read_probe_seq.into(),
         };
 
-        // SAFETY: transmute from 'static storage to ephemeral for transport
-        let entries_ref = unsafe {
-            std::mem::transmute::<&[crate::LogEntry<'static>], &[crate::LogEntry<'_>]>(
-                &self.scratch_entries,
-            )
-        };
-
-        let msg = RaftMessage::AppendEntriesVectored(&req, entries_ref);
-        let sent = self.send_message(peer, &msg).await;
-        self.scratch_entries.clear();
+        let msg = RaftMessage::AppendEntriesVectored(&req, &entries);
+        let mut iovs = self.scratch_vectored.take();
+        let sent = super::super::send_message_vectored(
+            &self.transport,
+            self.config.node_id,
+            &mut self.scratch_outbound,
+            &mut iovs,
+            peer,
+            &msg,
+        )
+        .await;
+        self.scratch_vectored.put(iovs);
+        self.scratch_entries.put(entries);
         if sent {
             Ok(Some(last_idx))
         } else {
@@ -175,11 +165,32 @@ where
             self.peer_progress.insert(
                 peer,
                 super::super::progress::PeerProgress {
-                    next_index: LogIndex(last_index.0 + 1),
+                    // B8 arithmetic policy: saturating at the boundary.
+                    next_index: LogIndex(last_index.0.saturating_add(1)),
                     match_index: LogIndex(0),
                 },
             );
             self.scratch_started.insert(peer, std::time::Instant::now());
+        }
+        // A13: learners get replication progress like followers, but NO
+        // check-quorum contact stamp — a learner's liveness must never help
+        // keep the leader's quorum lease alive (`check_quorum_active` only
+        // reads voters, and `handle_inbound` only stamps voters, so the
+        // omission here keeps all three sites consistent).
+        for peer in self
+            .config
+            .learners
+            .iter()
+            .copied()
+            .filter(|p| *p != self.config.node_id)
+        {
+            self.peer_progress.insert(
+                peer,
+                super::super::progress::PeerProgress {
+                    next_index: LogIndex(last_index.0.saturating_add(1)),
+                    match_index: LogIndex(0),
+                },
+            );
         }
         Ok(())
     }
@@ -195,13 +206,34 @@ where
         if index.0 == 0 {
             return Ok(Term(0));
         }
+        // The last-log cache is authoritative for the tip. After a snapshot
+        // restore/install the boundary entry itself is discarded from storage
+        // (`truncate_before(boundary + 1)`) while the tip position lives on in
+        // `cached_last_log` — without this fallback a leader that just
+        // restored from its own snapshot could not even build a bare
+        // heartbeat (prev = its own last index would read as CorruptLog).
+        // This is the send-side twin of the receive-side `prev_ok`
+        // snapshot-boundary fallback in `replication/handler.rs` (C3).
+        if index == self.cached_last_log.0 {
+            return Ok(self.cached_last_log.1);
+        }
         if let Some(term) = self.log_metadata.get_term(index) {
             return Ok(term);
         }
+        // §7: the snapshot boundary's term must stay answerable after the
+        // boundary entry itself was discarded (restore/install truncate the
+        // log through the boundary) — e.g. the very first propose after a
+        // snapshot restore needs prev_log_term at the boundary (C3).
+        if index == self.snapshot_boundary.0 {
+            return Ok(self.snapshot_boundary.1);
+        }
+        // B10: term-only probe via `RaftStorage::term_at` — no payload read,
+        // and no reliance on `entry_at` tolerating an undersized buffer (a
+        // compliant strict-buffer storage would error and kill the node here
+        // after a restart, when the metadata arena is cold).
         let term = self
             .storage
-            .entry_at(index, &mut self.scratch_payload)?
-            .map(|e| e.term)
+            .term_at(index)?
             .ok_or_else(|| RaftError::CorruptLog(format!("missing term at index {}", index.0)))?;
         self.log_metadata.append(index, term);
         Ok(term)
@@ -314,13 +346,29 @@ where
                 std::cmp::min(old_q, new_q)
             }
             None => {
-                // Gather: leader self (last_index) + all peer match_indexes.
+                // Gather: leader self (last_index) + each VOTER's match_index.
                 // Uses `scratch_commit_acks` (NOT `scratch_indexes`) so a
                 // concurrent propose's return slice is never clobbered (G1).
+                //
+                // A13: gather by voter identity, not by iterating
+                // `peer_progress` — learners keep progress entries there for
+                // replication, and a learner's ack must never advance the
+                // commit index. A voter with no progress entry contributes
+                // `LogIndex(0)` (same rule as `subset_quorum_index`), so a
+                // freshly-added voter is never silently skipped either.
                 self.scratch_commit_acks.clear();
                 self.scratch_commit_acks.push(last_index);
-                for progress in self.peer_progress.values() {
-                    self.scratch_commit_acks.push(progress.match_index);
+                let self_id = self.config.node_id;
+                for &peer in &self.config.peers {
+                    if peer == self_id {
+                        continue;
+                    }
+                    let matched = self
+                        .peer_progress
+                        .get(&peer)
+                        .map(|p| p.match_index)
+                        .unwrap_or(LogIndex(0));
+                    self.scratch_commit_acks.push(matched);
                 }
                 // Sort descending → quorum-th largest is the safe commit point.
                 self.scratch_commit_acks.sort_unstable_by(|a, b| b.0.cmp(&a.0));
@@ -341,10 +389,10 @@ where
         } else if let Some(term) = self.log_metadata.get_term(quorum_index) {
             term
         } else {
+            // B10: term-only probe — no payload read.
             let term = self
                 .storage
-                .entry_at(quorum_index, &mut self.scratch_payload)?
-                .map(|e| e.term)
+                .term_at(quorum_index)?
                 .unwrap_or(crate::Term(0));
             if term.0 > 0 {
                 self.log_metadata.append(quorum_index, term);
@@ -358,12 +406,14 @@ where
     }
 
     pub(crate) async fn drain_inbound_ready(&mut self) -> Result<(), RaftError> {
-        // Reuse preallocated scratch_quorum_buf to avoid 64KB allocation in hot propose path
-        self.scratch_quorum_buf.clear();
-        if self.scratch_quorum_buf.capacity() < 64 * 1024 {
-            self.scratch_quorum_buf.reserve(64 * 1024);
+        // Reuse preallocated scratch_quorum_buf to avoid 64KB allocation in
+        // the hot propose path. B5: grow with `resize` — which zero-fills any
+        // newly exposed bytes — instead of `reserve` + `set_len`, which would
+        // expose uninitialized heap memory if the reserve reallocated. Once
+        // the buffer is at 64 KiB this is a no-op.
+        if self.scratch_quorum_buf.len() < 64 * 1024 {
+            self.scratch_quorum_buf.resize(64 * 1024, 0);
         }
-        unsafe { self.scratch_quorum_buf.set_len(64 * 1024) };
 
         // Take the buffer to satisfy the borrow checker during zero-copy decode & handle
         struct BufferGuard<'a, S, T> {

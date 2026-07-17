@@ -36,9 +36,10 @@ where
     ///     `last_applied` is volatile (reset to 0) and the state
     ///     machine is responsible for its own persistence and
     ///     reconciliation via `snapshot`/`restore`.
-    ///   - Errors from `sm.apply` propagate — a diverging state
+    ///   - Errors from `sm.apply_at` propagate — a diverging state
     ///     machine is a hard bug; the node should crash rather than
-    ///     silently continue.
+    ///     silently continue. (Resource-class errors are the one
+    ///     exception: `run_once` degrades instead of dying — C8.)
     pub(super) fn apply_committed_entries(&mut self) -> Result<(), RaftError> {
         // Consume any freshly-installed snapshot before walking log entries.
         // This re-anchors `last_applied` to the snapshot boundary so the
@@ -78,7 +79,12 @@ where
             let consumed_by_membership =
                 crate::api::node::membership::apply_if_config_change(&mut self.node, payload)?;
             if !consumed_by_membership {
-                if let Err(e) = self.state_machine.apply(payload) {
+                // A6: hand the state machine the entry's committed LogIndex so
+                // an externally-persistent implementation can keep its own
+                // durable applied cursor (the engine's `last_applied` is
+                // volatile — see the `StateMachine` trait docs). Defaults to
+                // forwarding to `apply(entry)` for index-agnostic impls.
+                if let Err(e) = self.state_machine.apply_at(next, payload) {
                     // A diverging state machine is a hard bug — log loudly with
                     // the offending index before the error stops the node
                     // (ERR-10 / P1-3), rather than letting it die unexplained.
@@ -92,8 +98,18 @@ where
                 }
             }
             self.node.set_last_applied(next);
+            // C2: applied-entry debt drives the log-compaction policy trigger
+            // below. Config-change entries count too — they occupy log space.
+            self.node.compaction_debt_entries += 1;
+            self.node.compaction_debt_bytes += payload_len as u64;
             next = LogIndex(next.0 + 1);
         }
+        // C2: policy-triggered log compaction, leader AND follower — both
+        // accumulate log. Cheap when the trigger has not fired (two integer
+        // compares). The horizon is conservative (clamped to every current
+        // voter's match_index minus a retention margin) so a lagging follower
+        // is never stranded; see `log_compaction::maybe_compact`.
+        crate::api::node::log_compaction::maybe_compact(&mut self.node, &self.state_machine)?;
         Ok(())
     }
 
@@ -105,7 +121,32 @@ where
     /// version-skewed node) must never terminate the consensus loop. Only a
     /// [`ErrorClass::Fatal`](crate::ErrorClass::Fatal) error (local storage
     /// failure / corrupt log) propagates and stops the node.
-    async fn dispatch_inbound(&mut self, n: usize) -> Result<(), RaftError> {
+    ///
+    /// D3 abuse cutoff: decode errors are attributed to the frame's claimed
+    /// sender (bounded to current members plus one shared "unknown" bucket).
+    /// A sender that crosses `limits.inbound_decode_error_jail_threshold`
+    /// decode errors inside one error window is jailed for
+    /// `limits.inbound_jail_cooldown_ms`; while jailed, its frames are shed
+    /// HERE, pre-decode — one header peek and a counter bump — so a hostile
+    /// peer blasting garbage at line rate cannot make this loop burn a full
+    /// decode + warn-log per frame.
+    pub(super) async fn dispatch_inbound(&mut self, n: usize) -> Result<(), RaftError> {
+        // Cheap header peek for abuse attribution — NOT trust: a D2-compliant
+        // transport already dropped frames whose `from` mismatches the
+        // connection's authenticated identity before they reached us.
+        let claimed_from = crate::protocol::codec::decode::parse_prefix::<
+            crate::protocol::codec::wire::RaftFrameHeader,
+        >(&self.inbound_buf[..n], "raft frame header")
+        .ok()
+        .map(|(h, _)| h.from.get());
+        let abuse_key =
+            super::abuse::InboundAbuseGuard::key_for(claimed_from, self.node.peers());
+        let now = Instant::now();
+        if self.abuse.is_jailed(abuse_key, now) {
+            self.node.metrics.inc_frames_shed_jailed();
+            return Ok(());
+        }
+
         let inbound = match crate::decode_message(&self.inbound_buf[..n]) {
             Ok(m) => m,
             Err(e) => {
@@ -116,6 +157,19 @@ where
                     "dropping undecodable inbound frame"
                 );
                 self.node.metrics.inc_frames_dropped_nonfatal();
+                if self.abuse.record_decode_error(
+                    abuse_key,
+                    now,
+                    &self.node.config.limits,
+                ) {
+                    self.node.metrics.inc_peers_jailed();
+                    tracing::warn!(
+                        node_id = self.node.node_id().0,
+                        peer = abuse_key,
+                        cooldown_ms = self.node.config.limits.inbound_jail_cooldown_ms,
+                        "jailing peer: decode-error rate exceeded; shedding its frames pre-decode"
+                    );
+                }
                 return Ok(());
             }
         };
@@ -123,11 +177,26 @@ where
             Ok(()) => Ok(()),
             Err(e) if e.is_fatal() => Err(e),
             Err(e) => {
-                tracing::warn!(
-                    node_id = self.node.node_id().0,
-                    error = %e,
-                    "dropping inbound frame after non-fatal handler error"
-                );
+                if e.is_resource_exhaustion() {
+                    // C8: an ENOSPC-class failure while handling a frame (e.g.
+                    // a follower's append persist) — the frame was not acked,
+                    // so the leader never counts this node. Survive read-only
+                    // and resume acking once storage recovers.
+                    self.node.metrics.inc_resource_exhausted();
+                    tracing::error!(
+                        node_id = self.node.node_id().0,
+                        error = %e,
+                        "storage resource exhaustion (disk full?) while handling \
+                         inbound frame; frame dropped, nothing acked — will \
+                         resume once storage recovers"
+                    );
+                } else {
+                    tracing::warn!(
+                        node_id = self.node.node_id().0,
+                        error = %e,
+                        "dropping inbound frame after non-fatal handler error"
+                    );
+                }
                 self.node.metrics.inc_frames_dropped_nonfatal();
                 Ok(())
             }
@@ -143,7 +212,7 @@ where
     /// [`ErrorClass::Fatal`](crate::ErrorClass::Fatal) error (local storage /
     /// corrupt log) propagates. This is the recv-side complement to
     /// [`dispatch_inbound`](Self::dispatch_inbound) and completes P0-2.
-    async fn recv_inbound(&mut self, timeout: Duration) -> Result<Option<usize>, RaftError> {
+    pub(super) async fn recv_inbound(&mut self, timeout: Duration) -> Result<Option<usize>, RaftError> {
         match self
             .node
             .transport()
@@ -198,7 +267,18 @@ where
         }
         .encode();
         match self.node.propose_once(&final_bytes).await {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                // Farewell commit advertisement — `C_new` committed but is
+                // not yet applied locally, so the fan-out set still includes
+                // the peers being removed; this heartbeat is their only
+                // guaranteed chance to learn the final entry committed and
+                // self-remove before we drop them from replication. Same
+                // rationale as in `propose_config_change`.
+                if self.node.is_leader() {
+                    self.send_heartbeat_once().await?;
+                }
+                Ok(())
+            }
             // Lost leadership / quorum before it committed — a later leader
             // will retry the same finalize. Not an error.
             Err(RaftError::NotLeader { .. }) | Err(RaftError::NoQuorum) => Ok(()),
@@ -215,22 +295,37 @@ where
     }
 
     pub(super) async fn run_leader_once(&mut self) -> Result<(), RaftError> {
+        // §4.2.3 leadership-transfer freeze: while a TimeoutNow handoff is
+        // pending, PARK client proposals — leave them queued in `client_rx`
+        // (the same place they wait on a follower) instead of replicating.
+        // If the transfer succeeds this node becomes a follower and they stay
+        // parked; if it aborts (window expires) the next tick drains them
+        // normally. Leader duties (inbound, heartbeats, check-quorum)
+        // continue untouched.
+        let transferring = self.node.leadership_transfer_in_progress();
+
+        // Timer-based eviction of stalled inbound snapshot transfers (C4).
+        // Cheap: the map holds at most one entry per peer and is usually empty.
+        self.node.evict_stalled_snapshots();
+
         // 1. Drain inbound client proposals → pending_batch + pending_slots.
         //    NOTE: do NOT clear first — items may have been pushed by the idle-path select
         //    arm on the previous tick; clearing would drop slots without notifying clients.
         let limit = self.node.config.limits.append_batch_entries;
-        while self.pending_batch.len() < limit {
-            match self.client_rx.try_recv() {
-                Ok(p) => {
-                    self.pending_batch.push(p.payload);
-                    self.pending_slots.push(p.slot_id);
+        if !transferring {
+            while self.pending_batch.len() < limit {
+                match self.client_rx.try_recv() {
+                    Ok(p) => {
+                        self.pending_batch.push(p.payload);
+                        self.pending_slots.push(p.slot_id);
+                    }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
-        }
 
-        if !self.pending_batch.is_empty() {
-            self.replicate_pending().await?;
+            if !self.pending_batch.is_empty() {
+                self.replicate_pending().await?;
+            }
         }
 
         // 2. Burst-drain available inbound frames.
@@ -276,6 +371,22 @@ where
         }
 
         let timeout = self.next_heartbeat_at.saturating_duration_since(now);
+
+        // Transfer pending: wait on inbound frames only — do NOT select on
+        // `client_rx`, so proposals stay parked for the handoff window.
+        if transferring {
+            if let Some(n) = self.recv_inbound(timeout).await? {
+                self.dispatch_inbound(n).await?;
+                self.node.try_advance_commit_index()?;
+                self.drain_commit_waiters();
+                self.apply_committed_entries()?;
+                if !self.node.is_leader() {
+                    self.fail_commit_waiters();
+                }
+            }
+            return Ok(());
+        }
+
         futures::select! {
             frame_result = self.node.transport().recv_frame_timeout(timeout, &mut self.inbound_buf).fuse() => {
                 let frame = match frame_result {
@@ -327,30 +438,19 @@ where
 
     /// Replicate `pending_batch`, pair results with `pending_slots` → `commit_waiters`.
     ///
-    /// Uses a temporary `Vec<&[u8]>` built from the pre-allocated `pending_batch`
-    /// entries. This allocation happens once per batch, NOT per entry.
+    /// The slice-of-slices view is a LOCAL `Vec<&[u8]>` (allocation recycled
+    /// through the node's `scratch_payload_refs` dock) whose elements borrow
+    /// `self.pending_batch` — a field disjoint from `self.node`, so the
+    /// borrow checker itself proves the refs stay valid across the
+    /// `&mut self.node` call to `replicate_batch_async`. No `'static`
+    /// laundering, no ref parked inside the node (US3).
     pub(super) async fn replicate_pending(&mut self) -> Result<(), RaftError> {
         // Form a slice of slices — one indirect per already-owned Vec<u8> in pending_batch.
-        self.node.scratch_payload_refs.clear();
-        for p in &self.pending_batch {
-            // Safety: We temporarily transmute the lifetime of the slice to &'static [u8].
-            // This is safe because we clear the scratchpad before returning, and replicate_batch_async
-            // only accesses it during its synchronous asynchronous block execution.
-            let slice_static = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(p.as_slice()) };
-            self.node.scratch_payload_refs.push(slice_static);
-        }
+        let mut refs = self.node.scratch_payload_refs.take();
+        refs.extend(self.pending_batch.iter().map(|p| p.as_slice()));
 
-        // SAFETY: We temporarily erase the lifetime link between self.node and the slice passed
-        // as argument to replicate_batch_async, allowing &mut self.node to be called concurrently.
-        // This is safe because replicate_batch_async only reads the references synchronously
-        // during its execution, and we clear the scratchpad immediately afterwards.
-        let refs: &'static [&'static [u8]] = unsafe {
-            std::mem::transmute::<&[&[u8]], &'static [&'static [u8]]>(
-                self.node.scratch_payload_refs.as_slice(),
-            )
-        };
-        let res = self.node.replicate_batch_async(refs).await;
-        self.node.scratch_payload_refs.clear();
+        let res = self.node.replicate_batch_async(&refs).await;
+        self.node.scratch_payload_refs.put(refs);
 
         match res {
             Ok((first_index, _)) => {
@@ -373,7 +473,48 @@ where
         Ok(())
     }
 
+    /// Run one real election (no pre-vote) and settle post-election duties:
+    /// deadline resets, the first heartbeat, and §4.3 joint auto-resumption.
+    /// Error handling mirrors the follower-timeout campaign path (P0-2): only
+    /// Fatal-class errors propagate.
+    async fn campaign_and_settle(&mut self) -> Result<(), RaftError> {
+        match self.node.campaign_once(&mut self.inbound_buf).await {
+            Ok(elected) => {
+                self.reset_election_deadline();
+                if elected {
+                    self.reset_heartbeat_deadline();
+                    self.node.send_heartbeat_once().await?;
+                    self.reset_heartbeat_deadline();
+                    // If we won while a membership change was still
+                    // in its joint phase, drive it to completion so
+                    // the transition can never stall (§4.3).
+                    self.finalize_joint_if_inherited().await?;
+                }
+            }
+            Err(RaftError::NoQuorum) => {
+                self.reset_election_deadline();
+            }
+            Err(err) if err.is_fatal() => return Err(err),
+            // Non-fatal error mid-election: abandon this round and
+            // retry after the election timeout (P0-2).
+            Err(err) => {
+                tracing::warn!(
+                    node_id = self.node.node_id().0,
+                    error = %err,
+                    "tolerating non-fatal error during election campaign"
+                );
+                self.reset_election_deadline();
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn run_follower_once(&mut self) -> Result<(), RaftError> {
+        // Timer-based eviction of stalled inbound snapshot transfers (C4):
+        // runs every tick so a leader that goes quiet mid-install cannot park
+        // a multi-GiB pending buffer until the next unrelated message arrives.
+        self.node.evict_stalled_snapshots();
+
         let mut processed = 0;
         while let Some(n) = self.recv_inbound(Duration::ZERO).await? {
             self.dispatch_inbound(n).await?;
@@ -389,6 +530,16 @@ where
             // returning so the state machine tracks the leader.
             self.apply_committed_entries()?;
             self.reset_election_deadline();
+        }
+
+        // §4.2.3 leadership transfer: a leader-sanctioned TimeoutNow bypasses
+        // BOTH the election-timeout wait and pre-vote — campaign immediately.
+        if self.node.take_forced_campaign() {
+            self.campaign_and_settle().await?;
+            return Ok(());
+        }
+
+        if processed > 0 {
             return Ok(());
         }
 
@@ -399,6 +550,11 @@ where
                 self.dispatch_inbound(n).await?;
                 self.apply_committed_entries()?;
                 self.reset_election_deadline();
+                // Forced campaign (§4.2.3) — see above.
+                if self.node.take_forced_campaign() {
+                    self.campaign_and_settle().await?;
+                    return Ok(());
+                }
                 if self.node.is_leader() {
                     self.reset_heartbeat_deadline();
                 }
@@ -424,34 +580,7 @@ where
 
                 if pre_vote_success {
                     // Only start a real election if the pre-vote check succeeded
-                    match self.node.campaign_once(&mut self.inbound_buf).await {
-                        Ok(elected) => {
-                            self.reset_election_deadline();
-                            if elected {
-                                self.reset_heartbeat_deadline();
-                                self.node.send_heartbeat_once().await?;
-                                self.reset_heartbeat_deadline();
-                                // If we won while a membership change was still
-                                // in its joint phase, drive it to completion so
-                                // the transition can never stall (§4.3).
-                                self.finalize_joint_if_inherited().await?;
-                            }
-                        }
-                        Err(RaftError::NoQuorum) => {
-                            self.reset_election_deadline();
-                        }
-                        Err(err) if err.is_fatal() => return Err(err),
-                        // Non-fatal error mid-election: abandon this round and
-                        // retry after the election timeout (P0-2).
-                        Err(err) => {
-                            tracing::warn!(
-                                node_id = self.node.node_id().0,
-                                error = %err,
-                                "tolerating non-fatal error during election campaign"
-                            );
-                            self.reset_election_deadline();
-                        }
-                    }
+                    self.campaign_and_settle().await?;
                 } else {
                     self.reset_election_deadline();
                 }
@@ -513,7 +642,9 @@ where
         }
         // Copy the peer list out so the async call below can take
         // `&mut self.node` without aliasing the borrow of `config.peers`.
-        let peers: Vec<_> = self.node.peers().to_vec();
+        // A13: learners are snapshot catch-up targets like followers.
+        let mut peers: Vec<_> = self.node.peers().to_vec();
+        peers.extend_from_slice(self.node.learners());
         let self_id = self.node.node_id();
         let mut sent = 0usize;
         for peer in peers {

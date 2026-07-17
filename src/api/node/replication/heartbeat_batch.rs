@@ -89,8 +89,15 @@ where
         // only that field, leaving `node.scratch_peers` free to be
         // borrowed mutably at the same time.
         node.scratch_peers.clear();
-        node.scratch_peers
-            .extend(node.config.peers.iter().copied().filter(|p| *p != from));
+        // A13: learners receive batched heartbeats like followers.
+        node.scratch_peers.extend(
+            node.config
+                .peers
+                .iter()
+                .chain(node.config.learners.iter())
+                .copied()
+                .filter(|p| *p != from),
+        );
 
         for i in 0..node.scratch_peers.len() {
             let peer = node.scratch_peers[i];
@@ -216,6 +223,9 @@ fn write_frame_header(
     // wire struct definition — any future field reshuffle stays a compile
     // error rather than a silent wire-format drift.
     use zerocopy::Ref;
+    // B13: the buffer is exactly RAFT_FRAME_HEADER_SIZE by the parameter type;
+    // the zerocopy prefix take cannot fail.
+    #[allow(clippy::expect_used)]
     let (h_ref, _) = Ref::<_, RaftFrameHeader>::from_prefix(&mut buf[..])
         .expect("32-byte buffer aligns to RaftFrameHeader by construction");
     let header = Ref::into_mut(h_ref);

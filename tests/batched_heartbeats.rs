@@ -143,6 +143,7 @@ impl RaftStorage for TestStorage {
         }
         Ok(())
     }
+
     fn read_entries<'a>(
         &self,
         from: LogIndex,
@@ -151,28 +152,32 @@ impl RaftStorage for TestStorage {
         payload_buf: &'a mut [u8],
     ) -> Result<usize, RaftError> {
         let entries = self.entries.lock().unwrap();
-        let mut offset = 0;
+        let mut buf = payload_buf;
+        let mut written = 0;
         for e in entries.iter() {
             if e.index >= from && e.index < to {
                 let len = e.payload.len();
-                if offset + len > payload_buf.len() {
+                if len > buf.len() {
                     return Err(RaftError::Storage("payload_buf too small".into()));
                 }
-                payload_buf[offset..offset + len].copy_from_slice(&e.payload);
-                // SAFETY: payload_buf lives as long as 'a.
-                let static_payload = unsafe {
-                    std::mem::transmute::<&[u8], &'a [u8]>(&payload_buf[offset..offset + len])
-                };
+                // Split the front chunk off the remaining buffer so the
+                // shared ref pushed into `out` is never invalidated by a
+                // later write through `buf` — no transmute, and Stacked
+                // Borrows (Miri) clean.
+                let (chunk, rest) = std::mem::take(&mut buf).split_at_mut(len);
+                chunk.copy_from_slice(&e.payload);
+                buf = rest;
                 out.push(LogEntry {
                     term: e.term,
                     index: e.index,
-                    payload: EntryPayload(static_payload),
+                    payload: EntryPayload(chunk),
                 });
-                offset += len;
+                written += len;
             }
         }
-        Ok(offset)
+        Ok(written)
     }
+
     fn truncate_suffix(&self, from: LogIndex) -> Result<(), RaftError> {
         self.entries.lock().unwrap().retain(|e| e.index < from);
         Ok(())
@@ -203,9 +208,8 @@ impl RaftStorage for TestStorage {
                 return Err(RaftError::Storage("payload_buf too small".into()));
             }
             payload_buf[..e.payload.len()].copy_from_slice(&e.payload);
-            // SAFETY: payload_buf lives as long as 'a.
-            let static_payload =
-                unsafe { std::mem::transmute::<&[u8], &'a [u8]>(&payload_buf[..e.payload.len()]) };
+            // Shared reborrow-for-return of the 'a buffer (borrow-checked).
+            let static_payload: &'a [u8] = &payload_buf[..e.payload.len()];
             Ok(Some(LogEntry {
                 term: e.term,
                 index: e.index,
@@ -228,6 +232,7 @@ fn three_node_config(group: GroupId) -> NodeConfig {
         node_id: PeerId(1),
         cluster_id: ClusterId(group.0),
         peers: peers_id.iter().copied().map(PeerId).collect(),
+        learners: Vec::new(),
         bootstrap_peers: peers_id
             .iter()
             .map(|&id| BootstrapPeer {

@@ -179,6 +179,7 @@ async fn main() {
         node_id: PeerId(1),
         cluster_id: ClusterId(1),
         peers: vec![PeerId(1)],
+        learners: Vec::new(),
         bootstrap_peers: vec![BootstrapPeer {
             id: PeerId(1),
             addr: "127.0.0.1:0".parse().unwrap(),

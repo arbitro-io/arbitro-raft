@@ -1,4 +1,4 @@
-use super::{body_total_len, kind_of};
+use super::{body_total_len, kind_of, wire_len_u32};
 use crate::protocol::codec::wire::{
     AppendEntries, EntryHeader, RaftFrameHeader, KIND_APPEND_ENTRIES, RAFT_FRAME_HEADER_SIZE,
     RAFT_MAGIC, RAFT_VERSION,
@@ -38,7 +38,7 @@ fn encode_message_vectored_impl<'a>(
     out_vectored: &mut Vec<&'a [u8]>,
 ) -> Result<(), RaftError> {
     if let RaftMessage::AppendEntriesVectored(m, entries) = msg {
-        return encode_append_entries_vectored(
+        return encode_append_entries_vectored_with_pad(
             from,
             group_id,
             Term(m.term.get()),
@@ -46,6 +46,10 @@ fn encode_message_vectored_impl<'a>(
             LogIndex(m.prev_log_index.get()),
             Term(m.prev_log_term.get()),
             LogIndex(m.leader_commit.get()),
+            // A11: `_pad` carries the ReadIndex probe token — it must survive
+            // the scalar re-build, or heartbeat acks could never be
+            // correlated to a confirmation round.
+            m._pad.get(),
             entries,
             header_buf,
             out_vectored,
@@ -55,6 +59,8 @@ fn encode_message_vectored_impl<'a>(
     out_vectored.clear();
 
     let body_len = body_total_len(msg);
+    // B6: checked — a > 4 GiB body must fail the encode, never truncate.
+    let body_len_u32 = wire_len_u32(body_len, "frame body length")?;
     let total_header_len = RAFT_FRAME_HEADER_SIZE;
 
     if header_buf.len() < total_header_len {
@@ -74,7 +80,7 @@ fn encode_message_vectored_impl<'a>(
         header.kind = kind_of(msg);
         header.flags.set(0);
         header.from.set(from.0);
-        header.body_len.set(body_len as u32);
+        header.body_len.set(body_len_u32);
         header.reserved.set(0);
         header.group_id.set(group_id);
     }
@@ -150,6 +156,10 @@ fn encode_message_vectored_impl<'a>(
             out_vectored.push(&header_buf[..RAFT_FRAME_HEADER_SIZE]);
             out_vectored.push(m.as_bytes());
         }
+        RaftMessage::TimeoutNow(m) => {
+            out_vectored.push(&header_buf[..RAFT_FRAME_HEADER_SIZE]);
+            out_vectored.push(m.as_bytes());
+        }
         RaftMessage::Custom(p) | RaftMessage::CustomResponse(p) => {
             out_vectored.push(&header_buf[..RAFT_FRAME_HEADER_SIZE]);
             if !p.is_empty() {
@@ -163,6 +173,11 @@ fn encode_message_vectored_impl<'a>(
 
 /// Specialized vectored encoder for batches. Interleaves Entry headers (written to header_buf)
 /// and their respective payloads (from entries).
+///
+/// The `AppendEntries._pad` reserved word is encoded as `0`; callers that need
+/// to carry the A11 ReadIndex probe token go through
+/// [`encode_message_vectored`] with a populated `AppendEntriesVectored` body
+/// (or [`encode_append_entries_vectored_with_pad`] internally).
 #[allow(clippy::too_many_arguments)]
 pub fn encode_append_entries_vectored<'a>(
     from: PeerId,
@@ -176,6 +191,41 @@ pub fn encode_append_entries_vectored<'a>(
     header_buf: &'a mut [u8],
     out_vectored: &mut Vec<&'a [u8]>,
 ) -> Result<(), RaftError> {
+    encode_append_entries_vectored_with_pad(
+        from,
+        group_id,
+        term,
+        leader_id,
+        prev_log_index,
+        prev_log_term,
+        leader_commit,
+        0,
+        entries,
+        header_buf,
+        out_vectored,
+    )
+}
+
+/// [`encode_append_entries_vectored`] with an explicit value for the
+/// `AppendEntries._pad` reserved word (A11: the ReadIndex probe token that
+/// followers echo back in `AppendEntriesResp._pad[0..4]`).
+// B13: the three `Ref::from_prefix(..).unwrap()`s below operate on slices
+// whose lengths were computed from the very struct sizes being taken
+// (`total_headers_needed` is checked before the writes), so they cannot fail.
+#[allow(clippy::too_many_arguments, clippy::unwrap_used)]
+pub(crate) fn encode_append_entries_vectored_with_pad<'a>(
+    from: PeerId,
+    group_id: u64,
+    term: Term,
+    leader_id: PeerId,
+    prev_log_index: LogIndex,
+    prev_log_term: Term,
+    leader_commit: LogIndex,
+    pad: u32,
+    entries: &'a [LogEntry<'a>],
+    header_buf: &'a mut [u8],
+    out_vectored: &mut Vec<&'a [u8]>,
+) -> Result<(), RaftError> {
     out_vectored.clear();
     out_vectored.reserve(2 * entries.len() + 1);
 
@@ -184,6 +234,9 @@ pub fn encode_append_entries_vectored<'a>(
         body_payload_len += std::mem::size_of::<EntryHeader>() + e.payload.0.len();
     }
     let body_wire_len = std::mem::size_of::<AppendEntries>() + body_payload_len;
+    // B6: checked — a > 4 GiB batch body must fail the encode, never truncate.
+    let body_wire_len_u32 = wire_len_u32(body_wire_len, "frame body length")?;
+    let entry_count_u32 = wire_len_u32(entries.len(), "entry count")?;
 
     let total_headers_needed = RAFT_FRAME_HEADER_SIZE
         + std::mem::size_of::<AppendEntries>()
@@ -208,7 +261,7 @@ pub fn encode_append_entries_vectored<'a>(
         header.kind = KIND_APPEND_ENTRIES;
         header.flags.set(0);
         header.from.set(from.0);
-        header.body_len.set(body_wire_len as u32);
+        header.body_len.set(body_wire_len_u32);
         header.reserved.set(0);
         header.group_id.set(group_id);
 
@@ -222,8 +275,8 @@ pub fn encode_append_entries_vectored<'a>(
         body.prev_log_index.set(prev_log_index.0);
         body.prev_log_term.set(prev_log_term.0);
         body.leader_commit.set(leader_commit.0);
-        body.entry_count.set(entries.len() as u32);
-        body._pad.set(0);
+        body.entry_count.set(entry_count_u32);
+        body._pad.set(pad);
     }
 
     // 2. Collection phase
@@ -236,6 +289,8 @@ pub fn encode_append_entries_vectored<'a>(
     // 3. Interleave Entries
     for e in entries {
         let eh_len = std::mem::size_of::<EntryHeader>();
+        // B6: checked — never truncate a payload length.
+        let payload_len_u32 = wire_len_u32(e.payload.0.len(), "entry payload length")?;
 
         // Write EntryHeader
         unsafe {
@@ -245,7 +300,7 @@ pub fn encode_append_entries_vectored<'a>(
             let eh = Ref::into_mut(eh_ref);
             eh.term.set(e.term.0);
             eh.index.set(e.index.0);
-            eh.payload_len.set(e.payload.0.len() as u32);
+            eh.payload_len.set(payload_len_u32);
             eh._pad.set(0);
 
             // Push Header Slice

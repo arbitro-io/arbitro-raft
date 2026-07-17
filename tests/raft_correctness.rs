@@ -157,6 +157,7 @@ impl RaftStorage for TestStorage {
         }
         Ok(())
     }
+
     fn read_entries<'a>(
         &self,
         from: LogIndex,
@@ -165,30 +166,32 @@ impl RaftStorage for TestStorage {
         payload_buf: &'a mut [u8],
     ) -> Result<usize, RaftError> {
         let entries = self.entries.lock().unwrap();
-        let mut offset = 0;
+        let mut buf = payload_buf;
+        let mut written = 0;
         for e in entries.iter() {
             if e.index >= from && e.index < to {
                 let len = e.payload.len();
-                if offset + len > payload_buf.len() {
+                if len > buf.len() {
                     return Err(RaftError::Storage("payload_buf too small".into()));
                 }
-                payload_buf[offset..offset + len].copy_from_slice(&e.payload);
-
-                // SAFETY: We ensure payload_buf lives as long as 'a
-                let static_payload = unsafe {
-                    std::mem::transmute::<&[u8], &'a [u8]>(&payload_buf[offset..offset + len])
-                };
-
+                // Split the front chunk off the remaining buffer so the
+                // shared ref pushed into `out` is never invalidated by a
+                // later write through `buf` — no transmute, and Stacked
+                // Borrows (Miri) clean.
+                let (chunk, rest) = std::mem::take(&mut buf).split_at_mut(len);
+                chunk.copy_from_slice(&e.payload);
+                buf = rest;
                 out.push(LogEntry {
                     term: e.term,
                     index: e.index,
-                    payload: EntryPayload(static_payload),
+                    payload: EntryPayload(chunk),
                 });
-                offset += len;
+                written += len;
             }
         }
-        Ok(offset)
+        Ok(written)
     }
+
     fn truncate_suffix(&self, from: LogIndex) -> Result<(), RaftError> {
         self.entries.lock().unwrap().retain(|e| e.index < from);
         Ok(())
@@ -220,9 +223,8 @@ impl RaftStorage for TestStorage {
             }
             payload_buf[..e.payload.len()].copy_from_slice(&e.payload);
 
-            // SAFETY: We ensure payload_buf lives as long as 'a
-            let static_payload =
-                unsafe { std::mem::transmute::<&[u8], &'a [u8]>(&payload_buf[..e.payload.len()]) };
+            // Shared reborrow-for-return of the 'a buffer (borrow-checked).
+            let static_payload: &'a [u8] = &payload_buf[..e.payload.len()];
 
             Ok(Some(LogEntry {
                 term: e.term,
@@ -245,6 +247,7 @@ fn config_3node(node_id: u64) -> NodeConfig {
         node_id: PeerId(node_id),
         cluster_id: ClusterId(1),
         peers: peers_id.iter().copied().map(PeerId).collect(),
+        learners: Vec::new(),
         bootstrap_peers: peers_id
             .iter()
             .map(|&id| BootstrapPeer {
@@ -560,5 +563,120 @@ async fn metrics_count_election_activity() {
         metrics.snapshot().elections_started,
         1,
         "the earlier-cloned metrics handle must observe the election start"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B7 (P5): an empty payload batch must return cleanly — never panic on the
+// `.last()` of the (empty) scratch index vec.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn empty_batch_propose_returns_cleanly() {
+    let (transport, _out) = TestTransport::new();
+    let mut node =
+        arbitro_raft::RaftNode::new(config_3node(1), TestStorage::default(), transport).unwrap();
+    node.become_leader_for_benchmark(Term(1));
+
+    let indexes = node
+        .propose_batch_once(&[])
+        .await
+        .expect("an empty batch must be an Ok no-op, not a panic (B7)");
+    assert!(indexes.is_empty(), "empty batch must yield no indexes");
+}
+
+// ---------------------------------------------------------------------------
+// B11 (PS9): the propose-time quorum gather must be bounded by an ABSOLUTE
+// deadline. A hostile/misbehaving peer stream that keeps delivering
+// non-quorum frames (each recv succeeding immediately) must not stall
+// `gather_quorum_acks` forever by resetting the per-recv timeout.
+// ---------------------------------------------------------------------------
+
+/// Transport whose recv side floods an endless stream of valid but
+/// quorum-irrelevant frames (a stale `RequestVoteResp`), and whose send side
+/// accepts everything (so the propose fan-out marks peers pending).
+struct FloodTransport {
+    junk: Vec<u8>,
+}
+
+impl RaftTransport for FloodTransport {
+    fn send_vectored(
+        &self,
+        _peer: PeerId,
+        _slices: &[&[u8]],
+    ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
+        async { Ok(()) }
+    }
+
+    fn send_frame_owned(
+        &self,
+        _peer: PeerId,
+        _frame: bytes::Bytes,
+    ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
+        async { Ok(()) }
+    }
+
+    fn recv_frame(
+        &self,
+        out: &mut [u8],
+    ) -> impl std::future::Future<Output = Result<usize, RaftError>> + Send {
+        let junk = &self.junk;
+        async move {
+            out[..junk.len()].copy_from_slice(junk);
+            Ok(junk.len())
+        }
+    }
+
+    fn recv_frame_timeout(
+        &self,
+        _timeout: Duration,
+        out: &mut [u8],
+    ) -> impl std::future::Future<Output = Result<Option<usize>, RaftError>> + Send {
+        let junk = &self.junk;
+        async move {
+            // Yield so a wrapping `tokio::time::timeout` can still fire if a
+            // regression makes the gather loop unbounded again.
+            tokio::task::yield_now().await;
+            out[..junk.len()].copy_from_slice(junk);
+            Ok(Some(junk.len()))
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quorum_gather_is_bounded_under_hostile_frame_flood() {
+    use arbitro_raft::{encode_message_to_bytes, RaftMessage, RequestVoteResp};
+
+    // A stale (term 0) vote response from peer 2: decodes fine, is routed to
+    // the normal inbound handler, and never counts toward the propose quorum.
+    let resp = RequestVoteResp {
+        term: 0u64.into(),
+        vote_granted: 0,
+        _pad: [0; 7],
+    };
+    let junk = encode_message_to_bytes(PeerId(2), &RaftMessage::RequestVoteResp(&resp))
+        .unwrap()
+        .to_vec();
+
+    let transport = FloodTransport { junk };
+    let mut node =
+        arbitro_raft::RaftNode::new(config_3node(1), TestStorage::default(), transport).unwrap();
+    node.become_leader_for_benchmark(Term(1));
+
+    // config_3node: heartbeat_ms = 50 → gather deadline = 100 ms. Allow very
+    // generous CI slack, but the call MUST return — and with NoQuorum, since
+    // no real ack ever arrives (a false commit here would be data loss).
+    let started = std::time::Instant::now();
+    let res = tokio::time::timeout(Duration::from_secs(30), node.propose_once(b"x"))
+        .await
+        .expect("propose must return within the absolute deadline, not hang (B11)");
+    assert!(
+        matches!(res, Err(RaftError::NoQuorum)),
+        "flooded gather must end in NoQuorum, got {res:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "gather must respect its absolute deadline, took {:?}",
+        started.elapsed()
     );
 }

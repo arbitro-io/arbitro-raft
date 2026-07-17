@@ -1,7 +1,7 @@
 use crate::api::node::progress::AppendAdvance;
 use crate::RaftNode;
 use crate::{AppendEntriesResp, InboundRaftMessage, LogIndex, PeerId, RaftError, RaftMessage};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 impl<S, T> RaftNode<S, T>
 where
@@ -23,7 +23,16 @@ where
                 .await?
             {
                 self.scratch_pending.remove(&from);
-                *accepted += 1;
+                // A13: only a VOTER's completed ack moves the commit counter.
+                // Learners are part of the initial fan-out (they replicate
+                // like followers, and `advance_append_replication` above has
+                // already advanced their progress), but their ack must never
+                // count toward `needed` — in a 3-voter + 1-learner cluster an
+                // entry acked by the leader and the learner alone must NOT
+                // commit.
+                if self.config.peers.contains(&from) {
+                    *accepted += 1;
+                }
             }
         } else {
             self.handle_append_entries_response(from, resp).await?;
@@ -31,7 +40,9 @@ where
         Ok(())
     }
 
-    /// Block until a quorum has acknowledged `last_index` or `timeout` expires without progress.
+    /// Block until a quorum has acknowledged `last_index` or the absolute
+    /// deadline (`now + timeout`) expires (B11): a peer stream that keeps
+    /// delivering non-quorum frames must not extend the gather window forever.
     /// Returns the number of accepted acknowledgements (leader self-ack = 1 on entry).
     pub(super) async fn gather_quorum_acks(
         &mut self,
@@ -40,13 +51,18 @@ where
         timeout: Duration,
     ) -> Result<usize, RaftError> {
         let mut accepted = 1usize;
+        // B11: absolute deadline, mirroring the pre-vote gather in
+        // `election.rs`. Without it a slow/hostile peer that trickles
+        // irrelevant frames resets the per-recv timeout indefinitely.
+        let deadline = Instant::now() + timeout;
 
-        // Use pre-allocated quorum buffer
-        self.scratch_quorum_buf.clear();
-        if self.scratch_quorum_buf.capacity() < 64 * 1024 {
-            self.scratch_quorum_buf.reserve(64 * 1024);
+        // Use pre-allocated quorum buffer. B5: grow with `resize` — which
+        // zero-fills any newly exposed bytes — instead of `reserve` +
+        // `set_len`, which would expose uninitialized heap memory if the
+        // reserve reallocated. Once the buffer is at 64 KiB this is a no-op.
+        if self.scratch_quorum_buf.len() < 64 * 1024 {
+            self.scratch_quorum_buf.resize(64 * 1024, 0);
         }
-        unsafe { self.scratch_quorum_buf.set_len(64 * 1024) };
 
         // RAII Guard to ensure the buffer is returned to self even on error/panic.
         struct BufferGuard<'a, S, T> {
@@ -103,6 +119,9 @@ where
                     .node
                     .propose_commit_reached(needed, accepted, last_index)
                     || guard.node.scratch_pending.is_empty()
+                    // B11: a flood of immediately-available non-quorum frames
+                    // must not keep this burst loop spinning past the deadline.
+                    || Instant::now() >= deadline
                 {
                     break;
                 }
@@ -115,11 +134,20 @@ where
                 break;
             }
 
+            // B11: bound the blocking wait by the remaining budget, not a
+            // fresh full `timeout` per recv. On expiry we fall out with the
+            // acks gathered so far; the caller sees commit not reached and
+            // surfaces `NoQuorum` — never a hang, never a false commit.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
             // Blocking wait: yield only when the queue is actually empty.
             let n = match guard
                 .node
                 .transport
-                .recv_frame_timeout(timeout, &mut guard.buf)
+                .recv_frame_timeout(remaining, &mut guard.buf)
                 .await
             {
                 Ok(Some(n)) => n,

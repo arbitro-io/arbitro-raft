@@ -5,10 +5,13 @@
 //!
 //! The joint-consensus apply hook (`apply_if_config_change`) is wired into
 //! `ArbitroRaft::apply_committed_entries`, so the peer set is mutated at
-//! runtime and the leader routes AppendEntries to the new voter. Scenario 1
-//! (add) runs and passes. Scenario 2 (remove) is `#[ignore]`d: it exposes
-//! removed-node disruption that this lock-holding harness cannot fully close
-//! without leader-transfer (§4.2.3) — see the attribute on that test.
+//! runtime and the leader routes AppendEntries to the new voter. Both
+//! scenarios run un-ignored. Scenario 2 (remove) exercises the two robust
+//! remove-node legs: a leader removing ITSELF transfers leadership to a
+//! surviving voter first (§4.2.3, surfaced as a `NotLeader` redirect the
+//! harness retries), and the leader sends a farewell commit advertisement
+//! under the still-active joint union so the removed node learns `C_new`
+//! committed and self-removes instead of disrupting the cluster.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -92,6 +95,7 @@ impl RaftStorage for TestStorage {
         }
         Ok(())
     }
+
     fn read_entries<'a>(
         &self,
         from: LogIndex,
@@ -100,30 +104,32 @@ impl RaftStorage for TestStorage {
         payload_buf: &'a mut [u8],
     ) -> Result<usize, RaftError> {
         let entries = self.entries.lock().unwrap();
-        let mut offset = 0;
+        let mut buf = payload_buf;
+        let mut written = 0;
         for e in entries.iter() {
             if e.index >= from && e.index < to {
                 let len = e.payload.len();
-                if offset + len > payload_buf.len() {
+                if len > buf.len() {
                     return Err(RaftError::Storage("payload_buf too small".into()));
                 }
-                payload_buf[offset..offset + len].copy_from_slice(&e.payload);
-
-                // SAFETY: payload_buf outlives 'a for the duration of this call.
-                let static_payload = unsafe {
-                    std::mem::transmute::<&[u8], &'a [u8]>(&payload_buf[offset..offset + len])
-                };
-
+                // Split the front chunk off the remaining buffer so the
+                // shared ref pushed into `out` is never invalidated by a
+                // later write through `buf` — no transmute, and Stacked
+                // Borrows (Miri) clean.
+                let (chunk, rest) = std::mem::take(&mut buf).split_at_mut(len);
+                chunk.copy_from_slice(&e.payload);
+                buf = rest;
                 out.push(LogEntry {
                     term: e.term,
                     index: e.index,
-                    payload: EntryPayload(static_payload),
+                    payload: EntryPayload(chunk),
                 });
-                offset += len;
+                written += len;
             }
         }
-        Ok(offset)
+        Ok(written)
     }
+
     fn truncate_suffix(&self, from: LogIndex) -> Result<(), RaftError> {
         self.entries.lock().unwrap().retain(|e| e.index < from);
         Ok(())
@@ -155,9 +161,8 @@ impl RaftStorage for TestStorage {
             }
             payload_buf[..e.payload.len()].copy_from_slice(&e.payload);
 
-            // SAFETY: payload_buf outlives 'a for the duration of this call.
-            let static_payload =
-                unsafe { std::mem::transmute::<&[u8], &'a [u8]>(&payload_buf[..e.payload.len()]) };
+            // Shared reborrow-for-return of the 'a buffer (borrow-checked).
+            let static_payload: &'a [u8] = &payload_buf[..e.payload.len()];
 
             Ok(Some(LogEntry {
                 term: e.term,
@@ -178,6 +183,7 @@ fn make_config(node_id: u64, peers: &[u64]) -> NodeConfig {
         node_id: PeerId(node_id),
         cluster_id: ClusterId(1),
         peers: peers.iter().copied().map(PeerId).collect(),
+        learners: Vec::new(),
         bootstrap_peers: peers
             .iter()
             .map(|&id| BootstrapPeer {
@@ -201,12 +207,16 @@ struct NetworkHub {
     senders: Mutex<
         std::collections::HashMap<PeerId, tokio::sync::mpsc::UnboundedSender<(PeerId, Vec<u8>)>>,
     >,
+    /// Peers whose traffic (both directions) is silently dropped —
+    /// controllable delivery for partition scenarios.
+    blocked: Mutex<std::collections::HashSet<PeerId>>,
 }
 
 impl NetworkHub {
     fn new() -> Self {
         Self {
             senders: Mutex::new(std::collections::HashMap::new()),
+            blocked: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -218,7 +228,21 @@ impl NetworkHub {
         self.senders.lock().unwrap().insert(peer, sender);
     }
 
+    /// Replace the blocked-peer set. Frames to or from a blocked peer are
+    /// dropped, isolating it in both directions.
+    fn set_blocked(&self, peers: &[PeerId]) {
+        let mut blocked = self.blocked.lock().unwrap();
+        blocked.clear();
+        blocked.extend(peers.iter().copied());
+    }
+
     fn send(&self, from: PeerId, to: PeerId, data: Vec<u8>) {
+        {
+            let blocked = self.blocked.lock().unwrap();
+            if blocked.contains(&from) || blocked.contains(&to) {
+                return;
+            }
+        }
         if let Some(sender) = self.senders.lock().unwrap().get(&to) {
             let _ = sender.send((from, data));
         }
@@ -484,17 +508,6 @@ async fn test_add_fourth_node_via_config_change() {
 // Test 2 — remove the fourth node via config change.
 // ---------------------------------------------------------------------------
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "flaky (~1 in 3): removed-node disruption. The §4.3 auto-resumption \
-(ArbitroRaft::finalize_joint_if_inherited) and the leader-side pre-vote denial \
-(G2) landed and cut the failure rate, but cannot fully close it here because \
-this harness holds the leader's lock across the whole two-entry \
-propose_config_change, starving that node's heartbeat loop; a peer can then \
-time out and win an election mid-transition BEFORE C_new reaches it (so it \
-carries the stale voter set and never self-removes). Robustly closing this \
-needs EITHER leader-transfer-before-removal (Raft §4.2.3) OR a harness that \
-drives the config change through the run loop so heartbeats interleave. Tracked \
-as a P1 item in AUDIT_REPORT. The add-node path \
-(test_add_fourth_node_via_config_change) is un-ignored and passes robustly."]
 async fn test_remove_node_via_config_change() {
     let hub = Arc::new(NetworkHub::new());
     let initial = [1u64, 2, 3, 4];
@@ -519,12 +532,41 @@ async fn test_remove_node_via_config_change() {
         r.propose_once(&payload).await.expect("app propose failed");
     }
 
-    let final_idx = {
-        let mut r = rafts[leader].lock().await;
-        r.propose_config_change(vec![PeerId(1), PeerId(2), PeerId(3)])
-            .await
-            .expect("config change failed")
-    };
+    // Drive the removal with a leader-retry loop. Two legitimate redirects
+    // can occur: (a) the current leader IS node 4 — `propose_config_change`
+    // then transfers leadership to a surviving voter (§4.2.3) and returns
+    // `NotLeader` with a hint, and the change must be re-proposed on the
+    // new leader; (b) an unrelated leadership change lands between finding
+    // the leader and locking it. Both are retried; any other error fails.
+    let mut final_idx_opt = None;
+    for _attempt in 0..20 {
+        let leader = await_leader(&rafts).await;
+        let res = {
+            let mut r = rafts[leader].lock().await;
+            r.propose_config_change(vec![PeerId(1), PeerId(2), PeerId(3)])
+                .await
+        };
+        match res {
+            Ok(idx) => {
+                final_idx_opt = Some(idx);
+                break;
+            }
+            Err(RaftError::NotLeader { .. }) => {
+                // Redirected (self-removal transfer or a concurrent
+                // election) — give the handoff a beat, then retry on
+                // whichever node now leads.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(RaftError::TransferTimeout(_)) => {
+                // Self-removal handoff aborted because the target could not
+                // catch up within an election timeout; leadership resumed
+                // unchanged and the transfer is documented safe to retry.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("config change failed with non-redirect error: {e:?}"),
+        }
+    }
+    let final_idx = final_idx_opt.expect("config change did not commit within retry budget");
     assert!(
         final_idx.0 >= 7,
         "final_idx {} < 7 — expected 5 app + 2 config entries",
@@ -534,7 +576,7 @@ async fn test_remove_node_via_config_change() {
     // Wait (bounded) for the removal to converge instead of assuming a fixed
     // sleep is enough — config-change propagation timing varies run to run.
     let expected: Vec<PeerId> = [1u64, 2, 3].iter().copied().map(PeerId).collect();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let mut ok = true;
         for i in 0..3 {
@@ -575,5 +617,189 @@ async fn test_remove_node_via_config_change() {
             !is_leader && !peers.contains(&PeerId(4)),
             "node 4 was not removed from quorum: is_leader={is_leader} peers={peers:?}",
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 3 — A3/G4 pin: the Joint entry's OWN commit obeys the dual quorum.
+//
+// 3→5 grow (old = {1,2,3}, new = {1,2,3,4,5}). One old-config follower is
+// partitioned and nodes 4/5 are down, so the Joint entry is acked ONLY by
+// {leader, one old follower}: a majority of C_old (2 of 3) but NOT a
+// majority of C_new (2 of 5). Raft §4.3 requires majority-of-old AND
+// majority-of-new for every entry once the joint config is effective —
+// including the Joint entry itself. Before the append-time leader-side
+// activation fix, the leader decided this commit under the old majority
+// alone and would (wrongly) commit here; an entry committed without a
+// majority of C_new can be lost to a future leader elected inside the new
+// configuration. After healing the partition and booting 4/5, the dual
+// rule becomes satisfiable and the same entry must commit.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread")]
+async fn test_joint_entry_commit_requires_dual_quorum() {
+    let hub = Arc::new(NetworkHub::new());
+    let initial = [1u64, 2, 3];
+
+    let mut rafts: Vec<SharedRaft> = Vec::new();
+    let mut guard = AbortOnDrop { handles: vec![] };
+
+    for id in initial {
+        let (r, _s, _sm) = boot_node(hub.clone(), id, &initial);
+        guard.handles.push(spawn_driver(r.clone()));
+        rafts.push(r);
+    }
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    // Establish a committed application log first.
+    {
+        let leader = await_leader(&rafts).await;
+        for i in 0..3u8 {
+            let payload = [b'z', i];
+            let mut r = rafts[leader].lock().await;
+            r.propose_once(&payload).await.expect("app propose failed");
+        }
+    }
+
+    // Lock the leader, THEN partition one old-config follower (both
+    // directions) while nodes 4/5 do not exist yet. Verifying leadership
+    // under the lock closes the find-then-lock race; retry on a shift.
+    let mut pinned: Option<(usize, PeerId, LogIndex, LogIndex)> = None;
+    for _attempt in 0..10 {
+        let leader = await_leader(&rafts).await;
+        let leader_id = PeerId(initial[leader]);
+        let mut r = rafts[leader].lock().await;
+        if !r.node().is_leader() {
+            drop(r);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+        let blocked = initial
+            .iter()
+            .copied()
+            .map(PeerId)
+            .find(|p| *p != leader_id)
+            .expect("3-node cluster has a non-leader old member");
+        hub.set_blocked(&[blocked]);
+
+        let commit_before = r.commit_index();
+        let res = r
+            .propose_config_change(vec![
+                PeerId(1),
+                PeerId(2),
+                PeerId(3),
+                PeerId(4),
+                PeerId(5),
+            ])
+            .await;
+        let commit_after = r.commit_index();
+        let joint_idx = r.status().last_log_index;
+        drop(r);
+
+        match res {
+            Ok(idx) => panic!(
+                "config change reported committed at {} with only a \
+                 minority of C_new reachable — dual-quorum violated",
+                idx.0
+            ),
+            // Pre-append leadership loss — activation was rolled back;
+            // heal and retry the whole pin on the new leader.
+            Err(RaftError::NotLeader { .. }) => {
+                hub.set_blocked(&[]);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+            Err(_) => {
+                // The Joint entry must have been APPENDED (the commit
+                // decision was actually exercised) and must NOT have
+                // committed: acks = {leader, one old follower} is a
+                // majority of C_old but not of C_new.
+                assert!(
+                    joint_idx > commit_before,
+                    "joint entry was never appended (last_log {} <= commit_before {}) — \
+                     scenario not exercised",
+                    joint_idx.0,
+                    commit_before.0,
+                );
+                assert_eq!(
+                    commit_after, commit_before,
+                    "THE PIN: joint entry at {} committed under the old majority \
+                     without a majority of C_new (commit {} -> {})",
+                    joint_idx.0, commit_before.0, commit_after.0,
+                );
+                pinned = Some((leader, blocked, commit_before, joint_idx));
+                break;
+            }
+        }
+    }
+    let (leader, blocked, commit_before, joint_idx) =
+        pinned.expect("could not pin the dual-quorum scenario within retry budget");
+
+    // Hold the partition and confirm the run loop does not commit it
+    // either — try_advance_commit_index must also honor the dual rule.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for (i, r) in rafts.iter().enumerate() {
+        let id = PeerId(initial[i]);
+        if id == blocked {
+            continue; // never saw the entry
+        }
+        let g = r.lock().await;
+        assert!(
+            g.commit_index() < joint_idx,
+            "node {} committed the joint entry at {} while a majority of C_new \
+             was unreachable (commit {})",
+            id.0,
+            joint_idx.0,
+            g.commit_index().0,
+        );
+    }
+    // Sanity: the leader really appended the joint entry (pin integrity).
+    assert!(
+        joint_idx > commit_before && rafts[leader].lock().await.status().last_log_index >= joint_idx
+    );
+
+    // Heal: unblock the old follower and boot nodes 4 and 5. The dual
+    // rule is now satisfiable; the appended joint entry must commit and
+    // the transition must finish (a leader inheriting the active joint
+    // config finalizes it on election — §4.3 auto-resumption).
+    hub.set_blocked(&[]);
+    let target = [1u64, 2, 3, 4, 5];
+    for id in [4u64, 5] {
+        let (r, _s, _sm) = boot_node(hub.clone(), id, &target);
+        guard.handles.push(spawn_driver(r.clone()));
+        rafts.push(r);
+    }
+
+    let expected: Vec<PeerId> = target.iter().copied().map(PeerId).collect();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let mut ok = true;
+        for r in rafts.iter().take(3) {
+            let g = r.lock().await;
+            if g.commit_index() < joint_idx || g.node().peers() != expected.as_slice() {
+                ok = false;
+            }
+        }
+        if ok {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            for (i, r) in rafts.iter().enumerate() {
+                let g = r.lock().await;
+                eprintln!(
+                    "node {}: commit={} peers={:?} leader={}",
+                    i + 1,
+                    g.commit_index().0,
+                    g.node().peers(),
+                    g.node().is_leader(),
+                );
+            }
+            panic!(
+                "joint entry at {} did not commit / transition did not finish \
+                 after the dual quorum became satisfiable",
+                joint_idx.0
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

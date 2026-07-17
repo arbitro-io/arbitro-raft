@@ -53,6 +53,9 @@ impl<'a> DispatchResponseView<'a> {
     }
 
     fn header(&self) -> &DispatchResponseFrameHeader {
+        // B13: `frame` was validated at construction (`new` rejects short or
+        // malformed frames), so the prefix take cannot fail here.
+        #[allow(clippy::expect_used)]
         let (header, _) = Ref::<_, DispatchResponseFrameHeader>::from_prefix(self.frame)
             .expect("dispatch response view always stores a validated header");
         Ref::into_ref(header)
@@ -106,7 +109,12 @@ impl<'a> DispatchResponseView<'a> {
     }
 }
 
-pub fn encode_dispatch_response(response: &DispatchResponse) -> Vec<u8> {
+pub fn encode_dispatch_response(response: &DispatchResponse) -> Result<Vec<u8>, RaftError> {
+    // B6: checked — a payload that does not fit the u32 wire field must fail
+    // the encode, never be silently truncated into a corrupt frame.
+    let body_len = u32::try_from(response.payload.len()).map_err(|_| {
+        RaftError::Dispatch("dispatch response payload length exceeds u32 wire field".into())
+    })?;
     let header = DispatchResponseFrameHeader {
         magic: U32::new(RAFT_DISPATCH_RESPONSE_MAGIC),
         version: RAFT_DISPATCH_RESPONSE_VERSION,
@@ -119,7 +127,7 @@ pub fn encode_dispatch_response(response: &DispatchResponse) -> Vec<u8> {
         },
         _pad: 0,
         tx_id: U64::new(response.tx_id),
-        body_len: U32::new(response.payload.len() as u32),
+        body_len: U32::new(body_len),
     };
 
     let mut out = Vec::with_capacity(
@@ -127,5 +135,5 @@ pub fn encode_dispatch_response(response: &DispatchResponse) -> Vec<u8> {
     );
     out.extend_from_slice(header.as_bytes());
     out.extend_from_slice(&response.payload);
-    out
+    Ok(out)
 }

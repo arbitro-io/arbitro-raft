@@ -63,6 +63,9 @@ impl<'a> DispatchView<'a> {
     }
 
     fn header(&self) -> &DispatchFrameHeader {
+        // B13: `frame` was validated at construction (`new` rejects short or
+        // malformed frames), so the prefix take cannot fail here.
+        #[allow(clippy::expect_used)]
         let (header, _) = Ref::<_, DispatchFrameHeader>::from_prefix(self.frame)
             .expect("dispatch view always stores a validated header");
         Ref::into_ref(header)

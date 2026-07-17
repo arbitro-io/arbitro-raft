@@ -1,4 +1,4 @@
-use super::{body_total_len, kind_of};
+use super::{body_total_len, kind_of, wire_len_u32};
 use crate::protocol::codec::wire::{
     AppendEntries, EntryHeader, RaftFrameHeader, RAFT_FRAME_HEADER_SIZE, RAFT_MAGIC, RAFT_VERSION,
 };
@@ -9,6 +9,9 @@ use zerocopy::{IntoBytes, Ref};
 /// Useful for parallel fan-out (sharing the same frame across multiple sends).
 pub fn encode_message_to_bytes(from: PeerId, msg: &RaftMessage) -> Result<bytes::Bytes, RaftError> {
     let body_len = body_total_len(msg);
+    // B6: checked conversion BEFORE the allocation — a > 4 GiB body must be
+    // rejected here, not truncated into a wrong `body_len` on the wire.
+    let body_len_u32 = wire_len_u32(body_len, "frame body length")?;
     let total_len = RAFT_FRAME_HEADER_SIZE + body_len;
 
     let mut buf = bytes::BytesMut::with_capacity(total_len);
@@ -32,7 +35,7 @@ pub fn encode_message_to_bytes(from: PeerId, msg: &RaftMessage) -> Result<bytes:
         header.kind = kind_of(msg);
         header.flags.set(0);
         header.from.set(from.0);
-        header.body_len.set(body_len as u32);
+        header.body_len.set(body_len_u32);
         header.reserved.set(0);
         header.group_id.set(0);
     }
@@ -52,7 +55,8 @@ pub fn encode_message_to_bytes(from: PeerId, msg: &RaftMessage) -> Result<bytes:
                 let eh = EntryHeader {
                     term: e.term.0.into(),
                     index: e.index.0.into(),
-                    payload_len: (e.payload.0.len() as u32).into(),
+                    // B6: checked — never truncate a payload length.
+                    payload_len: wire_len_u32(e.payload.0.len(), "entry payload length")?.into(),
                     _pad: 0.into(),
                 };
                 buf[offset..offset + eh_len].copy_from_slice(eh.as_bytes());
@@ -98,6 +102,9 @@ pub fn encode_message_to_bytes(from: PeerId, msg: &RaftMessage) -> Result<bytes:
             }
         }
         RaftMessage::InstallSnapshotResp(m) => {
+            buf[RAFT_FRAME_HEADER_SIZE..].copy_from_slice(m.as_bytes());
+        }
+        RaftMessage::TimeoutNow(m) => {
             buf[RAFT_FRAME_HEADER_SIZE..].copy_from_slice(m.as_bytes());
         }
         RaftMessage::AppendEntriesSeeded {

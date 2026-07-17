@@ -18,10 +18,35 @@ pub const CONFIG_CHANGE_MAGIC: u8 = 0xC0;
 /// Current wire version for [`ConfigChangeEntry`].
 pub const CONFIG_CHANGE_VERSION: u8 = 1;
 
+/// Discriminator byte for the leader no-op control entry (A11 / ReadIndex).
+///
+/// Lives in byte `[2]` of the reserved `0xC0` control envelope, in the same
+/// slot as the config-change phase but far from its values (`1` = Joint,
+/// `2` = Final) so the two control families can never be confused.
+/// [`ConfigChangeEntry::decode`] returns `None` for it (unknown phase), and
+/// [`apply_if_config_change`] consumes it explicitly — a no-op entry never
+/// reaches the user state machine. Safe to introduce because user payloads
+/// beginning with `0xC0` have always been rejected at propose time, so no
+/// existing log can contain these bytes as application data.
+pub(crate) const NOOP_DISCRIMINANT: u8 = 0x7F;
+
+/// The full wire payload of a leader no-op entry: 4 bytes,
+/// `[0xC0, version, 0x7F, 0]`.
+#[inline]
+pub(crate) fn noop_entry() -> [u8; 4] {
+    [CONFIG_CHANGE_MAGIC, CONFIG_CHANGE_VERSION, NOOP_DISCRIMINANT, 0]
+}
+
+/// Whether `payload` is exactly a leader no-op control entry.
+#[inline]
+pub(crate) fn is_noop_entry(payload: &[u8]) -> bool {
+    payload == noop_entry()
+}
+
 /// Header size in bytes: magic + version + phase + pad + old_len + new_len.
 const HEADER_LEN: usize = 12;
 
-/// Phase of a joint-consensus transition.
+/// Phase of a joint-consensus transition, or a learner-set change (A13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigChangePhase {
     /// Joint configuration `C_old_new` — both old and new voter sets are
@@ -29,6 +54,13 @@ pub enum ConfigChangePhase {
     Joint,
     /// Final configuration `C_new` — only the new voter set is active.
     Final,
+    /// A13: add the peers in `new_peers` as LEARNERS (non-voting members).
+    /// Does NOT touch the voter set and therefore changes no quorum — see
+    /// the single-entry rationale on [`ConfigChangeEntry`].
+    AddLearner,
+    /// A13: remove the peers in `new_peers` from the learner set. Does NOT
+    /// touch the voter set and therefore changes no quorum.
+    RemoveLearner,
 }
 
 /// A membership-change control entry.
@@ -39,7 +71,7 @@ pub enum ConfigChangePhase {
 /// |-----------------|-------------|----------------------------------------|
 /// | `[0]`           | `magic`     | Always [`CONFIG_CHANGE_MAGIC`] (0xC0). |
 /// | `[1]`           | `version`   | Always [`CONFIG_CHANGE_VERSION`] (1).  |
-/// | `[2]`           | `phase`     | `1` = Joint, `2` = Final.              |
+/// | `[2]`           | `phase`     | `1` = Joint, `2` = Final, `3` = AddLearner, `4` = RemoveLearner. |
 /// | `[3]`           | `_pad`      | Reserved, must be `0`.                 |
 /// | `[4..8]`        | `old_len`   | `u32` little-endian.                   |
 /// | `[8..12]`       | `new_len`   | `u32` little-endian.                   |
@@ -61,6 +93,18 @@ pub enum ConfigChangePhase {
 /// `config.peers` still holds the union of the two sets for the purpose
 /// of replication targets and broadcast fan-out; the dual-quorum rule
 /// gates commit progression on top of that broadcast set.
+///
+/// # Learner entries (A13)
+///
+/// `AddLearner` / `RemoveLearner` reuse this envelope with the affected
+/// peer ids carried in `new_peers` (`old_peers` is empty and ignored on
+/// read). Unlike voter transitions they are SINGLE control entries, not a
+/// joint pair: a learner is excluded from every quorum, so adding or
+/// removing one changes no majority on either side of §4.3's safety
+/// argument — there is no "two disjoint majorities" hazard to bridge, and
+/// the joint machinery would add cost without adding safety. Promotion of
+/// a learner to voter IS a quorum change and goes through the normal
+/// Joint→Final voter transition (`promote_learner`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigChangeEntry {
     pub phase: ConfigChangePhase,
@@ -80,6 +124,8 @@ impl ConfigChangeEntry {
         out.push(match self.phase {
             ConfigChangePhase::Joint => 1,
             ConfigChangePhase::Final => 2,
+            ConfigChangePhase::AddLearner => 3,
+            ConfigChangePhase::RemoveLearner => 4,
         });
         out.push(0u8); // _pad
         out.extend_from_slice(&(old_len as u32).to_le_bytes());
@@ -109,6 +155,8 @@ impl ConfigChangeEntry {
         let phase = match bytes[2] {
             1 => ConfigChangePhase::Joint,
             2 => ConfigChangePhase::Final,
+            3 => ConfigChangePhase::AddLearner,
+            4 => ConfigChangePhase::RemoveLearner,
             _ => return None,
         };
         // bytes[3] is reserved padding — ignore its value on read.
@@ -190,6 +238,10 @@ where
                 }
                 self.config.peers = merged;
                 self.joint_peers = Some((entry.old_peers.clone(), entry.new_peers.clone()));
+                // A13: a peer entering the voter set stops being a learner
+                // (promotion) — the sets stay disjoint at all times.
+                let peers = &self.config.peers;
+                self.config.learners.retain(|p| !peers.contains(p));
             }
             ConfigChangePhase::Final => {
                 if entry.new_peers.is_empty() {
@@ -199,6 +251,27 @@ where
                 }
                 self.config.peers = entry.new_peers.clone();
                 self.joint_peers = None;
+                // A13: keep voter/learner disjointness after the final set
+                // lands (a promoted learner is now a plain voter).
+                let peers = &self.config.peers;
+                self.config.learners.retain(|p| !peers.contains(p));
+            }
+            // A13: learner-set changes. Single-entry (no joint pair) because
+            // no quorum changes — see the type-level rationale. Idempotent on
+            // re-apply: the apply loop re-applies committed entries after a
+            // restart (`last_applied` is volatile), and followers also adopt
+            // these at append time (§4.1 append-time rule, same as voter
+            // config entries).
+            ConfigChangePhase::AddLearner => {
+                for p in &entry.new_peers {
+                    if !self.config.peers.contains(p) && !self.config.learners.contains(p) {
+                        self.config.learners.push(*p);
+                    }
+                }
+            }
+            ConfigChangePhase::RemoveLearner => {
+                let removed = &entry.new_peers;
+                self.config.learners.retain(|p| !removed.contains(p));
             }
         }
 
@@ -213,20 +286,54 @@ where
         Ok(())
     }
 
-    /// Bring `peer_progress` into agreement with `config.peers`: insert a
-    /// fresh entry for every voter that has none, and drop entries for
-    /// peers no longer in the voter set. Retained peers keep their
-    /// in-flight progress so replication does not restart from scratch.
+    /// Undo a leader-side append-time joint activation whose Joint entry
+    /// never reached the log (the propose failed BEFORE appending — e.g.
+    /// a leadership-transfer freeze or a step-down raced the call). The
+    /// effective voter set reverts to `old_peers` and the dual-quorum
+    /// rule is disarmed. Callers must NOT invoke this when the Joint
+    /// entry IS in the log: an appended-but-uncommitted config entry
+    /// stays active (Raft §4.1 append-time rule), exactly as on a
+    /// follower.
+    pub(crate) fn revert_joint_activation(&mut self, old_peers: Vec<PeerId>) {
+        self.config.peers = old_peers;
+        self.joint_peers = None;
+        if self.is_leader() {
+            self.reconcile_leader_progress_with_config();
+        }
+    }
+
+    /// A13: undo a leader-side append-time learner-set activation whose
+    /// control entry never reached the log (the propose failed BEFORE
+    /// appending). Mirrors [`revert_joint_activation`]: an appended-but-
+    /// uncommitted learner entry stays active (§4.1 append-time rule).
+    ///
+    /// [`revert_joint_activation`]: RaftNode::revert_joint_activation
+    pub(crate) fn revert_learner_activation(&mut self, prev_learners: Vec<PeerId>) {
+        self.config.learners = prev_learners;
+        if self.is_leader() {
+            self.reconcile_leader_progress_with_config();
+        }
+    }
+
+    /// Bring `peer_progress` into agreement with the effective membership
+    /// (`config.peers` voters + `config.learners` non-voting members, A13):
+    /// insert a fresh entry for every member that has none, and drop entries
+    /// for peers no longer in either set. Retained peers keep their in-flight
+    /// progress so replication does not restart from scratch. Learners get a
+    /// progress entry because the leader replicates to them exactly like
+    /// followers — the quorum math simply never reads their `match_index`.
     fn reconcile_leader_progress_with_config(&mut self) {
         let last_index = self.cached_last_log.0;
         let self_id = self.config.node_id;
 
-        // Drop entries for peers no longer in config.peers.
+        // Drop entries for peers in neither the voter nor the learner set.
         let stale: Vec<PeerId> = self
             .peer_progress
             .iter()
             .map(|(peer, _)| peer)
-            .filter(|peer| !self.config.peers.contains(peer))
+            .filter(|peer| {
+                !self.config.peers.contains(peer) && !self.config.learners.contains(peer)
+            })
             .collect();
         for peer in stale {
             self.peer_progress.remove(&peer);
@@ -234,8 +341,13 @@ where
             self.scratch_started.remove(&peer);
         }
 
-        // Insert fresh progress for any voter missing one (leader excluded).
-        for &peer in &self.config.peers {
+        // Insert fresh progress for any member missing one (leader excluded).
+        for &peer in self
+            .config
+            .peers
+            .iter()
+            .chain(self.config.learners.iter())
+        {
             if peer == self_id {
                 continue;
             }
@@ -243,7 +355,8 @@ where
                 self.peer_progress.insert(
                     peer,
                     PeerProgress {
-                        next_index: LogIndex(last_index.0 + 1),
+                        // B8 arithmetic policy: saturating at the boundary.
+                        next_index: LogIndex(last_index.0.saturating_add(1)),
                         match_index: LogIndex(0),
                     },
                 );
@@ -253,14 +366,17 @@ where
 }
 
 /// Apply the entry to `node` if — and only if — `payload` is a
-/// well-formed config-change entry. Returns `Ok(true)` when the payload
-/// was a config-change entry (and has been applied), `Ok(false)` when
-/// it was an ordinary application payload.
+/// well-formed control entry (config change or leader no-op). Returns
+/// `Ok(true)` when the payload was a control entry (and has been
+/// consumed), `Ok(false)` when it was an ordinary application payload.
 ///
 /// The `ArbitroRaft` apply loop calls this unconditionally for every
 /// committed entry immediately BEFORE forwarding the payload to the
 /// user state machine — application payloads short-circuit through the
-/// `false` branch, and control payloads never reach user code.
+/// `false` branch, and control payloads never reach user code. The A11
+/// leader no-op (see [`noop_entry`]) is consumed with no state change:
+/// its sole purpose is to commit an entry of the leader's current term
+/// so ReadIndex's §6.4 guard holds.
 pub fn apply_if_config_change<S, T>(
     node: &mut RaftNode<S, T>,
     payload: &[u8],
@@ -269,6 +385,9 @@ where
     S: RaftStorage,
     T: RaftTransport,
 {
+    if is_noop_entry(payload) {
+        return Ok(true);
+    }
     if let Some(entry) = ConfigChangeEntry::decode(payload) {
         node.apply_config_change(&entry)?;
         Ok(true)

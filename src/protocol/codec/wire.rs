@@ -31,6 +31,7 @@ pub const KIND_CUSTOM_RESPONSE: u8 = 8;
 pub const KIND_APPEND_ENTRIES_SEEDED: u8 = 9;
 pub const KIND_PRE_VOTE: u8 = 10;
 pub const KIND_PRE_VOTE_RESP: u8 = 11;
+pub const KIND_TIMEOUT_NOW: u8 = 12;
 
 // ── Wire structs ──────────────────────────────────────────────────────────────
 
@@ -83,6 +84,13 @@ pub struct AppendEntries {
     pub prev_log_term: U64,
     pub leader_commit: U64,
     pub entry_count: U32,
+    /// Reserved word, doubling as the A11 ReadIndex probe token: a leader
+    /// confirming its quorum for a linearizable read stamps its current
+    /// probe sequence here; the follower echoes it verbatim into
+    /// `AppendEntriesResp._pad[0..4]`. `0` = no probe (the historical
+    /// padding value), which a confirmation round never counts — so frames
+    /// from older senders degrade SAFE (reads fail, never go stale).
+    /// The field keeps its `_pad` name for wire/API compatibility.
     pub _pad: U32,
 }
 
@@ -105,6 +113,13 @@ pub struct AppendEntriesResp {
     pub term: U64,
     pub match_index: U64,
     pub success: u8,
+    /// Reserved bytes; `[0..4]` echo the request's `AppendEntries._pad`
+    /// (little-endian) — the A11 ReadIndex probe token. This is what lets a
+    /// leader distinguish an ack generated AFTER its confirmation round began
+    /// from a stale ack that was already buffered/in flight: only echoes
+    /// matching the round's freshly-bumped sequence count toward the read
+    /// quorum. All-zero (older peers) never matches a live round — safe.
+    /// The field keeps its `_pad` name for wire/API compatibility.
     pub _pad: [u8; 7],
 }
 
@@ -132,6 +147,27 @@ pub struct InstallSnapshotResp {
     pub next_offset: U64,
     pub accepted: u8,
     pub _pad: [u8; 7],
+}
+
+/// Leadership transfer (Raft §4.2.3): the leader tells a fully-caught-up
+/// target to start an election IMMEDIATELY — bypassing both the election
+/// timeout and the pre-vote phase (the transfer is leader-sanctioned, so
+/// pre-vote's disruption guard does not apply).
+///
+/// Body is 16 bytes after the standard 32-byte [`RaftFrameHeader`]:
+///
+/// | Bytes     | Field       | Notes                                      |
+/// |-----------|-------------|--------------------------------------------|
+/// | `[0..8]`  | `term`      | Sender's current term (`u64` LE). A target |
+/// |           |             | ignores the sanction if this is stale.     |
+/// | `[8..16]` | `leader_id` | The transferring leader's id (`u64` LE).   |
+#[derive(
+    IntoBytes, FromBytes, KnownLayout, Immutable, Unaligned, Clone, Copy, Debug, PartialEq, Eq,
+)]
+#[repr(C)]
+pub struct TimeoutNow {
+    pub term: U64,
+    pub leader_id: U64,
 }
 
 // wire.rs now only contains pure zerocopy-mapped structs

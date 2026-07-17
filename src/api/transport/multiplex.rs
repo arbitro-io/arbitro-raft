@@ -66,6 +66,8 @@ where
 
             // group_id lives at header[24..32], little-endian — matches
             // RaftFrameHeader::group_id in protocol/codec/wire.rs.
+            // B13: length checked above — a HEADER_SIZE prefix always converts.
+            #[allow(clippy::unwrap_used)]
             let mut header: [u8; RAFT_FRAME_HEADER_SIZE] =
                 slices[0][..RAFT_FRAME_HEADER_SIZE].try_into().unwrap();
             header[24..32].copy_from_slice(&group_id.0.to_le_bytes());
@@ -155,7 +157,10 @@ where
 /// Short buffers (below `RAFT_FRAME_HEADER_SIZE`) never match.
 fn frame_group_matches(buf: &[u8], group_id: GroupId) -> bool {
     buf.len() >= RAFT_FRAME_HEADER_SIZE
-        && u64::from_le_bytes(buf[24..32].try_into().unwrap()) == group_id.0
+        && buf
+            .get(24..32)
+            .and_then(|b| <[u8; 8]>::try_from(b).ok())
+            .is_some_and(|b| u64::from_le_bytes(b) == group_id.0)
 }
 
 /// Reserved for a future sprint: a proper per-group inbox splitter (e.g. a

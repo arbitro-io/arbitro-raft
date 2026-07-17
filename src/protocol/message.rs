@@ -1,6 +1,6 @@
 use super::codec::wire::{
     AppendEntries, AppendEntriesResp, EntryHeader, InstallSnapshot, InstallSnapshotResp,
-    RequestVote, RequestVoteResp,
+    RequestVote, RequestVoteResp, TimeoutNow,
 };
 use crate::{EntryPayload, GroupId, LogEntry, LogIndex, PeerId, Term};
 use zerocopy::Ref;
@@ -28,6 +28,8 @@ pub enum RaftMessage<'a> {
     AppendEntriesResp(&'a AppendEntriesResp),
     InstallSnapshot(&'a InstallSnapshot, &'a [u8]),
     InstallSnapshotResp(&'a InstallSnapshotResp),
+    /// Leadership transfer (§4.2.3): leader → caught-up target, "campaign now".
+    TimeoutNow(&'a TimeoutNow),
     Custom(&'a [u8]),
     CustomResponse(&'a [u8]),
 }
@@ -95,6 +97,14 @@ impl<'a> InboundRaftMessage<'a> {
 
     pub fn as_install_snapshot_resp(&self) -> Option<&'a InstallSnapshotResp> {
         if let RaftMessage::InstallSnapshotResp(msg) = self.message {
+            Some(msg)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_timeout_now(&self) -> Option<&'a TimeoutNow> {
+        if let RaftMessage::TimeoutNow(msg) = self.message {
             Some(msg)
         } else {
             None

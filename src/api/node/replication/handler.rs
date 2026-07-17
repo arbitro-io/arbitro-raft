@@ -7,6 +7,19 @@ use crate::protocol::{
 use crate::{LogIndex, PeerId, RaftError, RaftMessage, Role};
 use zerocopy::Ref;
 
+/// A11 (ReadIndex): echo the request's probe token (`AppendEntries._pad`)
+/// into the response's reserved bytes (`AppendEntriesResp._pad[0..4]`, LE).
+/// The leader's quorum-confirmation round only counts acks whose echo matches
+/// its freshly-bumped sequence — this is what distinguishes an ack generated
+/// after the read began from a stale ack already buffered in flight. Echoed
+/// on every response (success, reject, stale-term) — the confirmation filter
+/// is term-based on the leader side.
+#[inline]
+fn probe_echo_pad(msg: &AppendEntries) -> [u8; 7] {
+    let token = msg._pad.get().to_le_bytes();
+    [token[0], token[1], token[2], token[3], 0, 0, 0]
+}
+
 impl<S, T> RaftNode<S, T>
 where
     S: crate::RaftStorage,
@@ -37,12 +50,9 @@ where
             }
             let local_term = match self.log_metadata.get_term(incoming.index) {
                 Some(t) => Some(t),
-                None => {
-                    let mut dummy = [0u8; 8];
-                    self.storage
-                        .entry_at(incoming.index, &mut dummy)?
-                        .map(|e| e.term)
-                }
+                // B10: term-only probe — no payload read, no reliance on
+                // undersized-buffer truncation in `entry_at`.
+                None => self.storage.term_at(incoming.index)?,
             };
             match local_term {
                 Some(t) if t == incoming.term => {}
@@ -58,42 +68,38 @@ where
             }
         }
         if append_from < entry_count {
-            self.scratch_entries.clear();
+            // Dock-recycled LOCAL batch — the entries borrow `payload` (the
+            // decoded inbound frame), a lifetime the compiler verifies; no
+            // 'static laundering, nothing parked in `self` (US3).
+            let mut entries = self.scratch_entries.take();
             let iter = AppendEntriesEntryIter::new(payload, entry_count);
             for entry in iter.skip(append_from) {
-                // Safety: we transmute the lifetime to 'static to store it in the preallocated scratchpad.
-                // This is safe because scratch_entries is cleared immediately after the storage call.
-                let entry_static = unsafe {
-                    std::mem::transmute::<crate::LogEntry<'_>, crate::LogEntry<'static>>(entry)
-                };
-                self.scratch_entries.push(entry_static);
+                entries.push(entry);
             }
 
-            // SAFETY: storage traits expect LogEntry<'_>.
-            let entries_ref = unsafe {
-                std::mem::transmute::<&[crate::LogEntry<'static>], &[crate::LogEntry<'_>]>(
-                    &self.scratch_entries,
-                )
-            };
-            self.storage.append_entries(entries_ref)?;
-            for entry in entries_ref {
-                self.log_metadata.append(entry.index, entry.term);
-            }
+            let append_res = self.storage.append_entries(&entries);
+            let mut latest_config = None;
+            if append_res.is_ok() {
+                for entry in entries.iter() {
+                    self.log_metadata.append(entry.index, entry.term);
+                }
 
-            if let Some(last) = self.scratch_entries.last() {
-                self.cached_last_log = (last.index, last.term);
-            }
+                if let Some(last) = entries.last() {
+                    self.cached_last_log = (last.index, last.term);
+                }
 
-            // Append-time config activation (Raft §4.1): if any newly-appended
-            // entry is a config change, adopt it NOW — a server uses the latest
-            // configuration in its log whether or not it has committed. This is
-            // what lets a removed node recognize its removal (and stop
-            // campaigning) the instant it receives the entry, instead of racing
-            // to apply it before the leader drops it from replication.
-            let latest_config = self.scratch_entries.iter().rev().find_map(|e| {
-                crate::api::node::membership::ConfigChangeEntry::decode(e.payload.0)
-            });
-            self.scratch_entries.clear();
+                // Append-time config activation (Raft §4.1): if any newly-appended
+                // entry is a config change, adopt it NOW — a server uses the latest
+                // configuration in its log whether or not it has committed. This is
+                // what lets a removed node recognize its removal (and stop
+                // campaigning) the instant it receives the entry, instead of racing
+                // to apply it before the leader drops it from replication.
+                latest_config = entries.iter().rev().find_map(|e| {
+                    crate::api::node::membership::ConfigChangeEntry::decode(e.payload.0)
+                });
+            }
+            self.scratch_entries.put(entries);
+            append_res?;
             if let Some(entry) = latest_config {
                 self.apply_config_change(&entry)?;
             }
@@ -127,12 +133,8 @@ where
 
             let local_term = match self.log_metadata.get_term(incoming_index) {
                 Some(t) => Some(t),
-                None => {
-                    let mut dummy = [0u8; 8];
-                    self.storage
-                        .entry_at(incoming_index, &mut dummy)?
-                        .map(|e| e.term)
-                }
+                // B10: term-only probe — see `apply_append_entries`.
+                None => self.storage.term_at(incoming_index)?,
             };
             match local_term {
                 Some(t) if t == incoming_term => {}
@@ -155,21 +157,24 @@ where
 
             let final_headers = &headers[append_from..];
 
-            // Transform contiguous block to list of refs using scratchpad
-            self.scratch_payload_refs.clear();
+            // Transform the contiguous block into a list of refs in a
+            // dock-recycled LOCAL vec. The slices borrow `payloads` (the
+            // inbound frame), a lifetime the compiler verifies — no 'static
+            // laundering, nothing parked in `self` (US3).
+            let mut payload_refs = self.scratch_payload_refs.take();
             let p_iter =
                 AppendEntriesRawIter::new(headers_bytes, SeededPayloads::Contiguous(payloads));
             for (idx, (_, payload)) in p_iter.enumerate() {
                 if idx >= append_from {
-                    // SAFETY: ephemeral pointers cleared after storage call
-                    self.scratch_payload_refs
-                        .push(unsafe { std::mem::transmute::<&[u8], &'static [u8]>(payload) });
+                    payload_refs.push(payload);
                 }
             }
 
-            self.storage
-                .append_entries_seeded(final_headers, &self.scratch_payload_refs)?;
-            self.scratch_payload_refs.clear();
+            let append_res = self
+                .storage
+                .append_entries_seeded(final_headers, &payload_refs);
+            self.scratch_payload_refs.put(payload_refs);
+            append_res?;
             for h in final_headers {
                 self.log_metadata
                     .append(LogIndex(h.index.get()), crate::Term(h.term.get()));
@@ -218,7 +223,7 @@ where
                 term: self.hard_state.current_term.0.into(),
                 success: 0,
                 match_index: self.cached_last_log.0 .0.into(),
-                _pad: [0; 7],
+                _pad: probe_echo_pad(msg),
             };
             self.send_message(from, &RaftMessage::AppendEntriesResp(&resp))
                 .await;
@@ -237,9 +242,10 @@ where
             Some(t) => t == prev_log_term,
             None if prev_log_idx.0 == 0 => true,
             None => {
-                let mut dummy = [0; 8];
-                match self.storage.entry_at(prev_log_idx, &mut dummy)? {
-                    Some(e) => e.term == prev_log_term,
+                // B10: term-only probe — no payload read, no reliance on
+                // undersized-buffer truncation in `entry_at`.
+                match self.storage.term_at(prev_log_idx)? {
+                    Some(t) => t == prev_log_term,
                     // Entry may have been compacted by a snapshot. It matches iff
                     // it lines up with the snapshot boundary we last installed.
                     None => {
@@ -261,7 +267,7 @@ where
                 term: self.hard_state.current_term.0.into(),
                 success: 0,
                 match_index: hint.into(),
-                _pad: [0; 7],
+                _pad: probe_echo_pad(msg),
             };
             self.send_message(from, &RaftMessage::AppendEntriesResp(&resp))
                 .await;
@@ -279,7 +285,7 @@ where
             term: self.hard_state.current_term.0.into(),
             success: 1,
             match_index: last_log_index.0.into(),
-            _pad: [0; 7],
+            _pad: probe_echo_pad(msg),
         };
         self.send_message(from, &RaftMessage::AppendEntriesResp(&resp))
             .await;
@@ -304,7 +310,7 @@ where
                 term: self.hard_state.current_term.0.into(),
                 success: 0,
                 match_index: self.cached_last_log.0 .0.into(),
-                _pad: [0; 7],
+                _pad: probe_echo_pad(msg),
             };
             self.send_message(from, &RaftMessage::AppendEntriesResp(&resp))
                 .await;
@@ -323,9 +329,10 @@ where
             Some(t) => t == prev_log_term,
             None if prev_log_idx.0 == 0 => true,
             None => {
-                let mut dummy = [0; 8];
-                match self.storage.entry_at(prev_log_idx, &mut dummy)? {
-                    Some(e) => e.term == prev_log_term,
+                // B10: term-only probe — no payload read, no reliance on
+                // undersized-buffer truncation in `entry_at`.
+                match self.storage.term_at(prev_log_idx)? {
+                    Some(t) => t == prev_log_term,
                     // Entry may have been compacted by a snapshot. It matches iff
                     // it lines up with the snapshot boundary we last installed.
                     None => {
@@ -347,7 +354,7 @@ where
                 term: self.hard_state.current_term.0.into(),
                 success: 0,
                 match_index: hint.into(),
-                _pad: [0; 7],
+                _pad: probe_echo_pad(msg),
             };
             self.send_message(from, &RaftMessage::AppendEntriesResp(&resp))
                 .await;
@@ -365,7 +372,7 @@ where
             term: self.hard_state.current_term.0.into(),
             success: 1,
             match_index: last_log_index.0.into(),
-            _pad: [0; 7],
+            _pad: probe_echo_pad(msg),
         };
         self.send_message(from, &RaftMessage::AppendEntriesResp(&resp))
             .await;

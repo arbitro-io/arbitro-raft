@@ -18,6 +18,11 @@ pub(crate) trait PendingCustomDispatch: Send + Sync {
         response: DispatchResponseRef<'_>,
     ) -> Result<(), RaftError>;
     fn is_ready(&self) -> bool;
+    /// Resolve the transaction with a deterministic `LostLeadership`
+    /// failure, waking every parked waiter. Invoked by `step_down` BEFORE
+    /// the pending map is cleared (A5 / C7 / ERR-7); a no-op when the
+    /// transaction already completed.
+    fn abort_lost_leadership(&self);
 }
 
 pub(crate) struct PendingCustomTx<R> {
@@ -50,6 +55,10 @@ impl<R: Clone + Send + 'static> PendingCustomDispatch for PendingCustomTx<R> {
 
     fn is_ready(&self) -> bool {
         self.handle.is_ready()
+    }
+
+    fn abort_lost_leadership(&self) {
+        self.tx.abort(crate::DispatchFailure::LostLeadership);
     }
 }
 
@@ -247,7 +256,7 @@ pub(super) struct NodeDispatchResponder<'a, T> {
 #[async_trait]
 impl<T: crate::RaftTransport> DispatchResponder for NodeDispatchResponder<'_, T> {
     async fn send_response(&self, response: DispatchResponse) -> Result<(), RaftError> {
-        let inner = encode_dispatch_response(&response);
+        let inner = encode_dispatch_response(&response)?;
         let msg = RaftMessage::CustomResponse(&inner);
 
         let mut header_buf = [0u8; 128];

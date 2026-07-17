@@ -28,6 +28,10 @@ name = "tcp_raft_bench"
 harness = false
 
 [[bench]]
+name = "raft_transport_bench"
+harness = false
+
+[[bench]]
 name = "dispatch_bench"
 harness = false
 

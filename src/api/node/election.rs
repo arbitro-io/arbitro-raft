@@ -4,6 +4,16 @@ use crate::{InboundRaftMessage, RaftError, RaftMessage, Role, Term};
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
 
+/// Majority check for ONE side of a joint configuration (A4 / Raft §4.3):
+/// a vote in `granted` counts toward `subset` only if the voter is a member
+/// of that subset — grants from the other side (or from non-members) are
+/// worth nothing here. Shared with the ReadIndex quorum confirmation (A11),
+/// which applies the same dual-majority rule to heartbeat acks.
+pub(crate) fn subset_vote_majority(subset: &[crate::PeerId], granted: &[crate::PeerId]) -> bool {
+    let count = subset.iter().filter(|p| granted.contains(p)).count();
+    count >= super::quorum(subset.len())
+}
+
 impl<S, T> RaftNode<S, T>
 where
     S: crate::RaftStorage,
@@ -113,6 +123,24 @@ where
         }
         Ok(possible_votes)
     }
+    /// Whether the votes in `granted` win the election under the EFFECTIVE
+    /// configuration (A4, audit P1). Raft §4.3 applies joint consensus to
+    /// elections exactly as to commits: while a `C_old,new` transition is
+    /// active a candidate needs a majority of C_old AND a majority of C_new
+    /// independently — a majority of the union alone can crown a leader that
+    /// lacks entries committed under the majority of the side it skipped,
+    /// violating Leader Completeness. Outside a transition this is the plain
+    /// majority (`votes_needed`) of `config.peers`.
+    fn election_quorum_reached(&self, granted: &[crate::PeerId], votes_needed: usize) -> bool {
+        match &self.joint_peers {
+            Some((old_peers, new_peers)) => {
+                subset_vote_majority(old_peers, granted)
+                    && subset_vote_majority(new_peers, granted)
+            }
+            None => granted.len() >= votes_needed,
+        }
+    }
+
     async fn collect_votes(
         &mut self,
         term: Term,
@@ -120,11 +148,17 @@ where
         possible_votes: usize,
         inbound_buf: &mut [u8],
     ) -> Result<bool, RaftError> {
-        let mut votes = 1usize;
+        // Voters that granted us their vote for `term`, self included. Tracked
+        // by identity (not a plain counter) because the §4.3 joint rule needs
+        // to know WHICH side of the transition each vote came from (A4).
+        let mut granted: Vec<crate::PeerId> = Vec::with_capacity(self.config.peers.len());
+        granted.push(self.config.node_id);
         self.scratch_responders.clear();
         let deadline = Instant::now() + self.election_timeout();
 
-        while votes < votes_needed && self.scratch_responders.len() < possible_votes {
+        while !self.election_quorum_reached(&granted, votes_needed)
+            && self.scratch_responders.len() < possible_votes
+        {
             let mut msg_slots = [None; 16];
             let messages_count = self
                 .drain_inbound_frames(deadline, inbound_buf, &mut msg_slots)
@@ -136,7 +170,10 @@ where
 
             // 1. Process responses first
             for slot in msg_slots.iter().take(messages_count) {
-                let inbound = slot.unwrap();
+                // Slots `0..messages_count` are populated by
+                // `drain_inbound_frames`; an empty one is impossible, but
+                // skipping is strictly safer than panicking (B13).
+                let Some(inbound) = *slot else { continue };
                 let from = inbound.from;
                 if let RaftMessage::RequestVoteResp(resp) = inbound.message {
                     if self.scratch_responders.contains(&from) {
@@ -148,12 +185,19 @@ where
                         self.step_down(resp_term)?;
                         return Ok(false);
                     }
-                    if resp_term == term && resp.vote_granted != 0 {
-                        votes += 1;
+                    // Membership filter: only a vote from a voter of the
+                    // effective configuration counts. During a joint
+                    // transition `config.peers` is the union, and the
+                    // per-side attribution below decides what it is worth.
+                    if resp_term == term
+                        && resp.vote_granted != 0
+                        && self.config.peers.contains(&from)
+                    {
+                        granted.push(from);
                         debug!(
                             node_id = self.config.node_id.0,
                             voter = from.0,
-                            votes,
+                            votes = granted.len(),
                             needed = votes_needed,
                             "vote granted"
                         );
@@ -161,13 +205,16 @@ where
                 }
             }
 
-            if votes >= votes_needed {
+            if self.election_quorum_reached(&granted, votes_needed) {
                 return Ok(true);
             }
 
             // 2. Process requests second
             for slot in msg_slots.iter().take(messages_count) {
-                let inbound = slot.unwrap();
+                // Slots `0..messages_count` are populated by
+                // `drain_inbound_frames`; an empty one is impossible, but
+                // skipping is strictly safer than panicking (B13).
+                let Some(inbound) = *slot else { continue };
                 if !matches!(inbound.message, RaftMessage::RequestVoteResp(_)) {
                     if let Err(e) = self.handle_inbound(inbound).await {
                         if e.is_fatal() {
@@ -196,8 +243,8 @@ where
         }
         // Loop exit condition already guarantees role/term were unchanged since
         // the last check above (the `while` body ran to completion), so the
-        // accumulated `votes` are all for `term`.
-        Ok(votes >= votes_needed)
+        // accumulated `granted` votes are all for `term`.
+        Ok(self.election_quorum_reached(&granted, votes_needed))
     }
 
     pub(crate) async fn handle_request_vote(
@@ -334,7 +381,10 @@ where
 
             // 1. Process responses first
             for slot in msg_slots.iter().take(messages_count) {
-                let inbound = slot.unwrap();
+                // Slots `0..messages_count` are populated by
+                // `drain_inbound_frames`; an empty one is impossible, but
+                // skipping is strictly safer than panicking (B13).
+                let Some(inbound) = *slot else { continue };
                 let from = inbound.from;
                 if let RaftMessage::PreVoteResp(resp) = inbound.message {
                     if self.scratch_responders.contains(&from) {
@@ -346,7 +396,15 @@ where
                         self.step_down(resp_term)?;
                         return Ok(false);
                     }
-                    if resp_term == self.hard_state.current_term && resp.vote_granted != 0 {
+                    // Membership filter (A13, mirrors `collect_votes`): only a
+                    // VOTER's pre-vote grant counts. The broadcast above only
+                    // targets voters, but the exclusion must hold on the
+                    // counting side regardless — a learner (or any non-member)
+                    // sending an unsolicited grant must be worth nothing.
+                    if resp_term == self.hard_state.current_term
+                        && resp.vote_granted != 0
+                        && self.config.peers.contains(&from)
+                    {
                         votes += 1;
                         debug!(
                             node_id = self.config.node_id.0,
@@ -365,7 +423,10 @@ where
 
             // 2. Process requests second
             for slot in msg_slots.iter().take(messages_count) {
-                let inbound = slot.unwrap();
+                // Slots `0..messages_count` are populated by
+                // `drain_inbound_frames`; an empty one is impossible, but
+                // skipping is strictly safer than panicking (B13).
+                let Some(inbound) = *slot else { continue };
                 if !matches!(inbound.message, RaftMessage::PreVoteResp(_)) {
                     self.handle_inbound(inbound).await?;
                 }
@@ -436,7 +497,9 @@ where
         Ok(())
     }
 
-    async fn drain_inbound_frames<'a>(
+    /// Shared bounded inbound drain — used by the campaign paths here and by
+    /// the leadership-transfer catch-up loop (§4.2.3, `transfer.rs`).
+    pub(crate) async fn drain_inbound_frames<'a>(
         &self,
         deadline: Instant,
         inbound_buf: &'a mut [u8],
