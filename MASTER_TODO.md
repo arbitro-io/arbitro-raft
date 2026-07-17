@@ -27,11 +27,11 @@
 | F — Verification & CI | 8 | 2 |
 | G — Performance & throughput | 4 | 1 |
 | H — Multi-raft & share-nothing deployment | 9 | 0 |
-| I — API & contracts | 12 | 1 |
+| I — API & contracts | 11 | 2 |
 | J — Readability & polish | 7 | 1 |
 | K — Benchmark honesty | 4 | 1 |
-| L — arbitro-server cluster integration | 8 | 2 |
-| **Total** | **62** | **67** |
+| L — arbitro-server cluster integration | 7 | 3 |
+| **Total** | **60** | **69** |
 
 ---
 
@@ -220,7 +220,7 @@ map — still tokio, deployed share-nothing.
 - **I3 · DECISION: bounded client channel** — Why: unbounded today (H5); bounding means writes fail fast with backpressure under load instead of buffering — a product-behavior call (P1-9 remainder) plus a `&self`→`try_send` refactor. Status: DECISION-NEEDED · Effort: M · Depends: —
 - **I4 · `cluster_id` enforcement** — cross-reference **D5** (wire decision owns it).
 - **I5 · Gate test backdoors behind a `test-util` feature (API7)** — Why: `become_leader_for_benchmark` / `set_commit_index` are public safety-bypass levers in the production API. Status: OPEN · Effort: S · Depends: benches/tests migrate to the feature.
-- **I6 · `NotLeader` hint consistency (API4)** — Why: one site hints `voted_for`, another `leader_id` — one of them misdirects clients. Status: OPEN · Effort: S · Depends: —
+- **I6 · `NotLeader` hint consistency (API4)** — Why: one site hints `voted_for`, another `leader_id` — one of them misdirects clients. Status: DONE (2026-07-17, dedup pass) — the `propose_config_change` site was unified from `voted_for` to `leader_id` when `not_leader_error()` was promoted to a shared `pub(crate)` helper; all 3 `LeaderHint` sites now use `leader_id`/transfer-target (`arbitro_raft/mod.rs:527`, `node/mod.rs:574`, `transfer.rs:221`; fix comment at `arbitro_raft/mod.rs:472`). Confirmed by the WS-I/J false-OPEN re-audit. · Effort: S · Depends: —
 - **I7 · Dispatch lifecycle gaps (API8)** — Why: peers are never marked disconnected on send failure (retries hammer a dead peer); `DispatchHandle` has no `Drop` → abandoned waits leak slots. Status: OPEN · Effort: S · Depends: H3 (same module).
 - **I8 · Dispatch views reject trailing bytes (API9)** — Why: accepting oversized bodies masks encoder bugs and widens the parser attack surface. Status: OPEN · Effort: S · Depends: —
 - **I9 · Idiom sweep (ID1-10)** — Why: `#[non_exhaustive]`/`Clone`/`PartialEq`/`source()` on `RaftError` (with E5), `#[must_use]` on `DispatchHandle`/leases, missing `Debug` derives, newtype helpers to kill `.0 .0` noise, wire bools behind accessors. Status: OPEN · Effort: S · Depends: E5.
@@ -264,7 +264,7 @@ between the crate and the server. All paths `server:` = `arbitro/crates/arbitro-
 - **L3 · Event-driven apply (kill the 100 ms poll)** — Why: `apply_loop` polls `CommitIndexObserver` every 100 ms — adds up to 100 ms metadata-visibility latency on followers and wakes idle cores. Crate side: add a commit-notification hook (watch/event on commit-index advance — natural E1 sibling); server switches to it. Evidence: `server:cluster/apply_loop.rs:4,52`. Status: OPEN · Effort: M · Depends: small crate API addition.
 - **L4 · Kill the leader double-apply** — Why: on the leader, dispatch executes the command AND the apply loop re-applies it, "safe because create/delete are idempotent" (its own comment) — a contract that silently breaks with the first non-idempotent command (counters, quotas). Apply exactly once, gated on `last_applied` (wants A6's index-carrying apply). Evidence: `server:cluster/apply_loop.rs:12-15`. Status: OPEN · Effort: M · Depends: A6.
 - **L5 · Linearizable metadata reads (or documented staleness)** — Why: metadata reads are served from local SM state — stale on followers and on a deposed leader. Adopt A11's ReadIndex for read-your-writes surfaces (consumer creation racing stream creation), or explicitly document eventual consistency per endpoint. Evidence: `server:cluster/mod.rs` read paths. Status: OPEN · Effort: M · Depends: A11.
-- **L6 · Deploy transport security** — Why: server-side wiring of D1/D2 — TLS config, cert distribution/rotation, authenticated peer map; plus validation/diagnostics for `ARBITRO_CLUSTER_PEERS` (typo'd peer today = silent connect-retry loop). Evidence: `server:cluster/transport.rs:33-46`, `server:cluster/mod.rs:3`. Status: OPEN · Effort: M · Depends: D1, D2.
+- **L6 · Deploy transport security** — Why: server-side wiring of D1/D2 — TLS config, cert distribution/rotation, authenticated peer map; plus validation/diagnostics for `ARBITRO_CLUSTER_PEERS` (typo'd peer today = silent connect-retry loop). Evidence: `server:cluster/transport.rs:33-46`, `server:cluster/mod.rs:3`. Status: DONE (2026-07-17, via D1/D2/D3) — all four deliverables shipped: TLS config wired into server boot with fail-hard on bad env (`server:server.rs:517-524`), authenticated peer map (`ARBITRO_CLUSTER_TLS_PEER_MAP` + `peer-<id>`, `server:cluster/security.rs:15-27`), cert-rotation story documented (reload-on-reconnect, `security.rs:29-40`), and `ARBITRO_CLUSTER_PEERS/_LISTEN` validation now `error!`+`exit(2)` instead of a silent connect-retry loop (`server:server.rs:434-445,488-512`). Confirmed by the WS-K/L false-OPEN re-audit. Residue (own follow-up, tracked): cert-rotation file-watcher. · Effort: M · Depends: D1, D2.
 - **L7 · Wire snapshot + compaction end-to-end** — Why: once C2/C3 land the server must provide the pieces: `ArbitroStateMachine::snapshot()/restore()` fidelity for full metadata, `truncate_before` implemented in `FileRaftStorage`, and an ops-visible compaction cadence. Evidence: `server:cluster/state_machine.rs`; `server:cluster/storage.rs` default no-op `truncate_before`. Status: OPEN · Effort: M · Depends: C2, C3, L1.
 - **L8 · Share-nothing deployment of raft in the server** — Why: TODAY'S deployment is the measured slow shape — a single group on the shared work-stealing runtime (group migrates cores → cache thrash + cross-thread wakeups); the per-propose cost is runtime hot-path, not raft logic. Adopt H8's blueprint: pin raft (and future per-partition groups) to a dedicated core/runtime, align with the server's existing shard/worker layout. Evidence: `server:server.rs` spawn of `raft.run()`; H8. Status: OPEN · Effort: L · Depends: H7, H8.
 - **L9 · `ClusterState::client()` panics in Standalone** — Why: a `panic!("not in clustered mode")` on a reachable accessor is a foot-gun in mixed standalone/clustered code paths — return `Option`/`Result`. Evidence: `server:cluster/mod.rs:38-44`. Status: OPEN · Effort: S · Depends: —
