@@ -69,6 +69,17 @@ pub struct LimitsConfig {
     /// an operator rolling a node onto an incompatible wire version) recovers
     /// on its own within seconds. Default: 3 000.
     pub inbound_jail_cooldown_ms: u64,
+    /// Capacity, in proposals, of the bounded client→node mailbox that
+    /// `ClientHandle::write` / `write_bytes` enqueue into (H5). The send is a
+    /// non-blocking `try_send`: when the run loop lags behind a client flood
+    /// the mailbox fills and further writes fail FAST with the retryable
+    /// `RaftError::Overloaded` instead of buffering without limit (the old
+    /// unbounded channel's OOM path) or parking the caller indefinitely.
+    /// Sizing: at the default `append_batch_entries` (1024) the leader drains
+    /// up to one full batch per tick, so 8192 absorbs several ticks of burst
+    /// while capping worst-case buffered payload memory. Values below 1 are
+    /// clamped to 1. Default: 8 192.
+    pub client_mailbox_capacity: usize,
 }
 
 impl Default for LimitsConfig {
@@ -91,6 +102,7 @@ impl Default for LimitsConfig {
             inbound_decode_error_jail_threshold: 32,
             inbound_decode_error_window_ms: 10_000,
             inbound_jail_cooldown_ms: 3_000,
+            client_mailbox_capacity: 8_192,
         }
     }
 }

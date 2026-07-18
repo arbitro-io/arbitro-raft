@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use futures::{FutureExt, StreamExt};
+use futures::FutureExt;
 
 use crate::{LogIndex, RaftError, RaftStorage, RaftTransport, StateMachine};
 
@@ -411,7 +411,9 @@ where
                 // else: timeout, heartbeat sent on next tick
                 return Ok(());
             }
-            proposal = self.client_rx.next() => {
+            // tokio's bounded `recv` is cancel-safe: losing this select race
+            // never loses a proposal.
+            proposal = self.client_rx.recv().fuse() => {
                 if let Some(p) = proposal {
                     self.pending_batch.push(p.payload);
                     self.pending_slots.push(p.slot_id);
@@ -445,9 +447,10 @@ where
     /// `&mut self.node` call to `replicate_batch_async`. No `'static`
     /// laundering, no ref parked inside the node (US3).
     pub(super) async fn replicate_pending(&mut self) -> Result<(), RaftError> {
-        // Form a slice of slices — one indirect per already-owned Vec<u8> in pending_batch.
+        // Form a slice of slices — one indirect per already-owned Bytes payload
+        // in pending_batch (H5: refcounted, moved from the mailbox uncopied).
         let mut refs = self.node.scratch_payload_refs.take();
-        refs.extend(self.pending_batch.iter().map(|p| p.as_slice()));
+        refs.extend(self.pending_batch.iter().map(|p| &p[..]));
 
         let res = self.node.replicate_batch_async(&refs).await;
         self.node.scratch_payload_refs.put(refs);

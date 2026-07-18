@@ -12,6 +12,13 @@ pub enum RaftError {
     /// accepted again — so the caller may simply retry the transfer later.
     TransferTimeout(PeerId),
     TermChanged { current: Term },
+    /// The node is overloaded: the bounded client-proposal mailbox (or the
+    /// commit-notification slot pool) is full — the run loop is not draining
+    /// proposals as fast as clients submit them (H5). Nothing was enqueued
+    /// and nothing was acknowledged; this is a pure backpressure signal.
+    /// Retryable: classifies [`ErrorClass::Transient`] — back off briefly and
+    /// resubmit.
+    Overloaded,
     PeerUnknown(PeerId),
     InvalidConfig(&'static str),
     InvalidPayload(&'static str),
@@ -35,6 +42,10 @@ impl Display for RaftError {
                 target.0
             ),
             Self::TermChanged { current } => write!(f, "term changed: {}", current.0),
+            Self::Overloaded => write!(
+                f,
+                "overloaded: client proposal mailbox full; back off and retry"
+            ),
             Self::PeerUnknown(peer) => write!(f, "unknown peer {}", peer.0),
             Self::InvalidConfig(msg) => write!(f, "invalid config: {msg}"),
             Self::InvalidPayload(msg) => write!(f, "invalid payload: {msg}"),
@@ -122,10 +133,13 @@ impl RaftError {
             | Self::PeerUnknown(_) => ErrorClass::BadFrame,
             // Peer/network hiccup or a benign control-flow signal. A transfer
             // timeout is transient by design: the leader resumed normal
-            // operation and the transfer may simply be retried.
+            // operation and the transfer may simply be retried. Overload (H5)
+            // is transient by construction: the mailbox drains every tick, so
+            // backing off briefly and retrying is the correct client response.
             Self::NoQuorum
             | Self::TermChanged { .. }
             | Self::Transport(_)
+            | Self::Overloaded
             | Self::TransferTimeout(_) => ErrorClass::Transient,
         }
     }

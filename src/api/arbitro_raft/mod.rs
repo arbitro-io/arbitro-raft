@@ -3,7 +3,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
-use futures::channel::mpsc;
+use bytes::Bytes;
+use tokio::sync::mpsc;
 
 use crate::{
     DispatchContextView, DispatchHandle, DispatchSpec, LogIndex, PeerId, RaftError, RaftNode,
@@ -46,12 +47,18 @@ where
     pub(crate) next_election_at: Instant,
     pub(crate) next_heartbeat_at: Instant,
     pub(crate) election_state: u64,
-    client_tx: mpsc::UnboundedSender<ClientProposal>,
-    pub(crate) client_rx: mpsc::UnboundedReceiver<ClientProposal>,
+    /// Bounded client→node mailbox (H5) — capacity is
+    /// `limits.client_mailbox_capacity`; a full mailbox fails the client's
+    /// `try_send` fast with the retryable [`RaftError::Overloaded`] instead
+    /// of buffering without limit.
+    client_tx: mpsc::Sender<ClientProposal>,
+    pub(crate) client_rx: mpsc::Receiver<ClientProposal>,
     /// Shared registry for commit notifications.
     pub(crate) registry: Arc<SlotRegistry>,
-    /// Scratch — payloads drained from client_rx this tick, cleared before each use.
-    pub(crate) pending_batch: Vec<Vec<u8>>,
+    /// Scratch — payloads drained from client_rx this tick, cleared before
+    /// each use. `Bytes` (H5): drained proposals are moved here refcounted,
+    /// never re-copied.
+    pub(crate) pending_batch: Vec<Bytes>,
     /// Scratch — slots parallel to pending_batch, drained together.
     pub(crate) pending_slots: Vec<SlotId>,
     /// Entries replicated but not yet committed; resolved as commit_index advances.
@@ -95,7 +102,11 @@ where
     SM: StateMachine,
 {
     pub fn new(node: RaftNode<S, T>, state_machine: SM) -> Self {
-        let (client_tx, client_rx) = mpsc::unbounded();
+        // H5: the client mailbox is BOUNDED so a client flood backpressures
+        // (fails fast with `Overloaded`) instead of buffering until OOM.
+        // Clamped to >= 1 — a zero-capacity channel cannot accept any send.
+        let mailbox_cap = node.config.limits.client_mailbox_capacity.max(1);
+        let (client_tx, client_rx) = mpsc::channel(mailbox_cap);
         // 65k slots = 4MB RAM — absorbs extreme concurrent bursts without backpressure.
         let registry_cap = 65536;
         let mut raft = Self {
