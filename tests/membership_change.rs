@@ -13,6 +13,8 @@
 //! under the still-active joint union so the removed node learns `C_new`
 //! committed and self-removes instead of disrupting the cluster.
 
+#![allow(clippy::needless_range_loop)] // i indexes the rafts vec across assertions
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

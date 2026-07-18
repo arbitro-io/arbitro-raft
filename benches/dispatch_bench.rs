@@ -3,14 +3,13 @@
 // Measures the orchestration overhead of the parallel Dispatch API.
 // Reuses the setup from tests/dispatch_real.rs for minimal overhead.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::sync::Mutex;
+#![allow(clippy::field_reassign_with_default)] // bench setup, readability over lint
+
 use std::time::{Duration, Instant};
 
 use arbitro_raft::{
-    DispatchAckPolicy, DispatchHandle, DispatchSpec, EntryPayload, HardState, LogEntry, LogIndex,
-    NodeConfig, PeerId, RaftError, RaftNode, RaftStorage, RaftTransport, Role, SnapshotMeta, Term,
+    DispatchSpec, HardState, LogEntry, LogIndex,
+    NodeConfig, PeerId, RaftError, RaftNode, RaftStorage, RaftTransport, SnapshotMeta, Term,
 };
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 

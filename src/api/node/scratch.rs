@@ -121,7 +121,7 @@ mod tests {
     #[test]
     fn slice_scratch_recycles_capacity_without_laundering() {
         let mut dock = SliceScratch::with_capacity(8);
-        let data = vec![1u8, 2, 3];
+        let data = [1u8, 2, 3];
         {
             let mut v = dock.take();
             v.push(&data[..]);

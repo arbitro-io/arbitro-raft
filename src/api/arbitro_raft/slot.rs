@@ -101,11 +101,13 @@ impl SlotId {
     }
 
     /// Encode as a raw u64, e.g. for storing alongside other wire data.
+    #[allow(dead_code)] // symmetric public codec kept alongside `from_u64`
     pub fn to_u64(self) -> u64 {
         self.0
     }
 
     /// Decode a `SlotId` previously produced by [`SlotId::to_u64`].
+    #[allow(dead_code)] // symmetric public codec kept alongside `to_u64`
     pub fn from_u64(v: u64) -> Self {
         Self(v)
     }

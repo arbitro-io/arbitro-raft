@@ -19,13 +19,17 @@
 //   3. Real follower log logic (prev_log check, conflict truncation, append).
 //   4. Empty-payload baseline for protocol-overhead comparison.
 
+// Bench scaffolding: some seeded-path helpers are compiled but not wired into
+// every bench group; criterion::black_box is used for API symmetry.
+#![allow(dead_code, unused_imports, deprecated)]
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arbitro_raft::protocol::{
-    AppendEntries, AppendEntriesEntryIter, AppendEntriesRawIter, AppendEntriesResp, EntryHeader,
-    RaftMessage, SeededPayloads,
+    AppendEntries, AppendEntriesEntryIter, AppendEntriesResp, EntryHeader,
+    RaftMessage,
 };
 use arbitro_raft::{
     decode_message, encode_message_vectored, ArbitroRaft, BootstrapPeer, ClusterId, EntryPayload,
@@ -591,15 +595,12 @@ impl MemTransport {
     /// Helper for simulated transport logic in benchmarks
     fn handle_sim_inbound(&self, peer: PeerId, frame: &[u8]) -> Result<(), RaftError> {
         let inbound = decode_message(frame)?;
-        match inbound.message {
-            RaftMessage::AppendEntries(ae, body) => {
-                let (success, match_index) = match self.peer_state(peer) {
-                    Some(state) => state.lock().unwrap().process_append_legacy(ae, body),
-                    None => (false, LogIndex(0)),
-                };
-                self.send_resp(peer, ae.term.get(), success, match_index.0);
-            }
-            _ => {}
+        if let RaftMessage::AppendEntries(ae, body) = inbound.message {
+            let (success, match_index) = match self.peer_state(peer) {
+                Some(state) => state.lock().unwrap().process_append_legacy(ae, body),
+                None => (false, LogIndex(0)),
+            };
+            self.send_resp(peer, ae.term.get(), success, match_index.0);
         }
         Ok(())
     }
@@ -735,15 +736,15 @@ impl SeededTransport {
 impl RaftTransport for SeededTransport {
     fn send_vectored(
         &self,
-        peer: PeerId,
-        slices: &[&[u8]],
+        _peer: PeerId,
+        _slices: &[&[u8]],
     ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
         async move { Ok(()) }
     }
     fn send_frame_owned(
         &self,
-        peer: PeerId,
-        frame: bytes::Bytes,
+        _peer: PeerId,
+        _frame: bytes::Bytes,
     ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
         async move { Ok(()) }
     }

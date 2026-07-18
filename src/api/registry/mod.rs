@@ -139,6 +139,7 @@ where
     /// Iterate all groups (mut), exposing both the node and its bound
     /// state machine. Needed by apply loops that drive committed entries
     /// into the state machine.
+    #[allow(dead_code)] // apply-loop helper kept for the multi-raft driver path
     pub(crate) fn iter_entries_mut(
         &mut self,
     ) -> impl Iterator<Item = (&GroupId, &mut RaftNode<S, T>, &mut SM)> {

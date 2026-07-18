@@ -481,7 +481,7 @@ async fn run_loop_tick_evicts_stalled_snapshot_without_new_messages() {
         last_included_index: LogIndex(10),
         last_included_term: Term(1),
     };
-    transport.push_inbound(install_chunk_frame(PeerId(1), 1, &meta, 0, &vec![0xAA; 64], false));
+    transport.push_inbound(install_chunk_frame(PeerId(1), 1, &meta, 0, &[0xAA; 64], false));
     raft.run_once().await.unwrap();
     assert_eq!(last_resp_to(&transport, PeerId(1)), (1, 64));
     assert_eq!(metrics.snapshot().snapshots_evicted, 0);

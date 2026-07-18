@@ -501,9 +501,8 @@ async fn test_leader_drain_hands_off_to_most_caught_up_follower() {
             !r.node().is_leader(),
             "draining leader must have handed leadership off before stopping"
         );
-        assert_eq!(
-            r.run_once().await.expect("run_once after drain must not error"),
-            false,
+        assert!(
+            !r.run_once().await.expect("run_once after drain must not error"),
             "run_once after drain must report a clean stop (Ok(false))"
         );
     }
@@ -585,7 +584,7 @@ async fn test_drain_resolves_or_fails_every_commit_waiter() {
         r.drain()
             .await
             .expect("drain must degrade to a clean stop when no handoff target is reachable");
-        assert_eq!(r.run_once().await.unwrap(), false, "node must be stopped");
+        assert!(!r.run_once().await.unwrap(), "node must be stopped");
     }
 
     // EVERY in-flight write resolves within a bound; uncommittable ones fail.

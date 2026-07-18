@@ -32,7 +32,6 @@ use futures::channel::mpsc::{self, UnboundedReceiver};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
-use zerocopy::IntoBytes;
 
 /// ---------------------------------------------------------------------------
 // SeededMemStorage — Pure Zero-Copy Dual Arena for TCP benchmark.
@@ -574,12 +573,12 @@ async fn run_follower_sim(listener: TcpListener, leader_addr: SocketAddr, my_id:
 
                 let mut header_buf = [0u8; 128];
                 let mut vectors = Vec::new();
-                if let Ok(_) = encode_message_vectored(
+                if encode_message_vectored(
                     my_id,
                     &RaftMessage::AppendEntriesResp(&resp),
                     &mut header_buf,
                     &mut vectors,
-                ) {
+                ).is_ok() {
                     for v in vectors {
                         let _ = leader_conn.write_all(v).await;
                     }
@@ -627,12 +626,12 @@ async fn run_follower_sim(listener: TcpListener, leader_addr: SocketAddr, my_id:
 
                 let mut header_buf = [0u8; 128];
                 let mut vectors = Vec::new();
-                if let Ok(_) = encode_message_vectored(
+                if encode_message_vectored(
                     my_id,
                     &RaftMessage::AppendEntriesResp(&resp),
                     &mut header_buf,
                     &mut vectors,
-                ) {
+                ).is_ok() {
                     for v in vectors {
                         let _ = leader_conn.write_all(v).await;
                     }

@@ -3,6 +3,14 @@ name = "arbitro-raft"
 version = "0.2.0"
 edition = "2021"
 
+[lints.clippy]
+# Subjective style lints that fire heavily across the test/bench/example
+# harnesses (and nowhere in the shipped lib). `manual_async_fn` is deliberate:
+# several transport futures return an explicit `impl Future + Send` to pin the
+# Send bound; `type_complexity` flags the intentionally-explicit handle tuples.
+manual_async_fn = "allow"
+type_complexity = "allow"
+
 [dependencies]
 bytes = "1"
 async-trait = "0.1"

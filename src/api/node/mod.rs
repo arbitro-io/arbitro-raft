@@ -907,6 +907,8 @@ where
 /// a node so callers whose message borrows other node fields (e.g. storage
 /// views on the seeded zerocopy path) can invoke it under normal split-field
 /// borrow checking instead of laundering lifetimes to call `&mut self`.
+// header_buf is grown by encode_message_vectored; a &mut [u8] slice can't.
+#[allow(clippy::ptr_arg)]
 pub(crate) async fn send_message_vectored<'a, T>(
     transport: &T,
     from: PeerId,

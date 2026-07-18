@@ -2,6 +2,8 @@
 //! network needed) can be driven concurrently on one physical process, each
 //! advancing its own commit_index and applying to its own state machine.
 
+#![allow(dead_code)] // test harness struct keeps a field for symmetry
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

@@ -11,6 +11,8 @@
 //!   `handle.wait()` caller parks forever. The test fails on the pre-fix
 //!   silent `clear()` (the waiter hangs until the outer watchdog).
 
+#![allow(clippy::ptr_arg)] // test helper takes &Vec deliberately
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

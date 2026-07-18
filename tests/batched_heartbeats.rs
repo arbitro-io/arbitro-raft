@@ -259,7 +259,7 @@ fn build_five_group_registry(
         let gid = GroupId(i);
         let node = RaftNode::new(three_node_config(gid), TestStorage::default(), transport.clone())
             .unwrap();
-        registry.insert(gid, node, NoopStateMachine::default()).unwrap();
+        registry.insert(gid, node, NoopStateMachine).unwrap();
     }
     registry
 }

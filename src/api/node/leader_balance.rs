@@ -1,4 +1,6 @@
 // Leader placement heuristic across groups (B4).
+// Kept as a self-contained heuristic module; not yet wired into the pre-vote path.
+#![allow(dead_code)]
 
 use std::time::Duration;
 

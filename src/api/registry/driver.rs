@@ -337,7 +337,7 @@ where
         let Some(entry) = self.registry.entry_mut(gid) else {
             return Err(RaftError::Protocol(format!("no group {} in driver", gid.0)));
         };
-        let (mut guard, inbound_buf, _) = self.scratch.lend(&mut entry.node);
+        let (guard, inbound_buf, _) = self.scratch.lend(&mut entry.node);
         let res = guard.node.campaign_once(inbound_buf).await;
         let hb = match &res {
             Ok(true) => guard.node.send_heartbeat_once().await,
@@ -370,7 +370,7 @@ where
         let Some(entry) = self.registry.entry_mut(gid) else {
             return Err(RaftError::Protocol(format!("no group {} in driver", gid.0)));
         };
-        let (mut guard, _, apply_buf) = self.scratch.lend(&mut entry.node);
+        let (guard, _, apply_buf) = self.scratch.lend(&mut entry.node);
         let res = guard.node.propose_once(payload).await;
         let apply = if res.is_ok() {
             Self::apply_group(&mut *guard.node, &mut entry.sm, apply_buf)
@@ -480,7 +480,7 @@ where
             self.unknown_group_frames += 1;
             return Ok(());
         };
-        let (mut guard, inbound_buf, apply_buf) = self.scratch.lend(&mut entry.node);
+        let (guard, inbound_buf, apply_buf) = self.scratch.lend(&mut entry.node);
 
         let step: Result<(), RaftError> = match crate::decode_message(&inbound_buf[..n]) {
             Ok(inbound) => match guard.node.handle_inbound(inbound).await {
@@ -578,7 +578,7 @@ where
                     let term = entry.node.current_term();
                     entry.node.step_down(term)?;
                 } else {
-                    let (mut guard, _, _) = self.scratch.lend(&mut entry.node);
+                    let (guard, _, _) = self.scratch.lend(&mut entry.node);
                     let res = guard.node.send_heartbeat_once().await;
                     drop(guard);
                     match res {
@@ -595,7 +595,7 @@ where
         if !is_leader && now >= t.next_election_at {
             let forced = std::mem::take(&mut t.forced_campaign);
             t.reset_election();
-            let (mut guard, inbound_buf, _) = self.scratch.lend(&mut entry.node);
+            let (guard, inbound_buf, _) = self.scratch.lend(&mut entry.node);
             let res = Self::run_election(&mut *guard.node, inbound_buf, forced).await;
             let hb = match &res {
                 Ok(true) => guard.node.send_heartbeat_once().await,
