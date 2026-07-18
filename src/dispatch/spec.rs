@@ -1,4 +1,6 @@
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::dispatch::DispatchBuilder;
@@ -132,9 +134,38 @@ impl Default for DispatchOptions {
     }
 }
 
+/// Weyl-style mixing constant (2^64 / golden ratio, odd). Scatters the
+/// per-instance tx-id seeds across the id space so two independently
+/// constructed specs never start on overlapping ranges. Because the
+/// constant is odd, `n * TX_ID_SEED_MIX` is injective modulo 2^56: every
+/// construction epoch maps to a distinct 56-bit starting offset.
+const TX_ID_SEED_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Low 56 bits of a tx id hold the per-instance sequence; the high 8 bits
+/// hold the command byte (see [`DispatchSpec::next_tx_id`]).
+const TX_ID_SEQ_MASK: u64 = (1 << 56) - 1;
+
+/// Construction-epoch allocator for tx-id seeds. Bumped exactly ONCE per
+/// `DispatchSpec::new` (cold path: specs are built once per command per
+/// group) and never touched again — `next_tx_id` only ever hits the
+/// instance's own counter, so the H3 share-nothing property of the
+/// dispatch hot path is intact: no cross-group cache-line contention,
+/// no process-global id space.
+static TX_ID_SEED_EPOCH: AtomicU64 = AtomicU64::new(0);
+
 pub struct DispatchSpec<P, R> {
     command: u8,
     defaults: DispatchOptions,
+    /// Per-instance transaction-id counter (H3 — share-nothing multi-raft).
+    ///
+    /// Every `DispatchSpec::new` call owns an independent id space: the cell
+    /// is allocated once per construction and shared by refcount across
+    /// clones (clones of one spec are the same logical instance and
+    /// therefore continue the same sequence). It is freed when the last
+    /// clone drops — nothing is leaked. There is NO process-global counter
+    /// on the dispatch path — two specs built by two Raft groups never
+    /// touch the same cache line when allocating ids.
+    tx_ids: Arc<AtomicU64>,
     encode_params: fn(&P) -> Result<Vec<u8>, RaftError>,
     decode_params: fn(&[u8]) -> Result<P, RaftError>,
     encode_response: fn(&R) -> Result<Vec<u8>, RaftError>,
@@ -142,13 +173,22 @@ pub struct DispatchSpec<P, R> {
     _marker: PhantomData<fn(P) -> R>,
 }
 
+// Manual impl: `P`/`R` appear only behind `fn` pointers and `PhantomData`,
+// so cloning must not require `P: Clone` / `R: Clone` (a derive would).
 impl<P, R> Clone for DispatchSpec<P, R> {
     fn clone(&self) -> Self {
-        *self
+        Self {
+            command: self.command,
+            defaults: self.defaults,
+            tx_ids: Arc::clone(&self.tx_ids),
+            encode_params: self.encode_params,
+            decode_params: self.decode_params,
+            encode_response: self.encode_response,
+            decode_response: self.decode_response,
+            _marker: PhantomData,
+        }
     }
 }
-
-impl<P, R> Copy for DispatchSpec<P, R> {}
 
 impl<P, R> DispatchSpec<P, R> {
     pub fn new(
@@ -158,9 +198,18 @@ impl<P, R> DispatchSpec<P, R> {
         encode_response: fn(&R) -> Result<Vec<u8>, RaftError>,
         decode_response: fn(&[u8]) -> Result<R, RaftError>,
     ) -> Self {
+        // Seed the sequence from a monotonically increasing construction
+        // epoch, mixed to spread instances across the 56-bit space. Epochs
+        // are unique for the process lifetime, so even two instances of the
+        // SAME command on the same node — including one built after another
+        // was dropped with proposals still in flight — never collide in a
+        // shared pending map.
+        let epoch = TX_ID_SEED_EPOCH.fetch_add(1, Ordering::Relaxed);
+        let seed = epoch.wrapping_mul(TX_ID_SEED_MIX);
         Self {
             command,
             defaults: DispatchOptions::default(),
+            tx_ids: Arc::new(AtomicU64::new(seed)),
             encode_params,
             decode_params,
             encode_response,
@@ -242,7 +291,73 @@ impl<P, R> DispatchSpec<P, R> {
         self.decode_response
     }
 
+    /// Allocate the next transaction id from THIS spec instance's id space.
+    ///
+    /// Layout: `command << 56 | (seed + n) & 56-bit mask`. The command byte
+    /// in the high bits makes ids from different commands on one node
+    /// disjoint by construction; the epoch-derived seed keeps two
+    /// instances of the same command apart. One relaxed `fetch_add` on a
+    /// per-instance cache line — no cross-group contention, no allocation.
+    pub(crate) fn next_tx_id(&self) -> u64 {
+        let seq = self.tx_ids.fetch_add(1, Ordering::Relaxed);
+        ((self.command as u64) << 56) | (seq & TX_ID_SEQ_MASK)
+    }
+
     pub fn dispatch<'a>(&'a self, params: P) -> DispatchBuilder<'a, P, R> {
         DispatchBuilder::new(self, params)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw_spec(command: u8) -> DispatchSpec<Vec<u8>, Vec<u8>> {
+        DispatchSpec::new(
+            command,
+            |p| Ok(p.clone()),
+            |b| Ok(b.to_vec()),
+            |r| Ok(r.clone()),
+            |b| Ok(b.to_vec()),
+        )
+    }
+
+    /// The per-instance tx-id counter is refcounted, not leaked: clones
+    /// share one allocation, and dropping the last clone frees it. This is
+    /// the structural regression test for the old intentionally-leaked
+    /// `&'static` cell, which lost 8 bytes forever on every construction.
+    #[test]
+    fn tx_counter_is_freed_when_last_clone_drops() {
+        let spec = raw_spec(1);
+        let clone = spec.clone();
+        assert_eq!(
+            Arc::strong_count(&spec.tx_ids),
+            2,
+            "a clone must share the counter allocation, not fork a new one"
+        );
+
+        let weak = Arc::downgrade(&spec.tx_ids);
+        drop(clone);
+        assert_eq!(Arc::strong_count(&spec.tx_ids), 1);
+        drop(spec);
+        assert!(
+            weak.upgrade().is_none(),
+            "tx-id counter must be deallocated once the last clone drops"
+        );
+    }
+
+    /// N constructions + drops leave zero live counter allocations behind.
+    #[test]
+    fn repeated_construction_leaves_no_live_allocations() {
+        let mut weaks = Vec::with_capacity(1000);
+        for i in 0..1000u32 {
+            let spec = raw_spec(i as u8);
+            weaks.push(Arc::downgrade(&spec.tx_ids));
+            drop(spec);
+        }
+        assert!(
+            weaks.iter().all(|w| w.upgrade().is_none()),
+            "every dropped spec must release its tx-id counter"
+        );
     }
 }

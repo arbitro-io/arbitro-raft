@@ -1,5 +1,4 @@
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use zerocopy::byteorder::little_endian::{U32, U64};
 use zerocopy::IntoBytes;
@@ -112,15 +111,15 @@ impl<'a, P, R> DispatchBuilder<'a, P, R> {
     }
 
     pub fn build(self) -> Result<DispatchEnvelope<P, R>, RaftError> {
-        static NEXT_TX_ID: AtomicU64 = AtomicU64::new(1);
-
         let body = self.spec.encode_params(&self.params)?;
         // B6: checked — a body that does not fit the u32 wire field must fail
         // the build, never be silently truncated into a corrupt frame.
         let body_len = u32::try_from(body.len()).map_err(|_| {
             RaftError::Dispatch("dispatch body length exceeds u32 wire field".into())
         })?;
-        let tx_id = NEXT_TX_ID.fetch_add(1, Ordering::Relaxed);
+        // H3: per-spec-instance id space — no process-global counter shared
+        // across Raft groups.
+        let tx_id = self.spec.next_tx_id();
         let header = DispatchFrameHeader {
             magic: U32::new(RAFT_DISPATCH_MAGIC),
             version: RAFT_DISPATCH_VERSION,

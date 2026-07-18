@@ -125,11 +125,11 @@ fn dispatch_registry_invokes_typed_handler_and_returns_typed_response() {
     let spec = sync_spec();
     let responder = ResponseCollector::default();
     let registry = RaftCustomRegistry::new();
-    let spec_for_handler = spec;
+    let spec_for_handler = spec.clone();
 
     registry
-        .on_with(spec, move |params, ctx: DispatchContextView<'_>| {
-            let spec_for_response = spec_for_handler;
+        .on_with(spec.clone(), move |params, ctx: DispatchContextView<'_>| {
+            let spec_for_response = spec_for_handler.clone();
             Box::pin(async move {
                 assert_eq!(params, SyncParams { start: 40, end: 50 });
                 ctx.accept_with(
@@ -170,7 +170,7 @@ fn dispatch_registry_reports_decode_failures_through_context() {
     let registry = RaftCustomRegistry::new();
 
     registry
-        .on_with(spec, |_params, _ctx| Box::pin(async move { Ok(()) }))
+        .on_with(spec.clone(), |_params, _ctx| Box::pin(async move { Ok(()) }))
         .unwrap();
 
     let mut corrupted = spec
@@ -338,9 +338,11 @@ fn dispatch_registry_enforces_scope_for_routes() {
     let responder = ResponseCollector::default();
     let registry = RaftCustomRegistry::new();
     let spec = sync_spec().with_scope(DispatchScope::Followers);
+    let spec_for_handler = spec.clone();
 
     registry
-        .on_with(spec, move |_params, ctx: DispatchContextView<'_>| {
+        .on_with(spec.clone(), move |_params, ctx: DispatchContextView<'_>| {
+            let spec = spec_for_handler.clone();
             Box::pin(async move { ctx.accept_with(&spec, &SyncAck { saved_until: 50 }).await })
         })
         .unwrap();

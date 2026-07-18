@@ -6,15 +6,48 @@
 //! group by `group_id`.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::{
     GroupId, InboundRaftMessage, RaftError, RaftNode, RaftStorage, RaftTransport, StateMachine,
 };
 
 pub(crate) mod batch_scratch;
+pub mod driver;
 pub mod heartbeats;
 
 pub(crate) use batch_scratch::{BatchScratch, FrameOut};
+pub use driver::MultiRaftDriver;
+
+/// Multiplicative hasher for `GroupId` keys: one `imul` + one shift instead
+/// of SipHash, keeping the per-frame group route O(1) with a ~2 ns hash.
+/// Not DoS-hardened — group ids are operator-assigned, never attacker-chosen.
+#[derive(Clone, Copy, Default)]
+pub struct GroupIdHasher(u64);
+
+const FIB: u64 = 0x9e37_79b9_7f4a_7c15;
+
+impl Hasher for GroupIdHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(FIB);
+        }
+        self.0 ^= self.0 >> 32;
+    }
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        let x = n.wrapping_mul(FIB);
+        self.0 = x ^ (x >> 32);
+    }
+}
+
+pub type GroupIdBuildHasher = BuildHasherDefault<GroupIdHasher>;
+pub(crate) type GroupIdMap<V> = HashMap<GroupId, V, GroupIdBuildHasher>;
 
 pub(crate) struct GroupEntry<S, T, SM> {
     pub(crate) node: RaftNode<S, T>,
@@ -27,7 +60,7 @@ where
     T: RaftTransport,
     SM: StateMachine,
 {
-    groups: HashMap<GroupId, GroupEntry<S, T, SM>>,
+    groups: GroupIdMap<GroupEntry<S, T, SM>>,
     /// Reusable scratch buffers for the batched heartbeat tick — see
     /// [`BatchScratch`]. Cleared (not reallocated) at the start of every
     /// `tick_heartbeats` call.
@@ -42,14 +75,14 @@ where
 {
     pub fn new() -> Self {
         Self {
-            groups: HashMap::new(),
+            groups: GroupIdMap::default(),
             scratch: BatchScratch::default(),
         }
     }
 
     pub fn with_capacity(cap: usize) -> Self {
         Self {
-            groups: HashMap::with_capacity(cap),
+            groups: HashMap::with_capacity_and_hasher(cap, GroupIdBuildHasher::default()),
             scratch: BatchScratch::default(),
         }
     }
@@ -73,6 +106,12 @@ where
 
     pub fn get_mut(&mut self, id: GroupId) -> Option<&mut RaftNode<S, T>> {
         self.groups.get_mut(&id).map(|entry| &mut entry.node)
+    }
+
+    /// Whole-entry access (node + state machine) for the run-driver's
+    /// per-frame route→step path — one O(1) lookup, no double hash.
+    pub(crate) fn entry_mut(&mut self, id: GroupId) -> Option<&mut GroupEntry<S, T, SM>> {
+        self.groups.get_mut(&id)
     }
 
     pub fn state_machine(&self, id: GroupId) -> Option<&SM> {

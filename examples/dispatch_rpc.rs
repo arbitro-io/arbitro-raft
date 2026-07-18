@@ -195,7 +195,7 @@ async fn main() {
         .with_scope(DispatchScope::LocalOnly)
         .with_ack_policy(DispatchAckPolicy::All);
 
-    node.on_with(spec, |question: String, ctx| {
+    node.on_with(spec.clone(), |question: String, ctx| {
         Box::pin(async move {
             let answer = format!("pong: {question}");
             ctx.accept_bytes(answer.as_bytes().to_vec()).await
