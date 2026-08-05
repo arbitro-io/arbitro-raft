@@ -72,7 +72,9 @@ impl LogMetadataArena {
             return None;
         }
 
-        if index.0 >= self.base_index.0 && index.0 < self.base_index.0.saturating_add(self.len as u64) {
+        if index.0 >= self.base_index.0
+            && index.0 < self.base_index.0.saturating_add(self.len as u64)
+        {
             let offset = (index.0 - self.base_index.0) as usize;
             let read_idx = (self.head + offset) % cap;
             let slot = &self.slots[read_idx];

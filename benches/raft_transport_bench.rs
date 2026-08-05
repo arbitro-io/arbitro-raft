@@ -1258,7 +1258,11 @@ async fn measure_propose_once<T: RaftTransport>(
 ) -> Duration {
     // Untimed warm-up rounds per sample so first-touch costs never skew a
     // sample. Durable mode needs more to warm the VHD write path steady-state.
-    let warmup = if wal_config().policy.is_durable() { 16 } else { 1 };
+    let warmup = if wal_config().policy.is_durable() {
+        16
+    } else {
+        1
+    };
     for _ in 0..warmup {
         raft.propose_once(payload)
             .await
@@ -1278,7 +1282,11 @@ async fn measure_propose_batch<T: RaftTransport>(
     payloads: &[&[u8]],
     iters: u64,
 ) -> Duration {
-    let warmup = if wal_config().policy.is_durable() { 16 } else { 1 };
+    let warmup = if wal_config().policy.is_durable() {
+        16
+    } else {
+        1
+    };
     for _ in 0..warmup {
         raft.propose_batch_once(payloads)
             .await
@@ -1371,20 +1379,21 @@ fn bench_transport_latency(c: &mut Criterion) {
             group.bench_function(
                 format!("{}{}/propose_once/{label}", kind.name(), fsync_id_segment()),
                 |b| {
-                b.to_async(&rt).iter_custom(move |iters| async move {
-                    let payload = vec![0xAAu8; size];
-                    match kind {
-                        Kind::InMem => {
-                            let mut cluster = make_inmem_cluster().await;
-                            measure_propose_once(&mut cluster.raft, &payload, iters).await
+                    b.to_async(&rt).iter_custom(move |iters| async move {
+                        let payload = vec![0xAAu8; size];
+                        match kind {
+                            Kind::InMem => {
+                                let mut cluster = make_inmem_cluster().await;
+                                measure_propose_once(&mut cluster.raft, &payload, iters).await
+                            }
+                            Kind::Tcp => {
+                                let mut cluster = make_tcp_cluster().await;
+                                measure_propose_once(&mut cluster.raft, &payload, iters).await
+                            }
                         }
-                        Kind::Tcp => {
-                            let mut cluster = make_tcp_cluster().await;
-                            measure_propose_once(&mut cluster.raft, &payload, iters).await
-                        }
-                    }
-                });
-            });
+                    });
+                },
+            );
         }
     }
     group.finish();

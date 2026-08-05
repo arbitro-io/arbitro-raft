@@ -629,7 +629,10 @@ async fn test_transfer_aborts_when_target_cannot_catch_up() {
     // immediately (no freeze is left behind by an aborted transfer).
     {
         let mut r = cluster.rafts[leader].lock().await;
-        assert!(r.node().is_leader(), "leader must retain leadership on abort");
+        assert!(
+            r.node().is_leader(),
+            "leader must retain leadership on abort"
+        );
         assert_eq!(
             r.status().term,
             term_before,

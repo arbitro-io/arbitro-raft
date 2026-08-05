@@ -4,14 +4,18 @@ use crate::{LeaderHint, PeerId, Term};
 
 #[derive(Debug)]
 pub enum RaftError {
-    NotLeader { leader_hint: Option<LeaderHint> },
+    NotLeader {
+        leader_hint: Option<LeaderHint>,
+    },
     NoQuorum,
     /// Leadership transfer (§4.2.3) aborted: the target could not catch up to
     /// the leader's last log index within one election timeout. The leader has
     /// RESUMED normal operation — no step-down happened, proposals are
     /// accepted again — so the caller may simply retry the transfer later.
     TransferTimeout(PeerId),
-    TermChanged { current: Term },
+    TermChanged {
+        current: Term,
+    },
     /// The node is overloaded: the bounded client-proposal mailbox (or the
     /// commit-notification slot pool) is full — the run loop is not draining
     /// proposals as fast as clients submit them (H5). Nothing was enqueued

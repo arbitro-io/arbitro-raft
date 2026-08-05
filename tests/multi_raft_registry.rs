@@ -242,12 +242,18 @@ fn single_node_config(node_id: u64) -> NodeConfig {
 fn build_single_node_raft(
     node_id: u64,
     group: GroupId,
-) -> (ArbitroRaft<TestStorage, LoopTransport, CountingSM>, Arc<AtomicUsize>) {
+) -> (
+    ArbitroRaft<TestStorage, LoopTransport, CountingSM>,
+    Arc<AtomicUsize>,
+) {
     let config = single_node_config(node_id);
     let storage = TestStorage::default();
     let node = arbitro_raft::RaftNode::new(config, storage, LoopTransport).unwrap();
     let count = Arc::new(AtomicUsize::new(0));
-    let sm = CountingSM { count: count.clone(), group };
+    let sm = CountingSM {
+        count: count.clone(),
+        group,
+    };
     (ArbitroRaft::new(node, sm), count)
 }
 
@@ -336,9 +342,18 @@ async fn test_registry_owns_state_machines_per_group() {
     for i in 0..5u32 {
         g1.propose_once(&i.to_le_bytes()).await.unwrap();
     }
-    assert_eq!(registry.get(GroupId(1)).unwrap().commit_index(), LogIndex(5));
-    assert_eq!(registry.get(GroupId(2)).unwrap().commit_index(), LogIndex(0));
-    assert_eq!(registry.get(GroupId(3)).unwrap().commit_index(), LogIndex(0));
+    assert_eq!(
+        registry.get(GroupId(1)).unwrap().commit_index(),
+        LogIndex(5)
+    );
+    assert_eq!(
+        registry.get(GroupId(2)).unwrap().commit_index(),
+        LogIndex(0)
+    );
+    assert_eq!(
+        registry.get(GroupId(3)).unwrap().commit_index(),
+        LogIndex(0)
+    );
 
     // Now advance Group 2 and Group 3 independently.
     for gid in [GroupId(2), GroupId(3)] {

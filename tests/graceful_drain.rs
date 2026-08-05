@@ -495,14 +495,18 @@ async fn test_leader_drain_hands_off_to_most_caught_up_follower() {
     let started = tokio::time::Instant::now();
     {
         let mut r = cluster.rafts[leader].lock().await;
-        r.drain().await.expect("drain on a healthy leader must succeed");
+        r.drain()
+            .await
+            .expect("drain on a healthy leader must succeed");
         // The draining node ends stopped and non-leader.
         assert!(
             !r.node().is_leader(),
             "draining leader must have handed leadership off before stopping"
         );
         assert!(
-            !r.run_once().await.expect("run_once after drain must not error"),
+            !r.run_once()
+                .await
+                .expect("run_once after drain must not error"),
             "run_once after drain must report a clean stop (Ok(false))"
         );
     }
@@ -625,8 +629,13 @@ async fn test_drain_follower_is_clean_stop_and_run_returns_ok() {
 
     {
         let mut r = cluster.rafts[follower].lock().await;
-        assert!(!r.node().is_leader(), "harness: picked node must be a follower");
-        r.drain().await.expect("draining a follower must be a clean no-op stop");
+        assert!(
+            !r.node().is_leader(),
+            "harness: picked node must be a follower"
+        );
+        r.drain()
+            .await
+            .expect("draining a follower must be a clean no-op stop");
         assert!(!r.node().is_leader());
 
         // A12 run()-return contract: after a graceful drain the run loop
@@ -638,7 +647,9 @@ async fn test_drain_follower_is_clean_stop_and_run_returns_ok() {
         );
 
         // Drain is idempotent.
-        r.drain().await.expect("second drain must be a no-op Ok(())");
+        r.drain()
+            .await
+            .expect("second drain must be a no-op Ok(())");
 
         // Intake is closed.
         let handle = r.client_handle();
@@ -651,7 +662,10 @@ async fn test_drain_follower_is_clean_stop_and_run_returns_ok() {
     // commits with the remaining majority.
     {
         let mut r = cluster.rafts[leader].lock().await;
-        assert!(r.node().is_leader(), "leader must be unaffected by a follower drain");
+        assert!(
+            r.node().is_leader(),
+            "leader must be unaffected by a follower drain"
+        );
         r.propose_once(b"still-alive")
             .await
             .expect("cluster must keep committing after a follower drains");

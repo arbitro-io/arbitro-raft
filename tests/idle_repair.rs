@@ -593,12 +593,8 @@ async fn diverged_follower_repaired_to_leader_log_on_idle_path() {
     let ids = [1u64, 2, 3];
 
     // Common committed prefix idx 1..=4 (term 1).
-    let prefix: Vec<(u64, u64, &[u8])> = vec![
-        (1, 1, b"e1"),
-        (1, 2, b"e2"),
-        (1, 3, b"e3"),
-        (1, 4, b"e4"),
-    ];
+    let prefix: Vec<(u64, u64, &[u8])> =
+        vec![(1, 1, b"e1"), (1, 2, b"e2"), (1, 3, b"e3"), (1, 4, b"e4")];
 
     let s1 = TestStorage::default();
     let s2 = TestStorage::default();
@@ -618,8 +614,7 @@ async fn diverged_follower_repaired_to_leader_log_on_idle_path() {
     diverged.push((2, 7, b"x7"));
     s3.seed(&diverged, 2);
 
-    let cluster =
-        boot_cluster_with_storages(&ids, vec![s1.clone(), s2.clone(), s3.clone()]).await;
+    let cluster = boot_cluster_with_storages(&ids, vec![s1.clone(), s2.clone(), s3.clone()]).await;
 
     // Election: node 3's last log term (2) is stale vs 1/2 (3), so §5.4.1
     // guarantees the leader is node 1 or node 2.

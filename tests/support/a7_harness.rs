@@ -88,7 +88,9 @@ impl RaftStorage for TestStorage {
     }
     fn save_hard_state(&self, state: &HardState) -> Result<(), RaftError> {
         if self.fail_save_hard_state.load(Ordering::SeqCst) {
-            return Err(RaftError::Storage("injected hard-state save failure".into()));
+            return Err(RaftError::Storage(
+                "injected hard-state save failure".into(),
+            ));
         }
         *self.hard_state.lock().unwrap() = Some(state.clone());
         Ok(())
@@ -264,7 +266,11 @@ impl RaftTransport for CaptureTransport {
         &self,
         _out: &mut [u8],
     ) -> impl std::future::Future<Output = Result<usize, RaftError>> + Send {
-        async move { Err(RaftError::Transport("capture transport has no inbound".into())) }
+        async move {
+            Err(RaftError::Transport(
+                "capture transport has no inbound".into(),
+            ))
+        }
     }
     fn recv_frame_timeout(
         &self,

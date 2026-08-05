@@ -28,8 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arbitro_raft::protocol::{
-    AppendEntries, AppendEntriesEntryIter, AppendEntriesResp, EntryHeader,
-    RaftMessage,
+    AppendEntries, AppendEntriesEntryIter, AppendEntriesResp, EntryHeader, RaftMessage,
 };
 use arbitro_raft::{
     decode_message, encode_message_vectored, ArbitroRaft, BootstrapPeer, ClusterId, EntryPayload,
@@ -40,9 +39,15 @@ use arbitro_raft::{
 /// Bench-local no-op StateMachine — apply is a no-op; snapshot/restore return empty.
 struct NoopSM;
 impl StateMachine for NoopSM {
-    fn apply(&mut self, _entry: &[u8]) -> Result<(), RaftError> { Ok(()) }
-    fn snapshot(&self) -> Result<Vec<u8>, RaftError> { Ok(Vec::new()) }
-    fn restore(&mut self, _snapshot: &[u8]) -> Result<(), RaftError> { Ok(()) }
+    fn apply(&mut self, _entry: &[u8]) -> Result<(), RaftError> {
+        Ok(())
+    }
+    fn snapshot(&self) -> Result<Vec<u8>, RaftError> {
+        Ok(Vec::new())
+    }
+    fn restore(&mut self, _snapshot: &[u8]) -> Result<(), RaftError> {
+        Ok(())
+    }
 }
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -173,8 +178,7 @@ impl RaftStorage for SeededMemStorage {
             // SAFETY: Benchmark-only stable pointer trick, same as
             // `read_entry_headers` above — the data buffer only grows and is
             // never truncated while the node borrows the storage.
-            let payload =
-                unsafe { std::mem::transmute::<&[u8], &'a [u8]>(&data[off..off + len]) };
+            let payload = unsafe { std::mem::transmute::<&[u8], &'a [u8]>(&data[off..off + len]) };
             callback(payload);
         }
         Ok(())

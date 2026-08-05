@@ -113,7 +113,12 @@ where
             // is ahead of the log can never inflate progress past the tip.
             let last_log = node.cached_last_log.0;
             let matched = LogIndex(boundary.0.min(last_log.0));
-            let next = LogIndex(boundary.0.saturating_add(1).min(last_log.0.saturating_add(1)));
+            let next = LogIndex(
+                boundary
+                    .0
+                    .saturating_add(1)
+                    .min(last_log.0.saturating_add(1)),
+            );
             if let Some(progress) = node.peer_progress.get_mut(&peer) {
                 if matched > progress.match_index {
                     progress.match_index = matched;

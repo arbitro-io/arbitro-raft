@@ -102,8 +102,7 @@ where
         // to the no-op path, which is always correct, merely one round
         // slower.
         let commit = self.soft_state.commit_index;
-        let guard_ok = commit.0 > 0
-            && matches!(self.term_at(commit), Ok(t) if t == confirm_term);
+        let guard_ok = commit.0 > 0 && matches!(self.term_at(commit), Ok(t) if t == confirm_term);
         if !guard_ok {
             // This crate appends NO automatic no-op at election win, so the
             // guard is satisfied here, on first demand, by committing a
@@ -250,5 +249,4 @@ where
             }
         }
     }
-
 }

@@ -571,14 +571,8 @@ fn make_inmem_cluster() -> InmemCluster {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let n: u64 = args
-        .next()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1000);
-    let payload_bytes: usize = args
-        .next()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let n: u64 = args.next().and_then(|v| v.parse().ok()).unwrap_or(1000);
+    let payload_bytes: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(0);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)

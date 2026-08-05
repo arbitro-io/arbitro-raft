@@ -506,8 +506,7 @@ fn hard_state_survives_restart_no_double_vote() {
 
     // "Restart": a brand-new node instance over the same durable storage.
     let (transport, _) = TestTransport::new();
-    let node =
-        arbitro_raft::RaftNode::new(config_3node(1), storage, transport).unwrap();
+    let node = arbitro_raft::RaftNode::new(config_3node(1), storage, transport).unwrap();
 
     assert_eq!(node.current_term(), Term(5), "term must survive restart");
     assert_eq!(

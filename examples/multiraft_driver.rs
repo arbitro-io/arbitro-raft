@@ -311,10 +311,14 @@ async fn main() {
     let mut driver_b: MultiRaftDriver<MemStorage, NetTransport, CountingSM> =
         MultiRaftDriver::new(net_b);
 
-    let a_counts: Vec<Arc<AtomicUsize>> =
-        GROUPS.iter().map(|_| Arc::new(AtomicUsize::new(0))).collect();
-    let b_counts: Vec<Arc<AtomicUsize>> =
-        GROUPS.iter().map(|_| Arc::new(AtomicUsize::new(0))).collect();
+    let a_counts: Vec<Arc<AtomicUsize>> = GROUPS
+        .iter()
+        .map(|_| Arc::new(AtomicUsize::new(0)))
+        .collect();
+    let b_counts: Vec<Arc<AtomicUsize>> = GROUPS
+        .iter()
+        .map(|_| Arc::new(AtomicUsize::new(0)))
+        .collect();
 
     // Runtime group registration: 3 groups on each driver, one shared
     // transport per side. add_group also puts each group on the memory diet.
@@ -359,7 +363,10 @@ async fn main() {
             gid.0
         );
         for i in 0..entries as u64 {
-            let idx = driver_a.propose(gid, &i.to_le_bytes()).await.expect("propose");
+            let idx = driver_a
+                .propose(gid, &i.to_le_bytes())
+                .await
+                .expect("propose");
             assert_eq!(idx, LogIndex(i + 1));
         }
     }
@@ -368,7 +375,10 @@ async fn main() {
     // until B's three state machines converge to 2 / 4 / 6.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        driver_a.run_once(Duration::from_millis(5)).await.expect("run_once");
+        driver_a
+            .run_once(Duration::from_millis(5))
+            .await
+            .expect("run_once");
         let done = GROUPS
             .iter()
             .enumerate()

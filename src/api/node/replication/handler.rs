@@ -262,7 +262,11 @@ where
             // hint at or below the leader's prev_log_index, so its next_index
             // walks back correctly instead of jumping past its own log (which
             // would crash `term_at` with CorruptLog and kill the leader).
-            let hint = self.cached_last_log.0 .0.min(prev_log_idx.0.saturating_sub(1));
+            let hint = self
+                .cached_last_log
+                .0
+                 .0
+                .min(prev_log_idx.0.saturating_sub(1));
             let resp = AppendEntriesResp {
                 term: self.hard_state.current_term.0.into(),
                 success: 0,
@@ -349,7 +353,11 @@ where
             // hint at or below the leader's prev_log_index, so its next_index
             // walks back correctly instead of jumping past its own log (which
             // would crash `term_at` with CorruptLog and kill the leader).
-            let hint = self.cached_last_log.0 .0.min(prev_log_idx.0.saturating_sub(1));
+            let hint = self
+                .cached_last_log
+                .0
+                 .0
+                .min(prev_log_idx.0.saturating_sub(1));
             let resp = AppendEntriesResp {
                 term: self.hard_state.current_term.0.into(),
                 success: 0,
@@ -454,7 +462,8 @@ where
                 return Ok(AppendAdvance::Ignored);
             }
             progress.match_index = resp_match_index;
-            progress.next_index = LogIndex(resp_match_index.0.saturating_add(1).min(next_index_cap));
+            progress.next_index =
+                LogIndex(resp_match_index.0.saturating_add(1).min(next_index_cap));
             if progress.match_index >= target_index {
                 return Ok(AppendAdvance::Completed);
             }

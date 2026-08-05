@@ -12,10 +12,10 @@
 //! - the happy path still commits, for both the copying `write(&[u8])` and
 //!   the zero-copy `write_bytes(Bytes)` entry points.
 
-#[path = "support/fault_storage.rs"]
-mod support;
 #[path = "support/a7_harness.rs"]
 mod a7;
+#[path = "support/fault_storage.rs"]
+mod support;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -111,9 +111,7 @@ async fn happy_path_write_and_zero_copy_write_bytes_still_commit() {
     let peers = [1u64, 2, 3];
     let nodes: Vec<a7::SharedRaft> = peers
         .iter()
-        .map(|&id| {
-            a7::boot_node_with_storage(hub.clone(), id, &peers, a7::TestStorage::default())
-        })
+        .map(|&id| a7::boot_node_with_storage(hub.clone(), id, &peers, a7::TestStorage::default()))
         .collect();
     let _drivers = a7::AbortOnDrop {
         handles: nodes.iter().cloned().map(a7::spawn_driver).collect(),

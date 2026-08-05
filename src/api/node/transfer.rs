@@ -216,9 +216,9 @@ where
     pub(crate) fn check_transfer_freeze(&mut self) -> Result<(), RaftError> {
         if self.leadership_transfer_in_progress() {
             return Err(RaftError::NotLeader {
-                leader_hint: self
-                    .pending_transfer
-                    .map(|t| crate::LeaderHint { leader_id: t.target }),
+                leader_hint: self.pending_transfer.map(|t| crate::LeaderHint {
+                    leader_id: t.target,
+                }),
             });
         }
         Ok(())

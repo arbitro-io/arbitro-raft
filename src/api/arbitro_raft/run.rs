@@ -58,8 +58,9 @@ where
             // read-borrow of `self.node` ends before we touch
             // `self.state_machine`.
             let payload_len = {
-                let entry_opt =
-                    self.node.read_entry_payload_into(next, &mut self.apply_buf)?;
+                let entry_opt = self
+                    .node
+                    .read_entry_payload_into(next, &mut self.apply_buf)?;
                 match entry_opt {
                     Some(entry) => entry.payload.0.len(),
                     // Entry missing at an index <= commit_index is only
@@ -139,8 +140,7 @@ where
         >(&self.inbound_buf[..n], "raft frame header")
         .ok()
         .map(|(h, _)| h.from.get());
-        let abuse_key =
-            super::abuse::InboundAbuseGuard::key_for(claimed_from, self.node.peers());
+        let abuse_key = super::abuse::InboundAbuseGuard::key_for(claimed_from, self.node.peers());
         let now = Instant::now();
         if self.abuse.is_jailed(abuse_key, now) {
             self.node.metrics.inc_frames_shed_jailed();
@@ -157,11 +157,10 @@ where
                     "dropping undecodable inbound frame"
                 );
                 self.node.metrics.inc_frames_dropped_nonfatal();
-                if self.abuse.record_decode_error(
-                    abuse_key,
-                    now,
-                    &self.node.config.limits,
-                ) {
+                if self
+                    .abuse
+                    .record_decode_error(abuse_key, now, &self.node.config.limits)
+                {
                     self.node.metrics.inc_peers_jailed();
                     tracing::warn!(
                         node_id = self.node.node_id().0,
@@ -212,7 +211,10 @@ where
     /// [`ErrorClass::Fatal`](crate::ErrorClass::Fatal) error (local storage /
     /// corrupt log) propagates. This is the recv-side complement to
     /// [`dispatch_inbound`](Self::dispatch_inbound) and completes P0-2.
-    pub(super) async fn recv_inbound(&mut self, timeout: Duration) -> Result<Option<usize>, RaftError> {
+    pub(super) async fn recv_inbound(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<usize>, RaftError> {
         match self
             .node
             .transport()
@@ -654,7 +656,11 @@ where
             if peer == self_id {
                 continue;
             }
-            if self.node.maybe_install_snapshot_to_lagging_peer(peer).await? {
+            if self
+                .node
+                .maybe_install_snapshot_to_lagging_peer(peer)
+                .await?
+            {
                 sent += 1;
             }
         }

@@ -33,8 +33,8 @@ use std::time::Duration;
 use arbitro_raft::{
     decode_message, encode_message_to_bytes, AppendEntries, AppendEntriesResp, ArbitroRaft,
     BootstrapPeer, ClusterId, EntryPayload, HardState, LimitsConfig, LogEntry, LogIndex,
-    NodeConfig, PeerId, RaftError, RaftMessage, RaftNode, RaftStorage, RaftTransport,
-    SnapshotMeta, StateMachine, Term, TimingConfig,
+    NodeConfig, PeerId, RaftError, RaftMessage, RaftNode, RaftStorage, RaftTransport, SnapshotMeta,
+    StateMachine, Term, TimingConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -119,7 +119,11 @@ impl TestStorage {
             .unwrap_or(0)
     }
     fn snapshot_meta(&self) -> Option<SnapshotMeta> {
-        self.snapshot.lock().unwrap().as_ref().map(|(m, _)| m.clone())
+        self.snapshot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(m, _)| m.clone())
     }
     /// Pre-seed the log with `(term, index, payload)` triples plus hard state.
     fn seed(&self, entries: &[(u64, u64, &[u8])], term: u64) {
@@ -594,7 +598,11 @@ fn append_entries_frame(
 }
 
 /// Tick the manually-driven node until `cond` holds (or the budget runs out).
-async fn pump_until<S, T, SM, F>(raft: &mut ArbitroRaft<S, T, SM>, mut cond: F, ticks: usize) -> bool
+async fn pump_until<S, T, SM, F>(
+    raft: &mut ArbitroRaft<S, T, SM>,
+    mut cond: F,
+    ticks: usize,
+) -> bool
 where
     S: RaftStorage,
     T: RaftTransport,
@@ -809,8 +817,14 @@ async fn below_horizon_follower_auto_caught_up_via_snapshot_then_append_entries(
 
     // Final convergence: byte-identical state machines.
     let converged = pump_until(&mut leader, || n3_sm.bytes() == leader_sm.bytes(), 400).await;
-    assert!(converged, "node 3 must converge byte-identical to the leader");
-    assert_eq!(leader_sm.bytes(), (1..=100u64).map(|i| i as u8).collect::<Vec<u8>>());
+    assert!(
+        converged,
+        "node 3 must converge byte-identical to the leader"
+    );
+    assert_eq!(
+        leader_sm.bytes(),
+        (1..=100u64).map(|i| i as u8).collect::<Vec<u8>>()
+    );
     assert_eq!(
         hub.install_frame_count(),
         installs_after_catchup,

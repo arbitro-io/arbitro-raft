@@ -124,8 +124,7 @@ where
             pending_batch: Vec::with_capacity(4096),
             pending_slots: Vec::with_capacity(4096),
             commit_waiters: Vec::with_capacity(4096),
-            inbound_buf: vec![0u8; crate::protocol::codec::wire::MAX_FRAME_SIZE]
-                .into_boxed_slice(),
+            inbound_buf: vec![0u8; crate::protocol::codec::wire::MAX_FRAME_SIZE].into_boxed_slice(),
             abuse: abuse::InboundAbuseGuard::default(),
         };
         raft.reset_election_deadline();

@@ -141,8 +141,7 @@ where
     pub(crate) fn voter_majority(&self, granted: &[crate::PeerId]) -> bool {
         match &self.joint_peers {
             Some((old_peers, new_peers)) => {
-                subset_vote_majority(old_peers, granted)
-                    && subset_vote_majority(new_peers, granted)
+                subset_vote_majority(old_peers, granted) && subset_vote_majority(new_peers, granted)
             }
             None => granted.len() >= super::quorum(self.config.peers.len()),
         }
@@ -163,9 +162,7 @@ where
         self.scratch_responders.clear();
         let deadline = Instant::now() + self.election_timeout();
 
-        while !self.voter_majority(&granted)
-            && self.scratch_responders.len() < possible_votes
-        {
+        while !self.voter_majority(&granted) && self.scratch_responders.len() < possible_votes {
             let mut msg_slots = [None; 16];
             let messages_count = self
                 .drain_inbound_frames(deadline, inbound_buf, &mut msg_slots)
@@ -233,9 +230,7 @@ where
             // votes accumulated so far were cast for the old term, and counting
             // them to `votes_needed` would crown us leader of a term we never
             // won (an Election-Safety violation).
-            if self.soft_state.role != Role::Candidate
-                || self.hard_state.current_term != term
-            {
+            if self.soft_state.role != Role::Candidate || self.hard_state.current_term != term {
                 return Ok(false);
             }
         }

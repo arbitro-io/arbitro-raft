@@ -10,14 +10,14 @@ use crate::{
 mod dispatch;
 mod election;
 mod generational;
+mod leader_balance;
+pub(crate) mod log_compaction;
+pub(crate) mod membership;
 mod progress;
 mod read_index;
 pub(crate) mod replication;
 mod scratch;
 mod snapshot;
-mod leader_balance;
-pub(crate) mod log_compaction;
-pub(crate) mod membership;
 mod snapshot_install;
 mod transfer;
 
@@ -61,7 +61,6 @@ pub struct RaftNode<S, T> {
     // they are empty. Borrowed-data scratch lives in the capacity docks
     // below (`EntryScratch` / `SliceScratch`), which hand out EMPTY vecs and
     // therefore need no clear-before-use convention.
-
     /// Capacity dock for `Vec<LogEntry<'_>>` append batches (see [`scratch`]).
     pub(crate) scratch_entries: scratch::EntryScratch,
     pub(crate) scratch_indexes: Vec<LogIndex>,
@@ -747,7 +746,8 @@ where
             && self.config.peers.contains(&from)
             && message_term(&inbound.message) == Some(self.hard_state.current_term)
         {
-            self.last_voter_contact.insert(from, std::time::Instant::now());
+            self.last_voter_contact
+                .insert(from, std::time::Instant::now());
         }
         match inbound.message {
             RaftMessage::AppendEntries(msg, payload) => {

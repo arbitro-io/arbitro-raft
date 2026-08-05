@@ -488,7 +488,10 @@ async fn a5_pending_dispatch_resolves_with_not_leader_on_step_down() {
     })
     .await
     .unwrap();
-    assert!(!node.is_leader(), "higher-term frame must depose the leader");
+    assert!(
+        !node.is_leader(),
+        "higher-term frame must depose the leader"
+    );
 
     // THE PIN (A5 / ERR-7): the waiter must resolve promptly and
     // deterministically — not hang until the dispatch timeout.
@@ -502,7 +505,10 @@ async fn a5_pending_dispatch_resolves_with_not_leader_on_step_down() {
         matches!(res, Err(RaftError::NotLeader { .. })),
         "lost-leadership dispatch must resolve with NotLeader, got {res:?}"
     );
-    assert!(handle.is_ready(), "completion must be observable afterwards");
+    assert!(
+        handle.is_ready(),
+        "completion must be observable afterwards"
+    );
 
     // A late follower response for the aborted tx must be a harmless no-op
     // (the registration was dropped) — the completion must not change.

@@ -170,7 +170,8 @@ where
                     match_index: LogIndex(0),
                 },
             );
-            self.last_voter_contact.insert(peer, std::time::Instant::now());
+            self.last_voter_contact
+                .insert(peer, std::time::Instant::now());
         }
         // A13: learners get replication progress like followers, but NO
         // check-quorum contact stamp — a learner's liveness must never help

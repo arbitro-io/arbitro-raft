@@ -57,18 +57,15 @@ impl<R: Clone> DispatchHandle<R> {
 
             if let Some(deadline) = deadline {
                 if Instant::now() >= deadline {
-                    guard.completion =
-                        Some(DispatchCompletion::Failed(DispatchFailure::Timeout));
+                    guard.completion = Some(DispatchCompletion::Failed(DispatchFailure::Timeout));
                     guard.wake_all();
                     return Poll::Ready(Err(RaftError::from(DispatchFailure::Timeout)));
                 }
 
-                let sleep = timeout_sleep.get_or_insert_with(|| {
-                    Box::pin(tokio::time::sleep_until(deadline.into()))
-                });
+                let sleep = timeout_sleep
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline.into())));
                 if let Poll::Ready(()) = sleep.as_mut().poll(cx) {
-                    guard.completion =
-                        Some(DispatchCompletion::Failed(DispatchFailure::Timeout));
+                    guard.completion = Some(DispatchCompletion::Failed(DispatchFailure::Timeout));
                     guard.wake_all();
                     return Poll::Ready(Err(RaftError::from(DispatchFailure::Timeout)));
                 }

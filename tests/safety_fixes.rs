@@ -322,8 +322,12 @@ fn append_entries_body(term: u64, entry_count: u32) -> AppendEntries {
 #[tokio::test]
 async fn a8_quorum_lease_counts_only_current_term_voter_contact() {
     let (transport, _tx) = InjectTransport::new();
-    let mut node =
-        RaftNode::new(make_config(1, &[1, 2, 3]), TestStorage::default(), transport).unwrap();
+    let mut node = RaftNode::new(
+        make_config(1, &[1, 2, 3]),
+        TestStorage::default(),
+        transport,
+    )
+    .unwrap();
     node.become_leader_for_benchmark(Term(5));
 
     // Fresh leader: progress init stamps contact for every peer — lease alive.
@@ -389,8 +393,12 @@ async fn a8_quorum_lease_counts_only_current_term_voter_contact() {
 #[tokio::test]
 async fn a8_leader_abdicates_when_only_stale_term_contact_arrives() {
     let (transport, tx) = InjectTransport::new();
-    let node =
-        RaftNode::new(make_config(1, &[1, 2, 3]), TestStorage::default(), transport).unwrap();
+    let node = RaftNode::new(
+        make_config(1, &[1, 2, 3]),
+        TestStorage::default(),
+        transport,
+    )
+    .unwrap();
     let mut raft = ArbitroRaft::new(node, NoopStateMachine);
     raft.node_mut().become_leader_for_benchmark(Term(5));
 
@@ -423,8 +431,12 @@ async fn a8_leader_abdicates_when_only_stale_term_contact_arrives() {
 #[tokio::test]
 async fn a8_leader_retains_leadership_under_current_term_contact() {
     let (transport, tx) = InjectTransport::new();
-    let node =
-        RaftNode::new(make_config(1, &[1, 2, 3]), TestStorage::default(), transport).unwrap();
+    let node = RaftNode::new(
+        make_config(1, &[1, 2, 3]),
+        TestStorage::default(),
+        transport,
+    )
+    .unwrap();
     let mut raft = ArbitroRaft::new(node, NoopStateMachine);
     raft.node_mut().become_leader_for_benchmark(Term(5));
 
@@ -506,7 +518,9 @@ async fn a10_concurrent_config_change_rejected_until_previous_completes() {
     assert!(
         matches!(
             res2,
-            Err(RaftError::InvalidConfig("config change already in progress"))
+            Err(RaftError::InvalidConfig(
+                "config change already in progress"
+            ))
         ),
         "concurrent config change must be rejected with InvalidConfig, got {res2:?}"
     );
@@ -519,8 +533,12 @@ async fn a10_concurrent_config_change_rejected_until_previous_completes() {
 #[tokio::test]
 async fn b8_append_resp_match_index_near_max_saturates_and_is_capped() {
     let (transport, _tx) = InjectTransport::new();
-    let mut node =
-        RaftNode::new(make_config(1, &[1, 2, 3]), TestStorage::default(), transport).unwrap();
+    let mut node = RaftNode::new(
+        make_config(1, &[1, 2, 3]),
+        TestStorage::default(),
+        transport,
+    )
+    .unwrap();
     node.become_leader_for_benchmark(Term(5));
 
     // A (spoofed/broken) follower acks match_index = u64::MAX. The unchecked
@@ -616,7 +634,9 @@ async fn b12_seeded_append_storage_error_propagates_like_contiguous_twin() {
     );
 
     let contiguous_storage = TestStorage::default();
-    contiguous_storage.fail_appends.store(true, Ordering::SeqCst);
+    contiguous_storage
+        .fail_appends
+        .store(true, Ordering::SeqCst);
     let contiguous_err = drive_contiguous_append(contiguous_storage)
         .await
         .expect_err("contiguous append with failing storage must surface the error");

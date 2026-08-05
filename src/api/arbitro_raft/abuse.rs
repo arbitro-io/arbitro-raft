@@ -100,8 +100,7 @@ impl InboundAbuseGuard {
         }
         state.errors_in_window = state.errors_in_window.saturating_add(1);
         if state.errors_in_window >= threshold {
-            state.jailed_until =
-                Some(now + Duration::from_millis(limits.inbound_jail_cooldown_ms));
+            state.jailed_until = Some(now + Duration::from_millis(limits.inbound_jail_cooldown_ms));
             return true;
         }
         false

@@ -24,8 +24,7 @@ use std::time::Duration;
 use arbitro_raft::{
     decode_message, encode_message_to_bytes, BootstrapPeer, ClusterId, EntryPayload, HardState,
     InstallSnapshot, InstallSnapshotResp, LimitsConfig, LogEntry, LogIndex, NodeConfig, PeerId,
-    RaftError, RaftMessage, RaftNode, RaftStorage, RaftTransport, SnapshotMeta, Term,
-    TimingConfig,
+    RaftError, RaftMessage, RaftNode, RaftStorage, RaftTransport, SnapshotMeta, Term, TimingConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -413,9 +412,12 @@ async fn stalled_pending_snapshot_is_evicted_by_timer_and_next_chunk_starts_fres
     let chunk_a = vec![0xAA; 64];
 
     // Chunk 1 (offset 0, not done) from the leader — buffer opens, ACK 64.
-    feed_frame(&mut node, &install_chunk_frame(PeerId(1), 1, &meta, 0, &chunk_a, false))
-        .await
-        .unwrap();
+    feed_frame(
+        &mut node,
+        &install_chunk_frame(PeerId(1), 1, &meta, 0, &chunk_a, false),
+    )
+    .await
+    .unwrap();
     assert_eq!(last_resp_to(&transport, PeerId(1)), (1, 64));
 
     // Progressing transfer is NOT evicted: well inside the stall window.
@@ -425,7 +427,11 @@ async fn stalled_pending_snapshot_is_evicted_by_timer_and_next_chunk_starts_fres
     // Leader goes quiet past the stall timeout — the timer sweep must evict
     // (no message for this transfer ever arrives again).
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(node.evict_stalled_snapshots(), 1, "stalled transfer must be evicted");
+    assert_eq!(
+        node.evict_stalled_snapshots(),
+        1,
+        "stalled transfer must be evicted"
+    );
     assert_eq!(metrics.snapshot().snapshots_evicted, 1);
     // Idempotent — nothing left to evict.
     assert_eq!(node.evict_stalled_snapshots(), 0);
@@ -434,9 +440,12 @@ async fn stalled_pending_snapshot_is_evicted_by_timer_and_next_chunk_starts_fres
     // session (NACK from offset 0), never appended to the freed buffer.
     transport.clear_sent();
     let chunk_b = vec![0xBB; 64];
-    feed_frame(&mut node, &install_chunk_frame(PeerId(1), 1, &meta, 64, &chunk_b, true))
-        .await
-        .unwrap();
+    feed_frame(
+        &mut node,
+        &install_chunk_frame(PeerId(1), 1, &meta, 64, &chunk_b, true),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         last_resp_to(&transport, PeerId(1)),
         (0, 0),
@@ -447,14 +456,23 @@ async fn stalled_pending_snapshot_is_evicted_by_timer_and_next_chunk_starts_fres
 
     // Sanity: a full fresh session (restart from offset 0) still completes —
     // eviction hardened the buffer without breaking install correctness.
-    feed_frame(&mut node, &install_chunk_frame(PeerId(1), 1, &meta, 0, &chunk_a, false))
-        .await
-        .unwrap();
-    feed_frame(&mut node, &install_chunk_frame(PeerId(1), 1, &meta, 64, &chunk_b, true))
-        .await
-        .unwrap();
+    feed_frame(
+        &mut node,
+        &install_chunk_frame(PeerId(1), 1, &meta, 0, &chunk_a, false),
+    )
+    .await
+    .unwrap();
+    feed_frame(
+        &mut node,
+        &install_chunk_frame(PeerId(1), 1, &meta, 64, &chunk_b, true),
+    )
+    .await
+    .unwrap();
     assert_eq!(last_resp_to(&transport, PeerId(1)), (1, 128));
-    let (saved_meta, saved_bytes) = storage.load_snapshot().unwrap().expect("snapshot persisted");
+    let (saved_meta, saved_bytes) = storage
+        .load_snapshot()
+        .unwrap()
+        .expect("snapshot persisted");
     assert_eq!(saved_meta, meta);
     assert_eq!(saved_bytes.len(), 128);
     assert_eq!(&saved_bytes[..64], &chunk_a[..]);
@@ -481,7 +499,14 @@ async fn run_loop_tick_evicts_stalled_snapshot_without_new_messages() {
         last_included_index: LogIndex(10),
         last_included_term: Term(1),
     };
-    transport.push_inbound(install_chunk_frame(PeerId(1), 1, &meta, 0, &[0xAA; 64], false));
+    transport.push_inbound(install_chunk_frame(
+        PeerId(1),
+        1,
+        &meta,
+        0,
+        &[0xAA; 64],
+        false,
+    ));
     raft.run_once().await.unwrap();
     assert_eq!(last_resp_to(&transport, PeerId(1)), (1, 64));
     assert_eq!(metrics.snapshot().snapshots_evicted, 0);
@@ -519,8 +544,7 @@ async fn snapshot_attempt_cap_backs_off_peer_and_recovers_after_cooldown() {
     storage.save_snapshot(&meta, &vec![0xCC; 1000]).unwrap();
 
     let transport = ScriptTransport::new(PeerId(3));
-    let mut node =
-        RaftNode::new(config_3node(1, limits), storage, transport.clone()).unwrap();
+    let mut node = RaftNode::new(config_3node(1, limits), storage, transport.clone()).unwrap();
     node.become_leader_for_benchmark(Term(2));
     let metrics = node.metrics();
 
@@ -540,7 +564,10 @@ async fn snapshot_attempt_cap_backs_off_peer_and_recovers_after_cooldown() {
 
     // Attempt budget exhausted → the next call refuses WITHOUT streaming.
     transport.clear_sent();
-    let sent = node.maybe_install_snapshot_to_lagging_peer(PeerId(3)).await.unwrap();
+    let sent = node
+        .maybe_install_snapshot_to_lagging_peer(PeerId(3))
+        .await
+        .unwrap();
     assert!(!sent, "capped peer must be refused");
     assert!(
         transport.sent_to(PeerId(3)).is_empty(),
@@ -549,7 +576,10 @@ async fn snapshot_attempt_cap_backs_off_peer_and_recovers_after_cooldown() {
     assert_eq!(metrics.snapshot().snapshot_installs_refused, 1);
 
     // Still cooling down — refused again.
-    let sent = node.maybe_install_snapshot_to_lagging_peer(PeerId(3)).await.unwrap();
+    let sent = node
+        .maybe_install_snapshot_to_lagging_peer(PeerId(3))
+        .await
+        .unwrap();
     assert!(!sent);
     assert_eq!(metrics.snapshot().snapshot_installs_refused, 2);
 
@@ -557,15 +587,27 @@ async fn snapshot_attempt_cap_backs_off_peer_and_recovers_after_cooldown() {
     tokio::time::sleep(Duration::from_millis(150)).await;
     transport.set_mode(RespondMode::AckAll);
     transport.clear_sent();
-    let sent = node.maybe_install_snapshot_to_lagging_peer(PeerId(3)).await.unwrap();
+    let sent = node
+        .maybe_install_snapshot_to_lagging_peer(PeerId(3))
+        .await
+        .unwrap();
     assert!(sent, "peer must be allowed again after the cooldown");
     // 1000 bytes / 256-byte chunks = 4 InstallSnapshot frames.
     let install_frames: Vec<_> = transport
         .sent_to(PeerId(3))
         .into_iter()
-        .filter(|f| decode_message(f).ok().and_then(|m| m.as_install_snapshot().map(|_| ())).is_some())
+        .filter(|f| {
+            decode_message(f)
+                .ok()
+                .and_then(|m| m.as_install_snapshot().map(|_| ()))
+                .is_some()
+        })
         .collect();
-    assert_eq!(install_frames.len(), 4, "full snapshot must have been streamed");
+    assert_eq!(
+        install_frames.len(),
+        4,
+        "full snapshot must have been streamed"
+    );
     // Refusal counter untouched by the successful path.
     assert_eq!(metrics.snapshot().snapshot_installs_refused, 2);
 
@@ -573,7 +615,10 @@ async fn snapshot_attempt_cap_backs_off_peer_and_recovers_after_cooldown() {
     // fresh set of attempts (i.e. it errors again rather than being refused).
     transport.set_mode(RespondMode::NackZero);
     let err = node.maybe_install_snapshot_to_lagging_peer(PeerId(3)).await;
-    assert!(err.is_err(), "fresh budget after success: install runs (and fails) again");
+    assert!(
+        err.is_err(),
+        "fresh budget after success: install runs (and fails) again"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -600,11 +645,13 @@ async fn large_install_keeps_heartbeats_flowing_to_other_followers() {
     let transport = ScriptTransport::new(PeerId(3));
     transport.set_mode(RespondMode::AckAll);
     transport.set_recv_delay(Duration::from_millis(5));
-    let mut node =
-        RaftNode::new(config_3node(1, limits), storage, transport.clone()).unwrap();
+    let mut node = RaftNode::new(config_3node(1, limits), storage, transport.clone()).unwrap();
     node.become_leader_for_benchmark(Term(2));
 
-    let sent = node.maybe_install_snapshot_to_lagging_peer(PeerId(3)).await.unwrap();
+    let sent = node
+        .maybe_install_snapshot_to_lagging_peer(PeerId(3))
+        .await
+        .unwrap();
     assert!(sent, "install must complete");
 
     // The install completed correctly in bounded chunk steps.
@@ -612,13 +659,18 @@ async fn large_install_keeps_heartbeats_flowing_to_other_followers() {
         .sent_to(PeerId(3))
         .iter()
         .filter_map(|f| {
-            decode_message(f)
-                .ok()
-                .and_then(|m| m.as_install_snapshot().map(|(req, p)| (req.offset.get(), p.len())))
+            decode_message(f).ok().and_then(|m| {
+                m.as_install_snapshot()
+                    .map(|(req, p)| (req.offset.get(), p.len()))
+            })
         })
         .collect();
     assert_eq!(chunks.len(), 32, "32 KiB / 1 KiB = 32 bounded steps");
-    assert_eq!(chunks.last().unwrap().0, 31 * 1024, "final chunk at the last offset");
+    assert_eq!(
+        chunks.last().unwrap().0,
+        31 * 1024,
+        "final chunk at the last offset"
+    );
 
     // OPS-2: while the install monopolized the call stack, the OTHER follower
     // (peer 2) must still have received bare heartbeats, so it never times out

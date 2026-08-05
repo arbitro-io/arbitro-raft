@@ -51,7 +51,11 @@ impl RaftTransport for CountingTransport {
         &self,
         _out: &mut [u8],
     ) -> impl std::future::Future<Output = Result<usize, RaftError>> + Send {
-        async move { Err(RaftError::Transport("CountingTransport has no inbound path".into())) }
+        async move {
+            Err(RaftError::Transport(
+                "CountingTransport has no inbound path".into(),
+            ))
+        }
     }
 
     fn recv_frame_timeout(
@@ -257,8 +261,12 @@ fn build_five_group_registry(
     let mut registry = RaftGroupRegistry::new();
     for i in 1..=5u64 {
         let gid = GroupId(i);
-        let node = RaftNode::new(three_node_config(gid), TestStorage::default(), transport.clone())
-            .unwrap();
+        let node = RaftNode::new(
+            three_node_config(gid),
+            TestStorage::default(),
+            transport.clone(),
+        )
+        .unwrap();
         registry.insert(gid, node, NoopStateMachine).unwrap();
     }
     registry

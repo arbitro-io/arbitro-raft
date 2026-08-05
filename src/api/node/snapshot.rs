@@ -137,14 +137,16 @@ where
                         break;
                     }
                     message => {
-                        self.handle_inbound(InboundRaftMessage { from, group_id, message })
-                            .await?;
+                        self.handle_inbound(InboundRaftMessage {
+                            from,
+                            group_id,
+                            message,
+                        })
+                        .await?;
                         // handle_inbound may have stepped us down on a higher term.
                         // Aborting here avoids stamping later chunks with the new
                         // term while still identifying ourselves as leader.
-                        if !self.is_leader()
-                            || self.hard_state.current_term != start_term
-                        {
+                        if !self.is_leader() || self.hard_state.current_term != start_term {
                             return Err(self.not_leader_error());
                         }
                     }
@@ -215,8 +217,7 @@ where
         self.soft_state.is_leader = false;
         self.soft_state.leader_id = Some(leader_id);
 
-        let stall_timeout =
-            Duration::from_millis(self.config.limits.snapshot_stall_timeout_ms);
+        let stall_timeout = Duration::from_millis(self.config.limits.snapshot_stall_timeout_ms);
         let pending = self
             .pending_snapshots
             .entry(from)

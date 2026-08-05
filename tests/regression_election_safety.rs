@@ -147,7 +147,10 @@ async fn c1_stale_grants_after_mid_campaign_step_down_never_crown_leader() {
     // The persisted state a restart would reload agrees.
     let hs = storage.persisted_hard_state();
     assert_eq!(hs.current_term, Term(5));
-    assert_eq!(hs.voted_for, None, "step-down must clear the persisted vote");
+    assert_eq!(
+        hs.voted_for, None,
+        "step-down must clear the persisted vote"
+    );
 
     // Re-deliver the stale term-1 grant explicitly (a delayed frame arriving
     // after the campaign) — it must be inert.
@@ -228,7 +231,10 @@ async fn c1_vote_grant_is_durable_before_the_response_is_sent() {
     storage.fail_save_hard_state.store(false, Ordering::SeqCst);
     let hs = storage.persisted_hard_state();
     assert_eq!(hs.current_term, Term(3));
-    assert_eq!(hs.voted_for, None, "unpersisted grant must not survive restart");
+    assert_eq!(
+        hs.voted_for, None,
+        "unpersisted grant must not survive restart"
+    );
 }
 
 // ---------------------------------------------------------------------------

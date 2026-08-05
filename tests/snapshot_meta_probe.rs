@@ -23,8 +23,8 @@ use std::time::Duration;
 use arbitro_raft::{
     decode_message, encode_message_to_bytes, AppendEntriesResp, ArbitroRaft, BootstrapPeer,
     ClusterId, EntryPayload, HardState, LimitsConfig, LogEntry, LogIndex, NodeConfig, PeerId,
-    RaftError, RaftMessage, RaftNode, RaftStorage, RaftTransport, SnapshotMeta, StateMachine,
-    Term, TimingConfig,
+    RaftError, RaftMessage, RaftNode, RaftStorage, RaftTransport, SnapshotMeta, StateMachine, Term,
+    TimingConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -82,7 +82,11 @@ impl CountingStorage {
         self.meta_snapshot_loads.load(Ordering::SeqCst)
     }
     fn snapshot_meta(&self) -> Option<SnapshotMeta> {
-        self.snapshot.lock().unwrap().as_ref().map(|(m, _)| m.clone())
+        self.snapshot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(m, _)| m.clone())
     }
 }
 
@@ -314,7 +318,11 @@ fn config_3node(node_id: u64, limits: LimitsConfig) -> NodeConfig {
     }
 }
 
-async fn pump_until<S, T, SM, F>(raft: &mut ArbitroRaft<S, T, SM>, mut cond: F, ticks: usize) -> bool
+async fn pump_until<S, T, SM, F>(
+    raft: &mut ArbitroRaft<S, T, SM>,
+    mut cond: F,
+    ticks: usize,
+) -> bool
 where
     S: RaftStorage,
     T: RaftTransport,

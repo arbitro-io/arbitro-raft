@@ -170,7 +170,9 @@ fn dispatch_registry_reports_decode_failures_through_context() {
     let registry = RaftCustomRegistry::new();
 
     registry
-        .on_with(spec.clone(), |_params, _ctx| Box::pin(async move { Ok(()) }))
+        .on_with(spec.clone(), |_params, _ctx| {
+            Box::pin(async move { Ok(()) })
+        })
         .unwrap();
 
     let mut corrupted = spec
@@ -341,10 +343,13 @@ fn dispatch_registry_enforces_scope_for_routes() {
     let spec_for_handler = spec.clone();
 
     registry
-        .on_with(spec.clone(), move |_params, ctx: DispatchContextView<'_>| {
-            let spec = spec_for_handler.clone();
-            Box::pin(async move { ctx.accept_with(&spec, &SyncAck { saved_until: 50 }).await })
-        })
+        .on_with(
+            spec.clone(),
+            move |_params, ctx: DispatchContextView<'_>| {
+                let spec = spec_for_handler.clone();
+                Box::pin(async move { ctx.accept_with(&spec, &SyncAck { saved_until: 50 }).await })
+            },
+        )
         .unwrap();
 
     let envelope = spec

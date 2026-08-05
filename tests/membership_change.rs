@@ -686,13 +686,7 @@ async fn test_joint_entry_commit_requires_dual_quorum() {
 
         let commit_before = r.commit_index();
         let res = r
-            .propose_config_change(vec![
-                PeerId(1),
-                PeerId(2),
-                PeerId(3),
-                PeerId(4),
-                PeerId(5),
-            ])
+            .propose_config_change(vec![PeerId(1), PeerId(2), PeerId(3), PeerId(4), PeerId(5)])
             .await;
         let commit_after = r.commit_index();
         let joint_idx = r.status().last_log_index;
@@ -757,7 +751,8 @@ async fn test_joint_entry_commit_requires_dual_quorum() {
     }
     // Sanity: the leader really appended the joint entry (pin integrity).
     assert!(
-        joint_idx > commit_before && rafts[leader].lock().await.status().last_log_index >= joint_idx
+        joint_idx > commit_before
+            && rafts[leader].lock().await.status().last_log_index >= joint_idx
     );
 
     // Heal: unblock the old follower and boot nodes 4 and 5. The dual

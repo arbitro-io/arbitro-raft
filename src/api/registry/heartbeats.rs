@@ -31,9 +31,13 @@ where
         // `scratch` (the reusable per-tick buffers) can be held mutably at
         // the same time — going through a method like `iter_mut()` here
         // would borrow all of `self` and conflict with `&mut self.scratch`.
-        let RaftGroupRegistry { groups, scratch, .. } = self;
+        let RaftGroupRegistry {
+            groups, scratch, ..
+        } = self;
         heartbeat_batch_inline::send_batched_heartbeats(
-            groups.iter_mut().map(|(gid, entry)| (*gid, &mut entry.node)),
+            groups
+                .iter_mut()
+                .map(|(gid, entry)| (*gid, &mut entry.node)),
             scratch,
             transport,
             expected_leader_groups,

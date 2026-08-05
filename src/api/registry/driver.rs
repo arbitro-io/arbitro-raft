@@ -77,8 +77,7 @@ pub(crate) struct CoreScratch {
 impl CoreScratch {
     fn new() -> Self {
         Self {
-            inbound_buf: vec![0u8; crate::protocol::codec::wire::MAX_FRAME_SIZE]
-                .into_boxed_slice(),
+            inbound_buf: vec![0u8; crate::protocol::codec::wire::MAX_FRAME_SIZE].into_boxed_slice(),
             payload_buf: vec![0u8; PAYLOAD_SCRATCH],
             outbound_buf: vec![0u8; OUTBOUND_SCRATCH],
             quorum_buf: vec![0u8; QUORUM_SCRATCH],
@@ -276,7 +275,8 @@ where
             self.demux.unregister(gid);
             return Err(e);
         }
-        self.timers.insert(gid, GroupTimers::new(gid, node_id, timing));
+        self.timers
+            .insert(gid, GroupTimers::new(gid, node_id, timing));
         Ok(())
     }
 
@@ -671,8 +671,7 @@ where
                 }
             };
             let payload = &apply_buf[..payload_len];
-            let consumed =
-                crate::api::node::membership::apply_if_config_change(node, payload)?;
+            let consumed = crate::api::node::membership::apply_if_config_change(node, payload)?;
             if !consumed {
                 if let Err(e) = sm.apply_at(next, payload) {
                     tracing::error!(

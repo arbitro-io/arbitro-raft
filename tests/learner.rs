@@ -782,7 +782,11 @@ async fn test_add_learner_preserves_commit_threshold() {
         let mut r = rafts[leader].lock().await;
         r.add_learner(PeerId(4)).await.expect("add_learner failed");
         // The voter set — and with it the commit threshold — is untouched.
-        assert_eq!(r.status().voter_count, 3, "voter_count changed on add_learner");
+        assert_eq!(
+            r.status().voter_count,
+            3,
+            "voter_count changed on add_learner"
+        );
         assert_eq!(r.node().peers(), &[PeerId(1), PeerId(2), PeerId(3)]);
     }
 

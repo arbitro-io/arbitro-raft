@@ -34,7 +34,12 @@ pub(crate) const NOOP_DISCRIMINANT: u8 = 0x7F;
 /// `[0xC0, version, 0x7F, 0]`.
 #[inline]
 pub(crate) fn noop_entry() -> [u8; 4] {
-    [CONFIG_CHANGE_MAGIC, CONFIG_CHANGE_VERSION, NOOP_DISCRIMINANT, 0]
+    [
+        CONFIG_CHANGE_MAGIC,
+        CONFIG_CHANGE_VERSION,
+        NOOP_DISCRIMINANT,
+        0,
+    ]
 }
 
 /// Whether `payload` is exactly a leader no-op control entry.
@@ -227,9 +232,8 @@ where
         self.metrics.inc_config_changes_applied();
         match entry.phase {
             ConfigChangePhase::Joint => {
-                let mut merged: Vec<PeerId> = Vec::with_capacity(
-                    entry.old_peers.len() + entry.new_peers.len(),
-                );
+                let mut merged: Vec<PeerId> =
+                    Vec::with_capacity(entry.old_peers.len() + entry.new_peers.len());
                 merged.extend_from_slice(&entry.old_peers);
                 for p in &entry.new_peers {
                     if !merged.contains(p) {
@@ -342,12 +346,7 @@ where
         }
 
         // Insert fresh progress for any member missing one (leader excluded).
-        for &peer in self
-            .config
-            .peers
-            .iter()
-            .chain(self.config.learners.iter())
-        {
+        for &peer in self.config.peers.iter().chain(self.config.learners.iter()) {
             if peer == self_id {
                 continue;
             }

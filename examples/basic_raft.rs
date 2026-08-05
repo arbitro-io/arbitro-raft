@@ -25,9 +25,15 @@ use arbitro_raft::{
 /// Example no-op StateMachine — apply is a no-op; snapshot/restore return empty.
 struct NoopSM;
 impl StateMachine for NoopSM {
-    fn apply(&mut self, _entry: &[u8]) -> Result<(), RaftError> { Ok(()) }
-    fn snapshot(&self) -> Result<Vec<u8>, RaftError> { Ok(Vec::new()) }
-    fn restore(&mut self, _snapshot: &[u8]) -> Result<(), RaftError> { Ok(()) }
+    fn apply(&mut self, _entry: &[u8]) -> Result<(), RaftError> {
+        Ok(())
+    }
+    fn snapshot(&self) -> Result<Vec<u8>, RaftError> {
+        Ok(Vec::new())
+    }
+    fn restore(&mut self, _snapshot: &[u8]) -> Result<(), RaftError> {
+        Ok(())
+    }
 }
 
 // ── Minimal in-memory storage ─────────────────────────────────────────────────

@@ -445,7 +445,10 @@ async fn read_index_on_follower_returns_not_leader() {
         .find(|i| *i != leader_i)
         .expect("3-node cluster has a follower");
     let mut follower = cluster.rafts[follower_i].lock().await;
-    assert!(!follower.node().is_leader(), "picked node must be a follower");
+    assert!(
+        !follower.node().is_leader(),
+        "picked node must be a follower"
+    );
 
     match follower.read_index().await {
         Err(RaftError::NotLeader { leader_hint }) => {
@@ -553,9 +556,7 @@ async fn read_index_refused_on_partitioned_deposed_leader() {
     let result = old_leader.read_index().await;
     match result {
         Err(RaftError::NoQuorum) | Err(RaftError::NotLeader { .. }) => {}
-        Ok(idx) => panic!(
-            "partitioned old leader served ReadIndex {idx:?} — stale read hole!"
-        ),
+        Ok(idx) => panic!("partitioned old leader served ReadIndex {idx:?} — stale read hole!"),
         Err(other) => panic!("expected NoQuorum/NotLeader, got unexpected error {other:?}"),
     }
     drop(old_leader);
@@ -571,7 +572,11 @@ async fn read_index_refused_on_partitioned_deposed_leader() {
             };
             if new_id != old_leader_id {
                 let mut new_leader = cluster.rafts[new_i].lock().await;
-                if new_leader.propose_once(b"post-partition-entry").await.is_ok() {
+                if new_leader
+                    .propose_once(b"post-partition-entry")
+                    .await
+                    .is_ok()
+                {
                     let ri = new_leader
                         .read_index()
                         .await

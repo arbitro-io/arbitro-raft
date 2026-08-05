@@ -29,8 +29,7 @@
 
 use arbitro_raft::{
     AppendEntriesResp, ArbitroRaft, ConfigChangeEntry, ConfigChangePhase, GroupId,
-    InboundRaftMessage, LogIndex, NoopStateMachine, PeerId, RaftError, RaftMessage, RaftNode,
-    Term,
+    InboundRaftMessage, LogIndex, NoopStateMachine, PeerId, RaftError, RaftMessage, RaftNode, Term,
 };
 
 #[path = "support/a7_harness.rs"]
@@ -199,8 +198,15 @@ async fn c3_step_down_before_joint_commit_keeps_joint_config_and_log() {
     tx.send(higher_term_frame(2, 99)).unwrap();
     raft.run_once().await.expect("run_once");
 
-    assert!(!raft.node().is_leader(), "the higher term must depose the leader");
-    assert_eq!(raft.status().term, Term(99), "the higher term must be adopted");
+    assert!(
+        !raft.node().is_leader(),
+        "the higher term must depose the leader"
+    );
+    assert_eq!(
+        raft.status().term,
+        Term(99),
+        "the higher term must be adopted"
+    );
 
     // THE PIN: the joint transition survives the step-down intact.
     assert!(
@@ -295,7 +301,6 @@ async fn c3_step_down_after_joint_commit_preserves_committed_entry() {
         decoded.new_peers,
         NEW.iter().copied().map(PeerId).collect::<Vec<_>>()
     );
-
 }
 
 // ---------------------------------------------------------------------------
@@ -399,7 +404,10 @@ async fn dup_f1_pre_vote_requires_dual_majority_during_joint() {
     // the node is now a follower of term 99 with the union as `peers`.
     tx.send(higher_term_frame(2, 99)).unwrap();
     raft.run_once().await.expect("run_once");
-    assert!(!raft.node().is_leader(), "the higher term must depose the leader");
+    assert!(
+        !raft.node().is_leader(),
+        "the higher term must depose the leader"
+    );
     assert!(
         raft.status().config_change_in_progress,
         "scenario integrity: the joint config must still be active"

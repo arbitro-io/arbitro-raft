@@ -122,6 +122,9 @@ mod tests {
             .iter()
             .filter(|p| matches!(p.state, DispatchPeerState::Accepted(_)))
             .count();
-        assert_eq!(accepted, 2, "both accepts recorded through the poisoned lock");
+        assert_eq!(
+            accepted, 2,
+            "both accepts recorded through the poisoned lock"
+        );
     }
 }

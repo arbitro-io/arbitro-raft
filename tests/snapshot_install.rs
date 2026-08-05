@@ -330,11 +330,7 @@ fn config_3node(node_id: u64) -> NodeConfig {
 /// be imported from an integration test. The behavior is identical:
 /// snapshot the SM, persist it, then truncate the log strictly below
 /// `last_applied`. Operates on the caller-owned `TestStorage` clone.
-fn compact_leader(
-    storage: &TestStorage,
-    sm: &CountingSM,
-    last_applied: LogIndex,
-) -> SnapshotMeta {
+fn compact_leader(storage: &TestStorage, sm: &CountingSM, last_applied: LogIndex) -> SnapshotMeta {
     assert!(last_applied.0 > 0, "cannot compact: last_applied is 0");
     let term = storage
         .entries
@@ -386,8 +382,7 @@ fn boot_cluster() -> ClusterSetup {
     // Node 1 — leader, driven manually by the test task.
     let leader_storage = TestStorage::default();
     let n1_transport = register(PeerId(1));
-    let mut n1_node =
-        RaftNode::new(config_3node(1), leader_storage.clone(), n1_transport).unwrap();
+    let mut n1_node = RaftNode::new(config_3node(1), leader_storage.clone(), n1_transport).unwrap();
     n1_node.become_leader_for_benchmark(Term(2));
     let leader_sm = CountingSM::default();
     let leader = ArbitroRaft::new(n1_node, leader_sm.clone());
@@ -495,8 +490,11 @@ async fn test_slow_follower_catches_up_via_snapshot() {
     assert_eq!(leader.node().last_applied(), LogIndex(50));
 
     // Compact the leader — mirrors B3's compact_up_to_last_applied.
-    let snap_meta =
-        compact_leader(&leader_storage, leader.state_machine(), leader.node().last_applied());
+    let snap_meta = compact_leader(
+        &leader_storage,
+        leader.state_machine(),
+        leader.node().last_applied(),
+    );
     assert_eq!(snap_meta.last_included_index, LogIndex(50));
 
     // Un-partition node 3.
@@ -590,7 +588,11 @@ async fn test_snapshot_receiver_restores_state_machine() {
     }
     assert_eq!(leader.node().last_applied(), LogIndex(50));
 
-    let _ = compact_leader(&leader_storage, leader.state_machine(), leader.node().last_applied());
+    let _ = compact_leader(
+        &leader_storage,
+        leader.state_machine(),
+        leader.node().last_applied(),
+    );
 
     hub.partitions.lock().unwrap().clear();
 
@@ -614,8 +616,7 @@ async fn test_snapshot_receiver_restores_state_machine() {
     for _ in 0..40 {
         tokio::time::sleep(Duration::from_millis(20)).await;
         leader.run_once().await.unwrap();
-        if node3_sm.applied.load(Ordering::SeqCst) > baseline_applied
-            && node3_commit.get().0 >= 51
+        if node3_sm.applied.load(Ordering::SeqCst) > baseline_applied && node3_commit.get().0 >= 51
         {
             break;
         }

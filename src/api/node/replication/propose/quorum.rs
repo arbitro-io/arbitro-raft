@@ -192,8 +192,12 @@ where
                     .await?;
             }
             message => {
-                self.handle_inbound(InboundRaftMessage { from, group_id, message })
-                    .await?;
+                self.handle_inbound(InboundRaftMessage {
+                    from,
+                    group_id,
+                    message,
+                })
+                .await?;
             }
         }
         Ok(())

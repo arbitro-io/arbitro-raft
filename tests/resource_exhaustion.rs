@@ -60,7 +60,10 @@ fn enospc_classifies_resource_and_corruption_stays_fatal() {
     ] {
         let err = RaftError::Io(std::io::Error::new(kind, "injected"));
         assert_eq!(err.class(), ErrorClass::Resource, "kind {kind:?}");
-        assert!(err.is_resource_exhaustion() && !err.is_fatal(), "kind {kind:?}");
+        assert!(
+            err.is_resource_exhaustion() && !err.is_fatal(),
+            "kind {kind:?}"
+        );
     }
     // Conservative boundary: anything that is not unambiguously resource
     // exhaustion keeps the fail-fast Fatal classification.
@@ -102,7 +105,10 @@ async fn disk_full_leader_steps_down_read_only_and_recovers() {
             .run_once()
             .await
             .expect("an ENOSPC-class error must never kill the run loop");
-        assert!(alive, "the node must keep ticking through resource exhaustion");
+        assert!(
+            alive,
+            "the node must keep ticking through resource exhaustion"
+        );
         if !raft.node().is_leader() {
             stepped_down = true;
             break;
@@ -144,7 +150,10 @@ async fn disk_full_leader_steps_down_read_only_and_recovers() {
         .propose_once(b"recovered")
         .await
         .expect("a write must commit again after space was freed");
-    assert!(idx > committed_before, "the recovered write advances the log");
+    assert!(
+        idx > committed_before,
+        "the recovered write advances the log"
+    );
     assert_eq!(raft.commit_index(), idx, "the recovered write committed");
 }
 
@@ -181,7 +190,10 @@ async fn corrupt_log_on_append_still_kills_the_run_loop() {
         "corrupt-log must stay Fatal, got {err:?}"
     );
     let doomed = doomed.await.expect("join");
-    assert!(doomed.is_err(), "the doomed write must resolve with an error");
+    assert!(
+        doomed.is_err(),
+        "the doomed write must resolve with an error"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -231,7 +243,11 @@ async fn follower_enospc_never_acks_is_nonfatal_and_recovers() {
     })
     .await
     .expect("the retried append must succeed after recovery");
-    assert_eq!(storage.durable_entries().len(), 1, "entry durable after recovery");
+    assert_eq!(
+        storage.durable_entries().len(),
+        1,
+        "entry durable after recovery"
+    );
     assert_eq!(
         transport.sent_to(2).len(),
         1,

@@ -8,8 +8,8 @@
 use std::time::{Duration, Instant};
 
 use arbitro_raft::{
-    DispatchSpec, HardState, LogEntry, LogIndex,
-    NodeConfig, PeerId, RaftError, RaftNode, RaftStorage, RaftTransport, SnapshotMeta, Term,
+    DispatchSpec, HardState, LogEntry, LogIndex, NodeConfig, PeerId, RaftError, RaftNode,
+    RaftStorage, RaftTransport, SnapshotMeta, Term,
 };
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 

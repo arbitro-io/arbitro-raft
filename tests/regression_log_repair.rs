@@ -80,8 +80,12 @@ fn build_divergent_pair() -> (
     leader.set_commit_index(LogIndex(5));
 
     let (follower_tx, follower_sent) = CaptureTransport::new();
-    let follower =
-        RaftNode::new(make_config(2, &[1, 2]), follower_storage.clone(), follower_tx).unwrap();
+    let follower = RaftNode::new(
+        make_config(2, &[1, 2]),
+        follower_storage.clone(),
+        follower_tx,
+    )
+    .unwrap();
 
     (
         leader,
@@ -157,7 +161,9 @@ async fn c5_longer_divergent_follower_repaired_byte_identical_in_bounded_rounds(
 
         // Leader-side clamp invariant, every round: next_index for the
         // follower must never exceed leader_last + 1 (= 6).
-        let (next, _) = leader.peer_progress(PeerId(2)).expect("progress for peer 2");
+        let (next, _) = leader
+            .peer_progress(PeerId(2))
+            .expect("progress for peer 2");
         assert!(
             next <= LogIndex(6),
             "round {round}: leader next_index {} walked past its own log \
@@ -195,8 +201,14 @@ async fn c5_longer_divergent_follower_repaired_byte_identical_in_bounded_rounds(
     // The follower also adopted the leader's commit index for the repaired
     // prefix, and the leader learned the follower's match.
     assert_eq!(follower.commit_index(), LogIndex(5));
-    let (next, matched) = leader.peer_progress(PeerId(2)).expect("progress for peer 2");
-    assert_eq!(matched, LogIndex(5), "leader must see the follower caught up");
+    let (next, matched) = leader
+        .peer_progress(PeerId(2))
+        .expect("progress for peer 2");
+    assert_eq!(
+        matched,
+        LogIndex(5),
+        "leader must see the follower caught up"
+    );
     assert_eq!(next, LogIndex(6));
     assert!(leader.is_leader(), "repair must not cost leadership");
     assert_eq!(leader.current_term(), Term(3));
@@ -240,7 +252,9 @@ async fn c5_forged_reject_hint_past_leader_log_is_clamped() {
             })
             .await
             .expect("forged reject must be survivable");
-        let (next, _) = leader.peer_progress(PeerId(2)).expect("progress for peer 2");
+        let (next, _) = leader
+            .peer_progress(PeerId(2))
+            .expect("progress for peer 2");
         assert!(
             next <= LogIndex(6),
             "THE PIN (P0-7): next_index {} advanced past leader_last + 1 on a \

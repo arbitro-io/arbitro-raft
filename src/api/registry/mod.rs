@@ -133,7 +133,9 @@ where
     /// Iterate all groups (mut), exposing only the node. Useful for
     /// tick-level fan-out (heartbeats, commit-index advance, etc.).
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&GroupId, &mut RaftNode<S, T>)> {
-        self.groups.iter_mut().map(|(id, entry)| (id, &mut entry.node))
+        self.groups
+            .iter_mut()
+            .map(|(id, entry)| (id, &mut entry.node))
     }
 
     /// Iterate all groups (mut), exposing both the node and its bound

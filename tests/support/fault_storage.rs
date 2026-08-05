@@ -223,7 +223,13 @@ impl FaultStorage {
 
 impl RaftStorage for FaultStorage {
     fn load_hard_state(&self) -> Result<HardState, RaftError> {
-        Ok(self.inner.hard_state.lock().unwrap().clone().unwrap_or_default())
+        Ok(self
+            .inner
+            .hard_state
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_default())
     }
 
     fn save_hard_state(&self, state: &HardState) -> Result<(), RaftError> {
@@ -444,7 +450,11 @@ impl RaftTransport for CaptureTransport {
         &self,
         _out: &mut [u8],
     ) -> impl std::future::Future<Output = Result<usize, RaftError>> + Send {
-        async move { Err(RaftError::Transport("no inbound in capture transport".into())) }
+        async move {
+            Err(RaftError::Transport(
+                "no inbound in capture transport".into(),
+            ))
+        }
     }
 
     fn recv_frame_timeout(

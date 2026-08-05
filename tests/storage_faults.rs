@@ -182,7 +182,11 @@ async fn vote_persist_failure_must_not_grant_the_vote() {
         matches!(err, RaftError::Storage(_)) && err.is_fatal(),
         "vote-persist failure must classify Fatal (halt the node), got {err:?}"
     );
-    assert_eq!(storage.calls(FaultOp::SaveHardState), 1, "the grant save was attempted");
+    assert_eq!(
+        storage.calls(FaultOp::SaveHardState),
+        1,
+        "the grant save was attempted"
+    );
     assert!(
         transport.sent().is_empty(),
         "the node must NOT send a vote response after a failed persist — \
@@ -404,7 +408,10 @@ async fn torn_write_with_error_no_ack_and_prefix_survives_restart() {
         .await
         .expect("bare probe must be handled");
     let (success, hint) = decoded_ack(&transport2, 2);
-    assert_eq!(success, 0, "restarted node must reject prev=3 (not durable)");
+    assert_eq!(
+        success, 0,
+        "restarted node must reject prev=3 (not durable)"
+    );
     assert_eq!(hint, 1, "reject hint must point at the durable tip");
 }
 
@@ -462,7 +469,11 @@ async fn torn_write_reported_ok_restart_recovers_durable_prefix_and_repairs() {
         .await
         .expect("repair append must succeed");
     let (success, match_index) = decoded_ack(&transport2, 2);
-    assert_eq!((success, match_index), (1, 3), "repair re-acks the full log");
+    assert_eq!(
+        (success, match_index),
+        (1, 3),
+        "repair re-acks the full log"
+    );
     assert_eq!(
         storage.durable_entries().len(),
         3,
@@ -566,7 +577,10 @@ async fn leader_repair_read_fault_is_contained_to_the_faulty_peer() {
     node.send_heartbeat_once()
         .await
         .expect("a per-peer repair read fault must not abort the heartbeat tick");
-    assert!(node.is_leader(), "the leader must survive a per-peer read fault");
+    assert!(
+        node.is_leader(),
+        "the leader must survive a per-peer read fault"
+    );
     assert!(
         transport.sent_to(2).is_empty(),
         "no frame may be sent to the peer whose backlog was unreadable — \
@@ -642,7 +656,11 @@ async fn follower_ack_implies_entries_survive_crash_restart() {
         .await
         .expect("healthy follower append must succeed");
     let (success, match_index) = decoded_ack(&follower_net, 2);
-    assert_eq!((success, match_index), (1, 2), "follower acks the full batch");
+    assert_eq!(
+        (success, match_index),
+        (1, 2),
+        "follower acks the full batch"
+    );
 
     // The ack promise: by the time the ack exists, the entries are durable.
     assert_eq!(follower_storage.durable_entries().len(), 2);

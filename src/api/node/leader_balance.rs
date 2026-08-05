@@ -11,7 +11,9 @@ use std::time::Duration;
 /// [`extra_pre_vote_delay`] returns a non-zero penalty.
 #[inline]
 pub fn fair_share(total_groups: usize, total_nodes: usize) -> usize {
-    if total_nodes == 0 { return total_groups; }
+    if total_nodes == 0 {
+        return total_groups;
+    }
     // Round up so we don't over-penalize the (leaders_held == ceil) case.
     total_groups.div_ceil(total_nodes)
 }
@@ -33,10 +35,16 @@ pub fn extra_pre_vote_delay(
     max_penalty: Duration,
 ) -> Duration {
     let share = fair_share(total_groups, total_nodes);
-    if leaders_held <= share { return Duration::ZERO; }
+    if leaders_held <= share {
+        return Duration::ZERO;
+    }
     let excess = (leaders_held - share) as u64;
     let penalty = Duration::from_millis(excess.saturating_mul(per_extra_leader_ms));
-    if penalty > max_penalty { max_penalty } else { penalty }
+    if penalty > max_penalty {
+        max_penalty
+    } else {
+        penalty
+    }
 }
 
 #[cfg(test)]

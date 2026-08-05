@@ -23,9 +23,15 @@ use arbitro_raft::{
 /// Bench-local no-op StateMachine — apply is a no-op; snapshot/restore return empty.
 struct NoopSM;
 impl StateMachine for NoopSM {
-    fn apply(&mut self, _entry: &[u8]) -> Result<(), RaftError> { Ok(()) }
-    fn snapshot(&self) -> Result<Vec<u8>, RaftError> { Ok(Vec::new()) }
-    fn restore(&mut self, _snapshot: &[u8]) -> Result<(), RaftError> { Ok(()) }
+    fn apply(&mut self, _entry: &[u8]) -> Result<(), RaftError> {
+        Ok(())
+    }
+    fn snapshot(&self) -> Result<Vec<u8>, RaftError> {
+        Ok(Vec::new())
+    }
+    fn restore(&mut self, _snapshot: &[u8]) -> Result<(), RaftError> {
+        Ok(())
+    }
 }
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use futures::channel::mpsc::{self, UnboundedReceiver};
@@ -179,8 +185,7 @@ impl RaftStorage for SeededMemStorage {
             // SAFETY: Benchmark-only stable pointer trick, same as
             // `read_entry_headers` above — the data buffer only grows and is
             // never truncated while the node borrows the storage.
-            let payload =
-                unsafe { std::mem::transmute::<&[u8], &'a [u8]>(&data[off..off + len]) };
+            let payload = unsafe { std::mem::transmute::<&[u8], &'a [u8]>(&data[off..off + len]) };
             callback(payload);
         }
         Ok(())
@@ -578,7 +583,9 @@ async fn run_follower_sim(listener: TcpListener, leader_addr: SocketAddr, my_id:
                     &RaftMessage::AppendEntriesResp(&resp),
                     &mut header_buf,
                     &mut vectors,
-                ).is_ok() {
+                )
+                .is_ok()
+                {
                     for v in vectors {
                         let _ = leader_conn.write_all(v).await;
                     }
@@ -631,7 +638,9 @@ async fn run_follower_sim(listener: TcpListener, leader_addr: SocketAddr, my_id:
                     &RaftMessage::AppendEntriesResp(&resp),
                     &mut header_buf,
                     &mut vectors,
-                ).is_ok() {
+                )
+                .is_ok()
+                {
                     for v in vectors {
                         let _ = leader_conn.write_all(v).await;
                     }

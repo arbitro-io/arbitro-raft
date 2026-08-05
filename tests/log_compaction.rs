@@ -25,8 +25,8 @@ use std::time::Duration;
 use arbitro_raft::{
     decode_message, encode_message_to_bytes, AppendEntries, AppendEntriesResp, ArbitroRaft,
     BootstrapPeer, ClusterId, EntryPayload, HardState, LimitsConfig, LogEntry, LogIndex,
-    NodeConfig, PeerId, RaftError, RaftMessage, RaftNode, RaftStorage, RaftTransport,
-    SnapshotMeta, StateMachine, Term, TimingConfig,
+    NodeConfig, PeerId, RaftError, RaftMessage, RaftNode, RaftStorage, RaftTransport, SnapshotMeta,
+    StateMachine, Term, TimingConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -81,7 +81,11 @@ impl TestStorage {
         self.entries.lock().unwrap().len()
     }
     fn snapshot_meta(&self) -> Option<SnapshotMeta> {
-        self.snapshot.lock().unwrap().as_ref().map(|(m, _)| m.clone())
+        self.snapshot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(m, _)| m.clone())
     }
 }
 
@@ -222,19 +226,16 @@ impl AckTransport {
                     _ => None,
                 };
                 if let Some(ae) = ae_opt {
-                    let match_index =
-                        ae.prev_log_index.get() + u64::from(ae.entry_count.get());
+                    let match_index = ae.prev_log_index.get() + u64::from(ae.entry_count.get());
                     let resp = AppendEntriesResp {
                         term: ae.term,
                         match_index: match_index.into(),
                         success: 1,
                         _pad: [0; 7],
                     };
-                    let bytes = encode_message_to_bytes(
-                        peer,
-                        &RaftMessage::AppendEntriesResp(&resp),
-                    )
-                    .unwrap();
+                    let bytes =
+                        encode_message_to_bytes(peer, &RaftMessage::AppendEntriesResp(&resp))
+                            .unwrap();
                     self.push_inbound(bytes.to_vec());
                 }
             }
@@ -402,7 +403,10 @@ fn boot_leader(
     storage: TestStorage,
     transport: AckTransport,
     limits: LimitsConfig,
-) -> (ArbitroRaft<TestStorage, AckTransport, CountingSM>, CountingSM) {
+) -> (
+    ArbitroRaft<TestStorage, AckTransport, CountingSM>,
+    CountingSM,
+) {
     let mut node = RaftNode::new(config_3node(1, limits), storage, transport).unwrap();
     node.become_leader_for_benchmark(Term(2));
     let sm = CountingSM::default();
@@ -439,11 +443,8 @@ where
 async fn compaction_fires_after_threshold_and_bounds_the_log() {
     let storage = TestStorage::default();
     let transport = AckTransport::new(&[2, 3]); // both followers ack
-    let (mut leader, leader_sm) = boot_leader(
-        storage.clone(),
-        transport.clone(),
-        compaction_limits(8, 4),
-    );
+    let (mut leader, leader_sm) =
+        boot_leader(storage.clone(), transport.clone(), compaction_limits(8, 4));
     let metrics = leader.metrics();
 
     // Propose 20 single-byte entries — the auto-acker commits each one.
@@ -455,8 +456,10 @@ async fn compaction_fires_after_threshold_and_bounds_the_log() {
     // log truncated up to 20 - min_retain = 16.
     let done = pump_until(
         &mut leader,
-        || storage.snapshot_meta().map(|m| m.last_included_index.0) == Some(20)
-            && storage.first_index() == Some(16),
+        || {
+            storage.snapshot_meta().map(|m| m.last_included_index.0) == Some(20)
+                && storage.first_index() == Some(16)
+        },
         200,
     )
     .await;
@@ -468,7 +471,10 @@ async fn compaction_fires_after_threshold_and_bounds_the_log() {
     );
 
     // Snapshot boundary and content.
-    let (meta, snap_bytes) = storage.load_snapshot().unwrap().expect("snapshot persisted");
+    let (meta, snap_bytes) = storage
+        .load_snapshot()
+        .unwrap()
+        .expect("snapshot persisted");
     assert_eq!(meta.last_included_index, LogIndex(20));
     assert_eq!(meta.last_included_term, Term(2));
     assert_eq!(
@@ -483,14 +489,23 @@ async fn compaction_fires_after_threshold_and_bounds_the_log() {
     assert_eq!(storage.len(), 5);
 
     // last_log_position intact across truncation.
-    assert_eq!(storage.last_log_position().unwrap(), (LogIndex(20), Term(2)));
+    assert_eq!(
+        storage.last_log_position().unwrap(),
+        (LogIndex(20), Term(2))
+    );
 
     // Reads below the horizon come from the snapshot, not the log.
     let mut buf = [0u8; 64];
     assert!(storage.entry_at(LogIndex(15), &mut buf).unwrap().is_none());
     assert!(storage.entry_at(LogIndex(16), &mut buf).unwrap().is_some());
-    assert!(meta.last_included_index.0 >= 15, "snapshot covers the truncated prefix");
-    assert_eq!(snap_bytes[14], 14u8, "payload of a truncated entry is in the snapshot");
+    assert!(
+        meta.last_included_index.0 >= 15,
+        "snapshot covers the truncated prefix"
+    );
+    assert_eq!(
+        snap_bytes[14], 14u8,
+        "payload of a truncated entry is in the snapshot"
+    );
 
     assert!(metrics.snapshot().log_compactions >= 1);
 }
@@ -503,11 +518,8 @@ async fn compaction_fires_after_threshold_and_bounds_the_log() {
 async fn lagging_follower_clamps_horizon_and_is_not_stranded() {
     let storage = TestStorage::default();
     let transport = AckTransport::new(&[2]); // peer 3 never responds
-    let (mut leader, _sm) = boot_leader(
-        storage.clone(),
-        transport.clone(),
-        compaction_limits(8, 4),
-    );
+    let (mut leader, _sm) =
+        boot_leader(storage.clone(), transport.clone(), compaction_limits(8, 4));
 
     for i in 0..20u8 {
         leader.propose_once(&[i]).await.unwrap();
@@ -516,13 +528,11 @@ async fn lagging_follower_clamps_horizon_and_is_not_stranded() {
     // The trigger fires (debt >= 8), a snapshot is persisted — but peer 3's
     // match_index is 0, so the conservative horizon clamps truncation to a
     // no-op: NOTHING may be discarded that the lagging voter still needs.
-    let snapshotted = pump_until(
-        &mut leader,
-        || storage.snapshot_meta().is_some(),
-        200,
-    )
-    .await;
-    assert!(snapshotted, "snapshot must be persisted even when truncation is clamped");
+    let snapshotted = pump_until(&mut leader, || storage.snapshot_meta().is_some(), 200).await;
+    assert!(
+        snapshotted,
+        "snapshot must be persisted even when truncation is clamped"
+    );
     assert_eq!(
         storage.snapshot_meta().unwrap().last_included_index,
         LogIndex(20)
@@ -606,8 +616,7 @@ async fn pending_snapshot_install_blocks_compaction_until_evicted() {
 
     // The leader also streams 10 committed entries — applying them crosses
     // the compaction threshold (8).
-    let entries: Vec<(u64, u64, Vec<u8>)> =
-        (1..=10u64).map(|i| (1u64, i, vec![i as u8])).collect();
+    let entries: Vec<(u64, u64, Vec<u8>)> = (1..=10u64).map(|i| (1u64, i, vec![i as u8])).collect();
     transport.push_inbound(append_entries_frame(PeerId(1), 1, 0, 0, 10, &entries));
 
     follower.run_once().await.unwrap();
@@ -631,8 +640,14 @@ async fn pending_snapshot_install_blocks_compaction_until_evicted() {
     transport.push_inbound(append_entries_frame(PeerId(1), 1, 10, 1, 10, &[]));
     follower.run_once().await.unwrap();
 
-    assert_eq!(metrics.snapshot().snapshots_evicted, 1, "stalled transfer evicted");
-    let meta = storage.snapshot_meta().expect("compaction fired after eviction");
+    assert_eq!(
+        metrics.snapshot().snapshots_evicted,
+        1,
+        "stalled transfer evicted"
+    );
+    let meta = storage
+        .snapshot_meta()
+        .expect("compaction fired after eviction");
     assert_eq!(meta.last_included_index, LogIndex(10));
     assert_eq!(meta.last_included_term, Term(1));
     // Follower horizon = last_applied (10) - retain (0); the boundary entry
@@ -654,23 +669,25 @@ async fn pending_snapshot_install_blocks_compaction_until_evicted() {
 async fn post_compaction_commits_flow_and_restart_replays_snapshot_plus_tail() {
     let storage = TestStorage::default();
     let transport = AckTransport::new(&[2, 3]);
-    let (mut leader, leader_sm) = boot_leader(
-        storage.clone(),
-        transport.clone(),
-        compaction_limits(8, 4),
-    );
+    let (mut leader, leader_sm) =
+        boot_leader(storage.clone(), transport.clone(), compaction_limits(8, 4));
 
     for i in 0..20u8 {
         leader.propose_once(&[i]).await.unwrap();
     }
     let compacted = pump_until(
         &mut leader,
-        || storage.snapshot_meta().map(|m| m.last_included_index.0) == Some(20)
-            && storage.first_index() == Some(16),
+        || {
+            storage.snapshot_meta().map(|m| m.last_included_index.0) == Some(20)
+                && storage.first_index() == Some(16)
+        },
         200,
     )
     .await;
-    assert!(compacted, "compaction must land before the post-compaction phase");
+    assert!(
+        compacted,
+        "compaction must land before the post-compaction phase"
+    );
 
     // The cluster still commits and applies new entries after compaction.
     for i in 0..5u8 {
@@ -684,7 +701,10 @@ async fn post_compaction_commits_flow_and_restart_replays_snapshot_plus_tail() {
     )
     .await;
     assert!(applied, "post-compaction entries must be applied");
-    assert_eq!(storage.last_log_position().unwrap(), (LogIndex(25), Term(2)));
+    assert_eq!(
+        storage.last_log_position().unwrap(),
+        (LogIndex(25), Term(2))
+    );
 
     let leader_state = leader_sm.state_bytes.lock().unwrap().clone();
     drop(leader);
